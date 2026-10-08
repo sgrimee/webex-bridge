@@ -5,6 +5,7 @@ pub mod auth;
 pub mod config;
 pub mod hydrate;
 pub mod paths;
+pub mod rooms;
 pub mod secrets;
 pub mod supervisor;
 pub mod threads;

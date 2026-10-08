@@ -7,6 +7,7 @@ pub mod hydrate;
 pub mod paths;
 pub mod rooms;
 pub mod secrets;
+#[cfg(feature = "server")]
 pub mod supervisor;
 pub mod threads;
 

@@ -2,7 +2,9 @@
 
 use anyhow::{bail, Context, Result};
 use std::time::Duration;
-use webex_bridge::{auth, config::Config, hydrate, paths::Paths, rooms, supervisor};
+use webex_bridge::{
+    auth, config::Config, hydrate, mirror::Mirror, paths::Paths, rooms, supervisor,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -36,7 +38,20 @@ async fn main() -> Result<()> {
                 Some(_) => "access token expired",
                 None => "login required",
             };
-            println!("Webex bridge: {state} (daemon not implemented yet)");
+            println!("Webex bridge: {state}");
+            if paths.mirror.exists() {
+                match Mirror::open(&paths).and_then(|mirror| mirror.stats()) {
+                    Ok(stats) => println!(
+                        "Mirror: rooms={} revisions={} initialDone={} gaps={}",
+                        stats.rooms, stats.revisions, stats.initial_done, stats.gaps
+                    ),
+                    // A locked Keychain means encrypted content remains unavailable;
+                    // report health without creating a plaintext fallback.
+                    Err(_) => println!("Mirror: unavailable (Keychain locked or unavailable)"),
+                }
+            } else {
+                println!("Mirror: not initialized");
+            }
         }
         [command, action, url_flag, link, title_flag, title, agent_flag, agent, workspace_flag, workspace]
             if command == "routes"
@@ -112,7 +127,7 @@ async fn main() -> Result<()> {
             })
             .await?;
         }
-        _ => bail!("Usage: webex-bridge login | me | status | devices status | messages inspect --id ID | rooms find --title TITLE | rooms verify --url SPACE_URL --title TITLE --agent NAME --workspace PATH | probe [--room ROOM_ID [--refresh-after-secs 1..120]]"),
+        _ => bail!("Usage: webex-bridge login | me | status | devices status | messages inspect --id ID | rooms find --title TITLE | rooms verify --url SPACE_URL --title TITLE | routes init --url SPACE_URL --title TITLE --agent NAME --workspace PATH | probe [--room ROOM_ID [--refresh-after-secs 1..120]]"),
     }
     Ok(())
 }

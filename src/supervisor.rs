@@ -1,11 +1,14 @@
 //! Mercury connection owner. Refresh rebuilds client and stream; failures back off.
 
-use crate::{auth, config::Config, paths::Paths};
+use crate::{auth, config::Config, paths::Paths, sync::history::WebexRest};
 use anyhow::{bail, Context, Result};
 use rand::Rng;
-use std::{future::Future, time::Duration};
-use tokio::signal::unix::{signal, SignalKind};
+use std::{future::Future, sync::Arc, time::Duration};
 use tokio::time::{sleep, timeout};
+use tokio::{
+    signal::unix::{signal, SignalKind},
+    sync::watch,
+};
 use webex::{error::Error as WebexError, Event, Webex};
 
 /// Public connection states used by the daemon's eventual status endpoint.
@@ -34,6 +37,7 @@ fn authentication_status(error: &WebexError) -> Option<u16> {
     let code = match error {
         WebexError::Status(code) | WebexError::StatusText(code, _) => Some(code.as_u16()),
         WebexError::Reqwest(error) => error.status().map(|code| code.as_u16()),
+        WebexError::Authentication => Some(401),
         WebexError::Tungstenite(error, _) => match error.as_ref() {
             tokio_tungstenite::tungstenite::Error::Http(response) => {
                 Some(response.status().as_u16())
@@ -59,6 +63,18 @@ pub async fn device_list_status(paths: &Paths) -> Result<u16> {
         .send()
         .await?;
     Ok(response.status().as_u16())
+}
+
+fn stream_error_kind(error: &WebexError) -> &'static str {
+    match error {
+        WebexError::Closed(_) => "closed",
+        WebexError::Tungstenite(_, _) => "websocket_transport",
+        WebexError::Io(_) => "io",
+        WebexError::Json(_) => "event_json",
+        WebexError::UTF8(_) => "event_utf8",
+        WebexError::Other(_) => "other",
+        _ => "api",
+    }
 }
 
 fn next_backoff(previous: Duration) -> Duration {
@@ -91,6 +107,39 @@ pub async fn run_with_refresh_after<H, F>(
 ) -> Result<()>
 where
     H: FnMut(Event, Webex) -> F,
+    F: Future<Output = Result<(), WebexError>>,
+{
+    run_inner(
+        paths,
+        forced_refresh_after,
+        move |event, client, _rest| on_event(event, client),
+        None,
+    )
+    .await
+}
+
+/// Daemon-only supervisor: latest connected REST client is published after
+/// Mercury is listening, allowing catch-up to run concurrently with live events.
+pub async fn run_daemon<H, F>(
+    paths: &Paths,
+    on_event: H,
+    connected: watch::Sender<Option<Arc<WebexRest>>>,
+) -> Result<()>
+where
+    H: FnMut(Event, Webex, Arc<WebexRest>) -> F,
+    F: Future<Output = Result<(), WebexError>>,
+{
+    run_inner(paths, None, on_event, Some(connected)).await
+}
+
+async fn run_inner<H, F>(
+    paths: &Paths,
+    forced_refresh_after: Option<Duration>,
+    mut on_event: H,
+    connected: Option<watch::Sender<Option<Arc<WebexRest>>>>,
+) -> Result<()>
+where
+    H: FnMut(Event, Webex, Arc<WebexRest>) -> F,
     F: Future<Output = Result<(), WebexError>>,
 {
     if forced_refresh_after.is_some() && Config::load(paths)?.dev.is_none() {
@@ -138,6 +187,12 @@ where
         match stream {
             Ok(Ok(mut stream)) => {
                 backoff = Duration::from_secs(1);
+                let rest = Arc::new(WebexRest::new(tokens.access_token.clone())?);
+                if let Some(sender) = &connected {
+                    sender
+                        .send(Some(Arc::clone(&rest)))
+                        .map_err(|_| anyhow::anyhow!("Daemon sync receiver closed"))?;
+                }
                 println!("Webex bridge: connected");
                 let mut forced = false;
                 let force_deadline = force_once.map(|delay| tokio::time::Instant::now() + delay);
@@ -161,11 +216,13 @@ where
                         _ = sleep(wait_for_refresh) => break,
                         event = stream.next() => match event {
                             Ok(event) => {
-                                if let Err(error) = on_event(event, client.clone()).await {
+                                if let Err(error) = on_event(event, client.clone(), Arc::clone(&rest)).await {
                                     if let Some(status) = authentication_status(&error) {
                                         bail!("auth_required: event hydration returned HTTP {status}; no scope change made");
                                     }
                                     // Never log a response body or event data via a Display impl.
+                                    // One malformed or concurrently deleted event must not drop
+                                    // the healthy Mercury stream; catch-up heals its state.
                                     eprintln!("Webex event hydration failed; catch-up is required");
                                 }
                             }
@@ -173,7 +230,10 @@ where
                                 let status = authentication_status(&error).unwrap_or_default();
                                 bail!("auth_required: Mercury stream returned HTTP {status}; no scope change made");
                             }
-                            Err(_) => break,
+                            Err(error) => {
+                                eprintln!("Webex Mercury stream ended ({})", stream_error_kind(&error));
+                                break;
+                            }
                         }
                     }
                 }
@@ -193,6 +253,9 @@ where
                 bail!("auth_required: Mercury connection returned HTTP {status}; no scope change made");
             }
             Ok(Err(_)) | Err(_) => {}
+        }
+        if let Some(sender) = &connected {
+            let _ = sender.send(None);
         }
         eprintln!("Webex bridge: disconnected; retrying after backoff");
         tokio::select! {

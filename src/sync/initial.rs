@@ -2,7 +2,7 @@
 //! Latest messages become available before the six-month background backfill.
 
 use crate::{
-    mirror::{Mirror, Upsert},
+    mirror::{SharedMirror, Upsert},
     sync::history::WebexRest,
 };
 use anyhow::{bail, Context, Result};
@@ -33,15 +33,16 @@ fn created_at(message: &webex::Message) -> Result<DateTime<Utc>> {
 
 /// First, store only the latest page; do not pretend the older history is complete.
 pub async fn latest_page(
-    mirror: &mut Mirror,
+    mirror: &SharedMirror,
     rest: &WebexRest,
     room: &Room,
     page_size: u32,
     cutoff: DateTime<Utc>,
 ) -> Result<InitialResult> {
-    mirror.upsert_room(room, true)?;
+    mirror.with(|db| db.upsert_room(room, true)).await?;
     let state = mirror
-        .room_sync(&room.id)?
+        .with(|db| db.room_sync(&room.id))
+        .await?
         .context("Room sync row missing")?;
     if state.boundary_created_at.is_some() {
         return Ok(InitialResult {
@@ -73,7 +74,7 @@ pub async fn latest_page(
         if created_at(message)? < cutoff {
             break;
         }
-        match mirror.upsert_message(message)? {
+        match mirror.with(|db| db.upsert_message(message)).await? {
             Upsert::Created(_) => counts.created += 1,
             Upsert::Edited(_) => counts.edited += 1,
             Upsert::Unchanged | Upsert::IgnoredDeleted => {}
@@ -81,32 +82,39 @@ pub async fn latest_page(
         oldest = Some(created.to_owned());
     }
     if let Some((created, id)) = newest {
-        mirror.record_boundary(&room.id, &created, &id)?;
+        mirror
+            .with(|db| db.record_boundary(&room.id, &created, &id))
+            .await?;
     }
     if let Some(oldest) = oldest {
-        mirror.record_oldest(&room.id, &oldest)?;
+        mirror
+            .with(|db| db.record_oldest(&room.id, &oldest))
+            .await?;
     }
     counts.done = page.len() < page_size as usize
         || page
             .last()
             .is_some_and(|message| created_at(message).is_ok_and(|created| created < cutoff));
     if counts.done {
-        mirror.mark_initial_done(&room.id)?;
+        mirror.with(|db| db.mark_initial_done(&room.id)).await?;
     }
-    mirror.mark_room_observed(&room.id, &room.last_activity)?;
+    mirror
+        .with(|db| db.mark_room_observed(&room.id, &room.last_activity))
+        .await?;
     Ok(counts)
 }
 
 /// Continue older pages from the durable oldest stored ID; safe to restart after a crash.
 pub async fn backfill(
-    mirror: &mut Mirror,
+    mirror: &SharedMirror,
     rest: &WebexRest,
     room_id: &str,
     page_size: u32,
     cutoff: DateTime<Utc>,
 ) -> Result<InitialResult> {
     let state = mirror
-        .room_sync(room_id)?
+        .with(|db| db.room_sync(room_id))
+        .await?
         .context("Room must be initialized first")?;
     if state.initial_done {
         return Ok(InitialResult {
@@ -116,7 +124,8 @@ pub async fn backfill(
         });
     }
     let mut before = mirror
-        .oldest_message_id(room_id)?
+        .with(|db| db.oldest_message_id(room_id))
+        .await?
         .context("Backfill cursor missing; retry latest-page sync")?;
     let mut counts = InitialResult {
         created: 0,
@@ -138,18 +147,16 @@ pub async fn backfill(
                 reached_cutoff = true;
                 break;
             }
-            match mirror.upsert_message(message)? {
+            match mirror.with(|db| db.upsert_message(message)).await? {
                 Upsert::Created(_) => counts.created += 1,
                 Upsert::Edited(_) => counts.edited += 1,
                 Upsert::Unchanged | Upsert::IgnoredDeleted => {}
             }
-            mirror.record_oldest(
-                room_id,
-                message
-                    .created
-                    .as_deref()
-                    .context("Message has no created time")?,
-            )?;
+            let created = message
+                .created
+                .as_deref()
+                .context("Message has no created time")?;
+            mirror.with(|db| db.record_oldest(room_id, created)).await?;
         }
         if reached_cutoff || page_len < page_size as usize {
             counts.done = true;
@@ -165,7 +172,7 @@ pub async fn backfill(
         before = last.to_owned();
     }
     if counts.done {
-        mirror.mark_initial_done(room_id)?;
+        mirror.with(|db| db.mark_initial_done(room_id)).await?;
     }
     Ok(counts)
 }
@@ -173,6 +180,7 @@ pub async fn backfill(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mirror::Mirror;
     use chrono::Duration as ChronoDuration;
     use reqwest::Url;
     use wiremock::{
@@ -232,35 +240,25 @@ mod tests {
         };
         let rest =
             WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
-        let mut mirror = Mirror::in_memory([20_u8; 32]).unwrap();
+        let mirror = SharedMirror::new(Mirror::in_memory([20_u8; 32]).unwrap());
         let cutoff = now - ChronoDuration::days(180);
-        let latest = latest_page(&mut mirror, &rest, &room, 2, cutoff)
-            .await
-            .unwrap();
+        let latest = latest_page(&mirror, &rest, &room, 2, cutoff).await.unwrap();
         assert_eq!(latest.created, 2);
         assert!(!latest.done);
-        assert_eq!(
-            mirror
-                .room_sync(room_id)
-                .unwrap()
-                .unwrap()
-                .boundary_message_id
-                .as_deref(),
-            Some(ids[0])
-        );
-        let background = backfill(&mut mirror, &rest, room_id, 2, cutoff)
+        let state = mirror
+            .with(|db| db.room_sync(room_id))
             .await
+            .unwrap()
             .unwrap();
+        assert_eq!(state.boundary_message_id.as_deref(), Some(ids[0]));
+        let background = backfill(&mirror, &rest, room_id, 2, cutoff).await.unwrap();
         assert_eq!(background.created, 1);
         assert!(background.done);
-        assert_eq!(
-            mirror
-                .room_sync(room_id)
-                .unwrap()
-                .unwrap()
-                .oldest_stored_at
-                .as_deref(),
-            Some(oldest.as_str())
-        );
+        let state = mirror
+            .with(|db| db.room_sync(room_id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.oldest_stored_at.as_deref(), Some(oldest.as_str()));
     }
 }

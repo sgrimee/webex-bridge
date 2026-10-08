@@ -17,8 +17,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::{
     fs::{self, OpenOptions},
     os::unix::fs::OpenOptionsExt,
+    sync::Arc,
     time::Duration,
 };
+use tokio::sync::Mutex;
 use webex::{Message, Person, Room};
 use zeroize::Zeroizing;
 
@@ -72,6 +74,39 @@ pub struct RoomSync {
     pub last_result: Option<String>,
     /// Last observed Webex room activity watermark (not a message timestamp).
     pub observed_last_activity: Option<String>,
+}
+
+/// Shared access that holds the DB lock only for synchronous operations.
+/// Never await a Webex REST call while this lock is held: live Mercury writes
+/// must proceed while background catch-up/backfill fetches remote pages.
+#[derive(Clone)]
+pub struct SharedMirror(Arc<Mutex<Mirror>>);
+
+impl SharedMirror {
+    /// Wrap one encrypted SQLite connection for live and background tasks.
+    #[must_use]
+    pub fn new(mirror: Mirror) -> Self {
+        Self(Arc::new(Mutex::new(mirror)))
+    }
+
+    /// Execute a short, synchronous DB operation under the shared lock.
+    pub async fn with<R>(&self, operation: impl FnOnce(&mut Mirror) -> Result<R>) -> Result<R> {
+        let mut mirror = self.0.lock().await;
+        operation(&mut mirror)
+    }
+}
+
+/// Metadata-only mirror status for CLI/daemon health reporting.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct MirrorStats {
+    /// Known room rows.
+    pub rooms: i64,
+    /// All message revisions/tombstones.
+    pub revisions: i64,
+    /// Rooms whose initial six-month sync completed.
+    pub initial_done: i64,
+    /// Rooms with a recorded recovery gap.
+    pub gaps: i64,
 }
 
 /// A local encrypted mirror; callers serialize writes through one owner.
@@ -139,6 +174,28 @@ impl Mirror {
     #[cfg(test)]
     pub(crate) fn in_memory(key: [u8; 32]) -> Result<Self> {
         Self::initialize(Connection::open_in_memory()?, key, true)
+    }
+
+    /// Read counts only; no encrypted free text is decrypted.
+    pub fn stats(&self) -> Result<MirrorStats> {
+        Ok(MirrorStats {
+            rooms: self
+                .conn
+                .query_row("SELECT count(*) FROM rooms", [], |row| row.get(0))?,
+            revisions: self
+                .conn
+                .query_row("SELECT count(*) FROM messages", [], |row| row.get(0))?,
+            initial_done: self.conn.query_row(
+                "SELECT count(*) FROM room_sync WHERE initial_done=1",
+                [],
+                |row| row.get(0),
+            )?,
+            gaps: self.conn.query_row(
+                "SELECT count(*) FROM room_sync WHERE last_result LIKE 'gap:%'",
+                [],
+                |row| row.get(0),
+            )?,
+        })
     }
 
     /// Upsert room metadata; title is encrypted, IDs/activity dates are indexed.

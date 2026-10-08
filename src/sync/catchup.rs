@@ -2,7 +2,7 @@
 //! Never move the boundary past an unvisited page; a crash simply replays safely.
 
 use crate::{
-    mirror::{Mirror, RoomSync, Upsert},
+    mirror::{RoomSync, SharedMirror, Upsert},
     sync::history::WebexRest,
 };
 use anyhow::{bail, Context, Result};
@@ -59,14 +59,15 @@ pub fn changed_room(room: &Room, state: &RoomSync) -> Result<bool> {
 /// Reconcile newer messages for one already-initialized room.
 /// If interrupted, the old boundary remains, and replay deduplicates safely.
 pub async fn catch_up_room(
-    mirror: &mut Mirror,
+    mirror: &SharedMirror,
     rest: &WebexRest,
     room: &Room,
     cutoff: DateTime<Utc>,
     page_size: u32,
 ) -> Result<CatchupResult> {
     let state = mirror
-        .room_sync(&room.id)?
+        .with(|db| db.room_sync(&room.id))
+        .await?
         .context("Room must be mirrored before catch-up")?;
     let boundary_id = state
         .boundary_message_id
@@ -117,8 +118,9 @@ pub async fn catch_up_room(
             // A deleted boundary ID may no longer be listed. A known older
             // message proves we crossed the old boundary without skipping new posts.
             let at_old_boundary = id == boundary_id
-                || (created_dt <= boundary_time && mirror.contains_message(id)?);
-            match mirror.upsert_message(message)? {
+                || (created_dt <= boundary_time
+                    && mirror.with(|db| db.contains_message(id)).await?);
+            match mirror.with(|db| db.upsert_message(message)).await? {
                 Upsert::Created(_) => result.created += 1,
                 Upsert::Edited(_) => result.edited += 1,
                 Upsert::Unchanged | Upsert::IgnoredDeleted => {}
@@ -146,23 +148,33 @@ pub async fn catch_up_room(
         before = Some(last.to_owned());
     }
     if let Some(oldest) = oldest_new {
-        mirror.record_oldest(&room.id, &oldest)?;
+        mirror
+            .with(|db| db.record_oldest(&room.id, &oldest))
+            .await?;
     }
     if let Some((latest_time, latest_id)) = newest {
         // All pages must be durable before advancing this boundary. On crash,
         // the old cursor safely replays any partial page set.
-        mirror.record_boundary(&room.id, &latest_time, &latest_id)?;
+        mirror
+            .with(|db| db.record_boundary(&room.id, &latest_time, &latest_id))
+            .await?;
         if !result.boundary_reached {
             let from = state.boundary_created_at.context("Boundary time missing")?;
-            mirror.record_gap(&room.id, &from, &latest_time)?;
+            mirror
+                .with(|db| db.record_gap(&room.id, &from, &latest_time))
+                .await?;
             result.gap = Some((from, latest_time));
         }
     } else if !result.boundary_reached {
         let from = state.boundary_created_at.context("Boundary time missing")?;
-        mirror.record_gap(&room.id, &from, &room.last_activity)?;
+        mirror
+            .with(|db| db.record_gap(&room.id, &from, &room.last_activity))
+            .await?;
         result.gap = Some((from, room.last_activity.clone()));
     }
-    mirror.mark_room_observed(&room.id, &room.last_activity)?;
+    mirror
+        .with(|db| db.mark_room_observed(&room.id, &room.last_activity))
+        .await?;
     Ok(result)
 }
 
@@ -172,7 +184,7 @@ mod tests {
     use crate::mirror::Mirror;
     use reqwest::Url;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     };
     use wiremock::{
@@ -242,22 +254,22 @@ mod tests {
         mirror.record_boundary(room_id, &old_time, old_id).unwrap();
         mirror.record_oldest(room_id, &old_time).unwrap();
         assert!(changed_room(&room, &mirror.room_sync(room_id).unwrap().unwrap()).unwrap());
+        let mirror = SharedMirror::new(mirror);
         let rest =
             WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
-        let result = catch_up_room(
-            &mut mirror,
-            &rest,
-            &room,
-            now - ChronoDuration::days(180),
-            2,
-        )
-        .await
-        .unwrap();
+        let result = catch_up_room(&mirror, &rest, &room, now - ChronoDuration::days(180), 2)
+            .await
+            .unwrap();
         assert_eq!(result.created, 2);
         assert!(result.boundary_reached);
         assert!(result.gap.is_none());
         assert_eq!(pages.load(Ordering::SeqCst), 2);
-        assert!(!changed_room(&room, &mirror.room_sync(room_id).unwrap().unwrap()).unwrap());
+        let state = mirror
+            .with(|db| db.room_sync(room_id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!changed_room(&room, &state).unwrap());
     }
 
     #[tokio::test]
@@ -299,47 +311,32 @@ mod tests {
             .upsert_message(&msg(old_id, room_id, &old_time))
             .unwrap();
         mirror.record_boundary(room_id, &old_time, old_id).unwrap();
+        let mirror = SharedMirror::new(mirror);
         let rest =
             WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
-        assert!(catch_up_room(
-            &mut mirror,
-            &rest,
-            &room,
-            now - ChronoDuration::days(180),
-            1
-        )
-        .await
-        .is_err());
-        assert!(mirror.contains_message(new_id).unwrap());
-        assert_eq!(
-            mirror
-                .room_sync(room_id)
-                .unwrap()
-                .unwrap()
-                .boundary_message_id
-                .as_deref(),
-            Some(old_id)
+        assert!(
+            catch_up_room(&mirror, &rest, &room, now - ChronoDuration::days(180), 1)
+                .await
+                .is_err()
         );
-        let result = catch_up_room(
-            &mut mirror,
-            &rest,
-            &room,
-            now - ChronoDuration::days(180),
-            1,
-        )
-        .await
-        .unwrap();
+        assert!(mirror.with(|db| db.contains_message(new_id)).await.unwrap());
+        let state = mirror
+            .with(|db| db.room_sync(room_id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.boundary_message_id.as_deref(), Some(old_id));
+        let result = catch_up_room(&mirror, &rest, &room, now - ChronoDuration::days(180), 1)
+            .await
+            .unwrap();
         assert_eq!(result.created, 0); // deduplicated the page stored before the crash
         assert!(result.boundary_reached);
-        assert_eq!(
-            mirror
-                .room_sync(room_id)
-                .unwrap()
-                .unwrap()
-                .boundary_message_id
-                .as_deref(),
-            Some(new_id)
-        );
+        let state = mirror
+            .with(|db| db.room_sync(room_id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.boundary_message_id.as_deref(), Some(new_id));
     }
 
     #[tokio::test]
@@ -367,27 +364,82 @@ mod tests {
             .upsert_message(&msg(old_id, room_id, &old_time))
             .unwrap();
         mirror.record_boundary(room_id, &old_time, old_id).unwrap();
+        let mirror = SharedMirror::new(mirror);
         let rest =
             WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
-        let result = catch_up_room(
-            &mut mirror,
-            &rest,
-            &room,
-            now - ChronoDuration::days(180),
-            2,
-        )
-        .await
-        .unwrap();
+        let result = catch_up_room(&mirror, &rest, &room, now - ChronoDuration::days(180), 2)
+            .await
+            .unwrap();
         assert_eq!(result.created, 1);
         assert!(!result.boundary_reached);
         assert!(result.gap.is_some());
-        assert!(mirror
-            .room_sync(room_id)
+        let state = mirror
+            .with(|db| db.room_sync(room_id))
+            .await
             .unwrap()
-            .unwrap()
-            .last_result
-            .unwrap()
-            .starts_with("gap:"));
+            .unwrap();
+        assert!(state.last_result.unwrap().starts_with("gap:"));
+    }
+
+    #[tokio::test]
+    async fn live_write_is_not_blocked_by_slow_catchup_http() {
+        let server = MockServer::start().await;
+        let room_id = "00000000-0000-4000-8000-00000000a001";
+        let old_id = "00000000-0000-4000-8000-000000000041";
+        let new_id = "00000000-0000-4000-8000-000000000042";
+        let live_id = "00000000-0000-4000-8000-000000000043";
+        let now = Utc::now();
+        let old_time = (now - ChronoDuration::days(1)).to_rfc3339();
+        let new_time = now.to_rfc3339();
+        let started = Arc::new(AtomicBool::new(false));
+        let notify = Arc::clone(&started);
+        let page = serde_json::json!({"items": [msg(new_id, room_id, &new_time), msg(old_id, room_id, &old_time)]});
+        Mock::given(method("GET"))
+            .and(path("/v1/messages"))
+            .respond_with(move |_: &wiremock::Request| {
+                notify.store(true, Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .set_body_json(page.clone())
+                    .set_delay(std::time::Duration::from_millis(500))
+            })
+            .mount(&server)
+            .await;
+        let mut db = Mirror::in_memory([15_u8; 32]).unwrap();
+        let room = room(room_id, &new_time);
+        db.upsert_room(&room, true).unwrap();
+        db.upsert_message(&msg(old_id, room_id, &old_time)).unwrap();
+        db.record_boundary(room_id, &old_time, old_id).unwrap();
+        let mirror = SharedMirror::new(db);
+        let background = mirror.clone();
+        let rest =
+            WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
+        let task = tokio::spawn(async move {
+            catch_up_room(
+                &background,
+                &rest,
+                &room,
+                now - ChronoDuration::days(180),
+                50,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let live = msg(live_id, room_id, &new_time);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            mirror.with(|db| db.upsert_message(&live)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, Upsert::Created(0));
+        assert!(task.await.unwrap().unwrap().boundary_reached);
     }
 
     #[test]

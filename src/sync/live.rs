@@ -1,1 +1,413 @@
-//! sync live module; implementation scheduled in the approved plan.
+//! Event-driven Mercury hydration and room-scoped delete reconciliation.
+//! Do not treat an event's text or a `leave` verb as an instruction/state change.
+
+use crate::{
+    mirror::{Mirror, Upsert},
+    sync::history::WebexRest,
+};
+use anyhow::{bail, Context, Result};
+use std::time::Duration;
+use tokio::time::sleep;
+use webex::{ActivityType, Event, GlobalId, GlobalIdType, MessageActivity, SpaceActivity};
+
+/// Outcome for a single live event, without message bodies.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum LiveResult {
+    /// Canonical message created/edited/deduplicated.
+    Message(Upsert),
+    /// Room-scoped reconciliation after a delete signal.
+    Reconciled(ReconcileResult),
+    /// Room metadata or membership verified by REST.
+    RoomUpdated,
+    /// Room membership was confirmed absent by REST.
+    RoomLeft,
+    /// Typing, acknowledgement and unrelated control events.
+    Ignored,
+}
+
+/// Counts from checking known canonical messages after a room-scoped signal.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ReconcileResult {
+    /// Active canonical IDs verified against REST.
+    pub checked: usize,
+    /// Bodies/revisions updated for old edits.
+    pub edited: usize,
+    /// Known missing IDs tombstoned and fully purged.
+    pub deleted: usize,
+}
+
+fn event_room_id(event: &Event, from_delete_target: bool) -> Result<String> {
+    let raw = if from_delete_target {
+        event
+            .data
+            .activity
+            .as_ref()
+            .and_then(|activity| activity.target.as_ref())
+            .and_then(|target| target.global_id.as_deref())
+            .context("Mercury delete has no room target")?
+    } else {
+        event
+            .data
+            .conversation_id
+            .as_deref()
+            .context("Mercury event has no room ID")?
+    };
+    let room = GlobalId::new(GlobalIdType::Room, raw.to_owned())
+        .context("Mercury room target is not a room ID")?;
+    Ok(room.id().to_owned())
+}
+
+/// Recheck active messages in a room after a delete signal or reconnect.
+/// A room REST check prevents misclassifying loss of membership as mass deletion.
+/// HTTP 404 for a known message is checked twice before irreversible body purge.
+pub async fn reconcile_room(
+    mirror: &mut Mirror,
+    rest: &WebexRest,
+    room_id: &str,
+) -> Result<ReconcileResult> {
+    let room = rest
+        .room(room_id)
+        .await?
+        .context("Room unavailable; cannot infer message deletions")?;
+    mirror.upsert_room(&room, true)?;
+    let ids = mirror.active_message_ids(room_id)?;
+    let mut result = ReconcileResult {
+        checked: 0,
+        edited: 0,
+        deleted: 0,
+    };
+    for id in ids {
+        match rest.message(&id).await? {
+            Some(message) => {
+                if message.room_id.as_deref() != Some(room_id) {
+                    bail!("REST message room mismatch during reconciliation");
+                }
+                if matches!(mirror.upsert_message(&message)?, Upsert::Edited(_)) {
+                    result.edited += 1;
+                }
+            }
+            None => {
+                sleep(Duration::from_millis(200)).await;
+                match rest.message(&id).await? {
+                    None if mirror.mark_deleted(room_id, &id)? => result.deleted += 1,
+                    Some(message) => {
+                        if message.room_id.as_deref() != Some(room_id) {
+                            bail!("REST message room mismatch during reconciliation");
+                        }
+                        if matches!(mirror.upsert_message(&message)?, Upsert::Edited(_)) {
+                            result.edited += 1;
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+        result.checked += 1;
+    }
+    Ok(result)
+}
+
+/// Hydrate one Mercury event, encrypt changes, and return metadata-only outcome.
+pub async fn ingest_event(
+    mirror: &mut Mirror,
+    rest: &WebexRest,
+    event: &Event,
+) -> Result<LiveResult> {
+    match event.activity_type() {
+        ActivityType::Message(MessageActivity::Posted | MessageActivity::Shared) => {
+            let activity_id = event.try_global_id()?;
+            let Some(message) = rest.message(activity_id.id()).await? else {
+                // A post can race a deletion. Never persist the event's body;
+                // reconcile known messages in its room instead.
+                let room_id = event_room_id(event, false)?;
+                return Ok(LiveResult::Reconciled(
+                    reconcile_room(mirror, rest, &room_id).await?,
+                ));
+            };
+            let room_id = message
+                .room_id
+                .as_deref()
+                .context("Hydrated message has no room")?;
+            if !mirror.has_room(room_id)? {
+                let room = rest
+                    .room(room_id)
+                    .await?
+                    .context("New message's room is unavailable")?;
+                mirror.upsert_room(&room, true)?;
+            }
+            if let Some(person_id) = message.person_id.as_deref() {
+                if !mirror.has_person(person_id)? {
+                    if let Some(person) = rest.person(person_id).await? {
+                        mirror.upsert_person(&person)?;
+                    }
+                }
+            }
+            Ok(LiveResult::Message(mirror.upsert_message(&message)?))
+        }
+        ActivityType::Message(MessageActivity::Deleted) => {
+            // `event.try_global_id()` mislabels this room target as a Message ID.
+            let room_id = event_room_id(event, true)?;
+            Ok(LiveResult::Reconciled(
+                reconcile_room(mirror, rest, &room_id).await?,
+            ))
+        }
+        ActivityType::Space(
+            SpaceActivity::Changed
+            | SpaceActivity::Created
+            | SpaceActivity::Joined
+            | SpaceActivity::Left,
+        ) => {
+            let was_left_verb = matches!(
+                event.activity_type(),
+                ActivityType::Space(SpaceActivity::Left)
+            );
+            let id = event.try_global_id()?;
+            let id = GlobalId::new(GlobalIdType::Room, id.id().to_owned())?;
+            if let Some(room) = rest.room(id.id()).await? {
+                mirror.upsert_room(&room, true)?;
+                Ok(LiveResult::RoomUpdated)
+            } else if was_left_verb {
+                if mirror.has_room(id.id())? {
+                    mirror.mark_room_left(id.id())?;
+                }
+                Ok(LiveResult::RoomLeft)
+            } else {
+                bail!("Mercury room event could not be verified by REST")
+            }
+        }
+        _ => Ok(LiveResult::Ignored),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::Url;
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    fn room(id: &str) -> webex::Room {
+        webex::Room {
+            id: id.into(),
+            title: Some("private title".into()),
+            room_type: "group".into(),
+            is_locked: false,
+            team_id: None,
+            last_activity: "2026-10-08T12:00:00Z".into(),
+            creator_id: "person".into(),
+            created: "2026-10-01T00:00:00Z".into(),
+        }
+    }
+    fn msg(id: &str, room_id: &str, body: &str, updated: Option<&str>) -> webex::Message {
+        webex::Message {
+            id: Some(id.into()),
+            room_id: Some(room_id.into()),
+            text: Some(body.into()),
+            created: Some("2026-10-08T12:00:00Z".into()),
+            updated: updated.map(str::to_owned),
+            ..webex::Message::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn post_verb_with_new_activity_id_updates_canonical_revision() {
+        let server = MockServer::start().await;
+        let room_id =
+            "Y2lzY29zcGFyazovL3VzL1JPT00vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBhMDAx";
+        let canonical =
+            "Y2lzY29zcGFyazovL3VzL01FU1NBR0UvMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBjMDAz";
+        let activity_uuid = "00000000-0000-4000-8000-00000000d001";
+        let activity_id = GlobalId::new(GlobalIdType::Message, activity_uuid.to_owned()).unwrap();
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/messages/{}", activity_id.id())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(msg(
+                canonical,
+                room_id,
+                "edited",
+                Some("2026-10-08T12:05:00Z"),
+            )))
+            .mount(&server)
+            .await;
+        let rest =
+            WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
+        let mut mirror = Mirror::in_memory([34_u8; 32]).unwrap();
+        mirror.upsert_room(&room(room_id), true).unwrap();
+        mirror
+            .upsert_message(&msg(canonical, room_id, "original", None))
+            .unwrap();
+        let event = Event {
+            data: webex::EventData {
+                event_type: "conversation.activity".into(),
+                activity: Some(webex::Activity {
+                    id: activity_uuid.into(),
+                    verb: "post".into(),
+                    ..webex::Activity::default()
+                }),
+                ..webex::EventData::default()
+            },
+            ..Event::default()
+        };
+        assert_eq!(
+            ingest_event(&mut mirror, &rest, &event).await.unwrap(),
+            LiveResult::Message(Upsert::Edited(1))
+        );
+        assert_eq!(
+            mirror.message_body(canonical).unwrap().as_deref(),
+            Some("edited")
+        );
+    }
+
+    #[tokio::test]
+    async fn leave_verb_does_not_remove_a_verified_member() {
+        let server = MockServer::start().await;
+        let room_id =
+            "Y2lzY29zcGFyazovL3VzL1JPT00vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBhMDAx";
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/rooms/{room_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(room(room_id)))
+            .mount(&server)
+            .await;
+        let rest =
+            WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
+        let mut mirror = Mirror::in_memory([35_u8; 32]).unwrap();
+        mirror.upsert_room(&room(room_id), true).unwrap();
+        let event = Event {
+            data: webex::EventData {
+                event_type: "conversation.activity".into(),
+                activity: Some(webex::Activity {
+                    verb: "leave".into(),
+                    target: Some(webex::Target {
+                        id: String::new(),
+                        object_type: "conversation".into(),
+                        url: String::new(),
+                        participants: None,
+                        activities: None,
+                        tags: Vec::new(),
+                        global_id: Some(room_id.into()),
+                    }),
+                    ..webex::Activity::default()
+                }),
+                ..webex::EventData::default()
+            },
+            ..Event::default()
+        };
+        assert_eq!(
+            ingest_event(&mut mirror, &rest, &event).await.unwrap(),
+            LiveResult::RoomUpdated
+        );
+        assert_eq!(mirror.is_member(room_id).unwrap(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn transient_404_never_purges_a_restored_message() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let server = MockServer::start().await;
+        let room_id =
+            "Y2lzY29zcGFyazovL3VzL1JPT00vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBhMDAx";
+        let message_id =
+            "Y2lzY29zcGFyazovL3VzL01FU1NBR0UvMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBjMDAy";
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/rooms/{room_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(room(room_id)))
+            .mount(&server)
+            .await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&attempts);
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/messages/{message_id}")))
+            .respond_with(move |_: &wiremock::Request| {
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(404)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(msg(
+                        message_id,
+                        room_id,
+                        "restored",
+                        Some("2026-10-08T12:05:00Z"),
+                    ))
+                }
+            })
+            .mount(&server)
+            .await;
+        let rest =
+            WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
+        let mut mirror = Mirror::in_memory([36_u8; 32]).unwrap();
+        mirror.upsert_room(&room(room_id), true).unwrap();
+        mirror
+            .upsert_message(&msg(message_id, room_id, "original", None))
+            .unwrap();
+        let result = reconcile_room(&mut mirror, &rest, room_id).await.unwrap();
+        assert_eq!(
+            result,
+            ReconcileResult {
+                checked: 1,
+                edited: 1,
+                deleted: 0
+            }
+        );
+        assert_eq!(
+            mirror.message_body(message_id).unwrap().as_deref(),
+            Some("restored")
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_signal_reconciles_room_and_purges_only_missing_message() {
+        let server = MockServer::start().await;
+        let room_id =
+            "Y2lzY29zcGFyazovL3VzL1JPT00vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBhMDAx";
+        let deleted_id =
+            "Y2lzY29zcGFyazovL3VzL01FU1NBR0UvMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBjMDAy";
+        let edited_id =
+            "Y2lzY29zcGFyazovL3VzL01FU1NBR0UvMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBjMDA1";
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/rooms/{room_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(room(room_id)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/messages/{deleted_id}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/messages/{edited_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(msg(
+                edited_id,
+                room_id,
+                "revised body",
+                Some("2026-10-08T12:05:00Z"),
+            )))
+            .mount(&server)
+            .await;
+        let rest =
+            WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
+        let mut mirror = Mirror::in_memory([33_u8; 32]).unwrap();
+        mirror.upsert_room(&room(room_id), true).unwrap();
+        mirror
+            .upsert_message(&msg(deleted_id, room_id, "delete me", None))
+            .unwrap();
+        mirror
+            .upsert_message(&msg(edited_id, room_id, "original body", None))
+            .unwrap();
+        let result = reconcile_room(&mut mirror, &rest, room_id).await.unwrap();
+        assert_eq!(
+            result,
+            ReconcileResult {
+                checked: 2,
+                edited: 1,
+                deleted: 1
+            }
+        );
+        assert!(mirror.message_body(deleted_id).unwrap().is_none());
+        assert_eq!(
+            mirror.message_body(edited_id).unwrap().as_deref(),
+            Some("revised body")
+        );
+    }
+}

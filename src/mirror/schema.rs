@@ -44,6 +44,7 @@ CREATE TABLE room_sync (
     initial_done INTEGER NOT NULL DEFAULT 0 CHECK (initial_done IN (0,1)),
     last_catchup_at TEXT,
     last_result TEXT,
+    observed_last_activity TEXT,
     FOREIGN KEY(room_id) REFERENCES rooms(room_id)
 );
 CREATE TABLE routes (

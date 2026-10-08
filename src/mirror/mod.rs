@@ -70,6 +70,8 @@ pub struct RoomSync {
     pub last_catchup_at: Option<String>,
     /// Redacted result code, never a body.
     pub last_result: Option<String>,
+    /// Last observed Webex room activity watermark (not a message timestamp).
+    pub observed_last_activity: Option<String>,
 }
 
 /// A local encrypted mirror; callers serialize writes through one owner.
@@ -135,7 +137,7 @@ impl Mirror {
 
     /// Create an encrypted in-memory mirror for tests; never touches Keychain.
     #[cfg(test)]
-    fn in_memory(key: [u8; 32]) -> Result<Self> {
+    pub(crate) fn in_memory(key: [u8; 32]) -> Result<Self> {
         Self::initialize(Connection::open_in_memory()?, key, true)
     }
 
@@ -164,6 +166,41 @@ impl Mirror {
             [&room.id],
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Check room identity without decrypting a possibly absent title.
+    pub fn has_room(&self, room_id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row("SELECT 1 FROM rooms WHERE room_id=?1", [room_id], |row| {
+                row.get::<_, i64>(0)
+            })
+            .optional()?
+            .is_some())
+    }
+
+    /// Read verified room membership without revealing title or message contents.
+    pub fn is_member(&self, room_id: &str) -> Result<Option<bool>> {
+        self.conn
+            .query_row(
+                "SELECT is_member FROM rooms WHERE room_id=?1",
+                [room_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Mark membership only after a REST check, never from a Mercury `leave` verb alone.
+    pub fn mark_room_left(&mut self, room_id: &str) -> Result<()> {
+        if self.conn.execute(
+            "UPDATE rooms SET is_member=0,updated_at=?2 WHERE room_id=?1",
+            params![room_id, Utc::now().to_rfc3339()],
+        )? != 1
+        {
+            bail!("Cannot leave a room not in the mirror");
+        }
         Ok(())
     }
 
@@ -213,6 +250,19 @@ impl Mirror {
         Ok(())
     }
 
+    /// Check cached person identity without decrypting free text.
+    pub fn has_person(&self, person_id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM people WHERE person_id=?1",
+                [person_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some())
+    }
+
     /// Decrypt a person's display name for an authorized UI client.
     pub fn person_display_name(&self, person_id: &str) -> Result<Option<String>> {
         let encrypted: Option<Vec<u8>> = self
@@ -245,6 +295,11 @@ impl Mirror {
             .room_id
             .as_deref()
             .context("REST message has no room ID")?;
+        let created_at = message
+            .created
+            .as_deref()
+            .context("REST message has no creation time")?;
+        parse_timestamp(created_at)?;
         let body = message.markdown.as_ref().or(message.text.as_ref());
         let files = message.files.as_ref().map(serde_json::to_vec).transpose()?;
         let previous: Option<UpsertPrevious> = self
@@ -322,7 +377,7 @@ impl Mirror {
             "INSERT INTO messages(room_id,message_id,revision,parent_id,sender_id,created_at,updated_at,
                                   status,body_ct,body_nonce,files_meta_ct)
              VALUES (?1,?2,?3,?4,?5,?6,?7,'active',?8,?9,?10)",
-            params![room_id,id,revision,message.parent_id,message.person_id,message.created,
+            params![room_id,id,revision,message.parent_id,message.person_id,created_at,
                 message.updated,body_ct,body_nonce,files_ct],
         )?;
         tx.commit()?;
@@ -410,7 +465,7 @@ impl Mirror {
         self.conn
             .query_row(
                 "SELECT boundary_created_at,boundary_message_id,oldest_stored_at,
-                    initial_done,last_catchup_at,last_result
+                    initial_done,last_catchup_at,last_result,observed_last_activity
              FROM room_sync WHERE room_id=?1",
                 [room_id],
                 |row| {
@@ -421,6 +476,7 @@ impl Mirror {
                         initial_done: row.get(3)?,
                         last_catchup_at: row.get(4)?,
                         last_result: row.get(5)?,
+                        observed_last_activity: row.get(6)?,
                     })
                 },
             )
@@ -470,6 +526,47 @@ impl Mirror {
         Ok(())
     }
 
+    /// Persist the room's lastActivity only after reconciliation finished.
+    pub fn mark_room_observed(&mut self, room_id: &str, last_activity: &str) -> Result<()> {
+        parse_timestamp(last_activity)?;
+        if self.conn.execute(
+            "UPDATE room_sync SET observed_last_activity=?2 WHERE room_id=?1",
+            params![room_id, last_activity],
+        )? != 1
+        {
+            bail!("Cannot mark an unknown room observed");
+        }
+        Ok(())
+    }
+
+    /// Record an explicit, auditable catch-up gap when the old boundary is unreachable.
+    pub fn record_gap(&mut self, room_id: &str, from: &str, to: &str) -> Result<()> {
+        parse_timestamp(from)?;
+        parse_timestamp(to)?;
+        let detail = format!("gap:{from}:{to}");
+        if self.conn.execute(
+            "UPDATE room_sync SET last_result=?2,last_catchup_at=?3 WHERE room_id=?1",
+            params![room_id, detail, Utc::now().to_rfc3339()],
+        )? != 1
+        {
+            bail!("Cannot record a gap for unknown room");
+        }
+        Ok(())
+    }
+
+    /// True if this canonical ID is already in the mirror (including tombstones).
+    pub fn contains_message(&self, message_id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM messages WHERE message_id=?1 LIMIT 1",
+                [message_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some())
+    }
+
     /// Mark background initial backfill complete for this room.
     pub fn mark_initial_done(&mut self, room_id: &str) -> Result<()> {
         if self.conn.execute(
@@ -480,6 +577,20 @@ impl Mirror {
             bail!("Cannot finish initial sync for unknown room");
         }
         Ok(())
+    }
+
+    /// Cursor for background initial backfill, recovered from durable rows after a crash.
+    pub fn oldest_message_id(&self, room_id: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT m.message_id FROM messages m WHERE m.room_id=?1 AND m.status='active'
+             AND m.revision=(SELECT MAX(revision) FROM messages WHERE message_id=m.message_id)
+             ORDER BY m.created_at ASC, m.message_id ASC LIMIT 1",
+                [room_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     /// Canonical IDs whose latest revision is active in a room. Reconcile only on events/outage.

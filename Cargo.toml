@@ -44,6 +44,7 @@ security-framework = { version = "3.7.0", features = ["OSX_10_15"], optional = t
 
 [dev-dependencies]
 tempfile = "3"
+wiremock = "0.6"
 
 [[bin]]
 name = "webex-bridged"

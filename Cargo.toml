@@ -1,0 +1,25 @@
+[package]
+name = "webex-bridge"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+description = "Local Webex mirror and scoped agent channel"
+
+[features]
+default = ["server"]
+server = []
+client = []
+
+[dependencies]
+webex = { path = "../webex-rust" }
+
+[[bin]]
+name = "webex-bridged"
+path = "src/bin/webex-bridged.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "webex-bridge"
+path = "src/bin/webex-bridge.rs"
+required-features = ["server"]

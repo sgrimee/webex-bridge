@@ -4,8 +4,9 @@ use anyhow::{bail, Context, Result};
 use reqwest::{header, Client, Url};
 use serde::Deserialize;
 use std::{collections::HashSet, time::Duration};
+use tokio::time::sleep;
 
-const ROOMS_URL: &str = "https://webexapis.com/v1/rooms?sortBy=lastactivity&max=100";
+const ROOMS_URL: &str = "https://webexapis.com/v1/rooms?sortBy=lastactivity&max=1000";
 
 #[derive(Deserialize)]
 struct RoomPage {
@@ -47,6 +48,35 @@ fn next_page(link: &str) -> Result<Option<Url>> {
     Ok(None)
 }
 
+async fn get_page(client: &Client, url: &Url, token: &str) -> Result<reqwest::Response> {
+    for attempt in 0..4 {
+        let response = client.get(url.clone()).bearer_auth(token).send().await?;
+        let status = response.status();
+        if matches!(status.as_u16(), 401 | 403) {
+            bail!(
+                "auth_required: Webex rejected room listing; stop and ask before changing scopes"
+            );
+        }
+        if status.is_success() {
+            return Ok(response);
+        }
+        if !matches!(status.as_u16(), 429 | 502 | 503 | 504) || attempt == 3 {
+            bail!("Webex room listing returned HTTP {status}");
+        }
+        let retry_after = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        let wait = retry_after.unwrap_or(1 << attempt);
+        if wait > 60 {
+            bail!("Webex asked to retry in more than 60 seconds; retry the command later");
+        }
+        sleep(Duration::from_secs(wait)).await;
+    }
+    unreachable!("the last attempt returns or errors")
+}
+
 /// Find all exact title matches, following Webex's Link pagination headers.
 /// Never print or log other people's room titles or response bodies.
 pub async fn find_by_title(token: &str, title: &str) -> Result<Vec<RoomCandidate>> {
@@ -57,19 +87,18 @@ pub async fn find_by_title(token: &str, title: &str) -> Result<Vec<RoomCandidate
     let mut url = Url::parse(ROOMS_URL)?;
     let mut seen = HashSet::new();
     let mut found = Vec::new();
+    let mut scanned = 0_usize;
     loop {
         if !seen.insert(url.to_string()) || seen.len() > 1000 {
             bail!("Webex rooms pagination repeated or exceeded the safe page limit");
         }
-        let response = client.get(url).bearer_auth(token).send().await?;
-        if matches!(response.status().as_u16(), 401 | 403) {
-            bail!(
-                "auth_required: Webex rejected room listing; stop and ask before changing scopes"
+        if seen.len() % 10 == 0 {
+            eprintln!(
+                "Scanned {} room pages (no titles or messages logged)",
+                seen.len()
             );
         }
-        if !response.status().is_success() {
-            bail!("Webex room listing returned HTTP {}", response.status());
-        }
+        let response = get_page(&client, &url, token).await?;
         let next = response
             .headers()
             .get(header::LINK)
@@ -82,6 +111,7 @@ pub async fn find_by_title(token: &str, title: &str) -> Result<Vec<RoomCandidate
             .json()
             .await
             .context("Invalid Webex rooms response")?;
+        scanned += page.items.len();
         found.extend(
             page.items
                 .into_iter()
@@ -92,6 +122,10 @@ pub async fn find_by_title(token: &str, title: &str) -> Result<Vec<RoomCandidate
             None => break,
         }
     }
+    eprintln!(
+        "Room discovery scanned {} pages and {scanned} room records",
+        seen.len()
+    );
     Ok(found)
 }
 

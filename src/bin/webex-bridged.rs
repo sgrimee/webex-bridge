@@ -42,11 +42,15 @@ async fn main() -> Result<()> {
             let mirror = live_mirror.clone();
             let dev_room = live_dev_room.clone();
             async move {
-                live::ingest_event(&mirror, &rest, &event, dev_room.as_deref())
-                    .await
-                    .map(|_| ())
-                    // Keep raw event/REST error details out of stdout and logs.
-                    .map_err(|_| webex::error::Error::Other("Live mirror sync failed".into()))
+                match live::ingest_event(&mirror, &rest, &event, dev_room.as_deref()).await {
+                    Ok(_) => Ok(()),
+                    // Preserve only the security category; keep raw event/REST
+                    // response details out of stdout and logs.
+                    Err(error) if error.to_string().contains("auth_required") => {
+                        Err(webex::error::Error::Authentication)
+                    }
+                    Err(_) => Err(webex::error::Error::Other("Live mirror sync failed".into())),
+                }
             }
         },
         connected_tx,

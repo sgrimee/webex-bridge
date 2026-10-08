@@ -43,6 +43,9 @@ pub struct TokenSet {
     pub expires_at: u64,
     /// Unix seconds when the refresh token expires.
     pub refresh_expires_at: u64,
+    /// Whether the token response explicitly confirmed all ten requested granular scopes.
+    #[serde(default)]
+    pub scopes_verified: bool,
 }
 
 impl TokenSet {
@@ -70,12 +73,15 @@ fn now() -> Result<u64> {
 }
 
 fn token_from_reply(reply: TokenReply, old: Option<&TokenSet>) -> Result<TokenSet> {
-    if let Some(scopes) = reply.scope.as_deref() {
+    let scopes_verified = if let Some(scopes) = reply.scope.as_deref() {
         let actual: std::collections::HashSet<_> = scopes.split_whitespace().collect();
-        if SCOPES.iter().any(|scope| !actual.contains(scope)) || actual.contains("spark:all") {
+        if actual.len() != SCOPES.len() || SCOPES.iter().any(|scope| !actual.contains(scope)) {
             bail!("Webex did not grant the required granular scopes; stop and ask the user (never use spark:all)");
         }
-    }
+        true
+    } else {
+        old.is_some_and(|tokens| tokens.scopes_verified)
+    };
     if reply.access_token.is_empty() || reply.expires_in == 0 {
         bail!("Webex returned an invalid access token lifetime");
     }
@@ -97,6 +103,7 @@ fn token_from_reply(reply: TokenReply, old: Option<&TokenSet>) -> Result<TokenSe
         issued_at,
         expires_at: issued_at.saturating_add(reply.expires_in),
         refresh_expires_at,
+        scopes_verified,
     })
 }
 
@@ -145,6 +152,11 @@ pub async fn login(paths: &Paths) -> Result<()> {
     .await?;
     let tokens = token_from_reply(reply, None)?;
     save(&tokens)?;
+    if tokens.scopes_verified {
+        println!("Webex explicitly confirmed all ten requested granular scopes.");
+    } else {
+        println!("Webex token response did not report granted scopes; device access must be tested separately.");
+    }
     Ok(())
 }
 
@@ -313,6 +325,18 @@ mod tests {
             expires_in: 3600,
             refresh_token_expires_in: Some(7200),
             scope: Some("spark:all".into()),
+        };
+        assert!(token_from_reply(reply, None).is_err());
+    }
+
+    #[test]
+    fn rejects_extra_scopes() {
+        let reply = TokenReply {
+            access_token: "not-a-real-token".into(),
+            refresh_token: Some("not-a-real-refresh".into()),
+            expires_in: 3600,
+            refresh_token_expires_in: Some(7200),
+            scope: Some(format!("{} spark:kms", SCOPES.join(" "))),
         };
         assert!(token_from_reply(reply, None).is_err());
     }

@@ -3,7 +3,11 @@
 use crate::paths::{check_mode, Paths};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
+use webex::{GlobalId, GlobalIdType};
 
 /// Configuration for a single user's Webex bridge.
 #[derive(Serialize, Deserialize)]
@@ -141,6 +145,56 @@ impl Config {
         toml::from_str(&data).context("Invalid webex-bridge config.toml")
     }
 
+    /// Create the initial configuration only after independently verifying a test room.
+    /// Never overwrite an existing configuration or write with permissive file modes.
+    pub fn write_initial(
+        paths: &Paths,
+        room_id: &str,
+        own_person_id: &str,
+        agent_name: &str,
+        workspace: &Path,
+    ) -> Result<()> {
+        paths.ensure_dirs()?;
+        let _ = GlobalId::new(GlobalIdType::Room, room_id.to_owned())?;
+        let _ = GlobalId::new(GlobalIdType::Person, own_person_id.to_owned())?;
+        if agent_name.is_empty()
+            || agent_name.contains(':')
+            || agent_name.chars().any(char::is_whitespace)
+        {
+            bail!("Agent name must be a non-empty address without colons or whitespace");
+        }
+        let workspace = workspace.canonicalize().context("Workspace must exist")?;
+        if !workspace.is_dir() {
+            bail!("Workspace must be a directory");
+        }
+        let config = Self {
+            dev: Some(DevConfig {
+                write_allowlist: vec![room_id.to_owned()],
+            }),
+            routes: vec![Route {
+                id: "agents-social".into(),
+                room_id: room_id.to_owned(),
+                agent_name: agent_name.to_owned(),
+                allowed_senders: vec![own_person_id.to_owned()],
+                receive: Receive::Addressed,
+                workspace: workspace.to_string_lossy().into_owned(),
+            }],
+            ..Self::default()
+        };
+        let data = toml::to_string_pretty(&config)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&paths.config)
+            .context("Config already exists or cannot be securely created")?;
+        file.write_all(data.as_bytes())?;
+        file.sync_all()?;
+        check_mode(&paths.config, 0o600)?;
+        Ok(())
+    }
+
     /// Check a write operation's destination against the development allowlist.
     pub fn check_write_room(&self, room_id: &str) -> Result<()> {
         match &self.dev {
@@ -162,5 +216,21 @@ mod tests {
         assert!(config.check_write_room("social").is_ok());
         assert!(toml::from_str::<Config>("[webex]\nspark_all = true\n").is_err());
         assert!(toml::from_str::<Config>("[[routes]]\nid = 'r'\nroom_id = 'a'\nagent_name = 'b'\nallowed_senders = []\nworkspace = 'x'\nreceive = 'any'\n").is_err());
+    }
+
+    #[test]
+    fn initial_config_is_restrictive_and_not_overwritten() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(temp.path().join("bridge"));
+        let room = "Y2lzY29zcGFyazovL3VzL1JPT00vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBhMDAx";
+        let person =
+            "Y2lzY29zcGFyazovL3VzL1BFT1BMRS8wMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMGIwMDE";
+        Config::write_initial(&paths, room, person, "sam/coder", temp.path()).unwrap();
+        assert!(Config::write_initial(&paths, room, person, "sam/coder", temp.path()).is_err());
+        let loaded = Config::load(&paths).unwrap();
+        assert_eq!(loaded.routes[0].agent_name, "sam/coder");
+        assert_eq!(loaded.routes[0].allowed_senders, vec![person]);
+        assert!(loaded.check_write_room("other-room").is_err());
+        assert!(loaded.check_write_room(room).is_ok());
     }
 }

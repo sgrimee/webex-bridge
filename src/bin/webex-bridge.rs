@@ -1,7 +1,7 @@
 //! Read-only transport probe and safe, explicit integration authentication.
 
 use anyhow::{bail, Result};
-use webex_bridge::{auth, hydrate, paths::Paths, rooms, supervisor};
+use webex_bridge::{auth, config::Config, hydrate, paths::Paths, rooms, supervisor};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -12,13 +12,50 @@ async fn main() -> Result<()> {
             auth::login(&paths).await?;
             println!("Webex bridge authentication complete; tokens are in Keychain.");
         }
+        [command, action] if command == "devices" && action == "status" => {
+            println!("WDM device-list HTTP {}", supervisor::device_list_status(&paths).await?);
+        }
+        [command] if command == "me" => {
+            let tokens = auth::fresh_token(&paths).await?;
+            println!("{}", rooms::own_person_id(&tokens.access_token).await?);
+        }
         [command] if command == "status" => {
             let state = match auth::load()? {
-                Some(tokens) if tokens.expires_at > now()? => "authenticated",
+                Some(tokens) if tokens.expires_at > now()? => {
+                    if tokens.scopes_verified {
+                        "authenticated; ten granular scopes confirmed by token response"
+                    } else {
+                        "authenticated; granted scopes not reported by token response"
+                    }
+                }
                 Some(_) => "access token expired",
                 None => "login required",
             };
             println!("Webex bridge: {state} (daemon not implemented yet)");
+        }
+        [command, action, url_flag, link, title_flag, title, agent_flag, agent, workspace_flag, workspace]
+            if command == "routes"
+                && action == "init"
+                && url_flag == "--url"
+                && title_flag == "--title"
+                && agent_flag == "--agent"
+                && workspace_flag == "--workspace" =>
+        {
+            let tokens = auth::fresh_token(&paths).await?;
+            let room = rooms::verify_space(&tokens.access_token, link, title).await?;
+            let sender = rooms::own_person_id(&tokens.access_token).await?;
+            Config::write_initial(&paths, &room.id, &sender, agent, workspace.as_ref())?;
+            println!("Created restricted config at {}", paths.config.display());
+        }
+        [command, action, flag, link, title_flag, title]
+            if command == "rooms"
+                && action == "verify"
+                && flag == "--url"
+                && title_flag == "--title" =>
+        {
+            let tokens = auth::fresh_token(&paths).await?;
+            let room = rooms::verify_space(&tokens.access_token, link, title).await?;
+            println!("{}", room.id);
         }
         [command, action, flag, title]
             if command == "rooms" && action == "find" && flag == "--title" =>
@@ -54,7 +91,7 @@ async fn main() -> Result<()> {
             })
             .await?;
         }
-        _ => bail!("Usage: webex-bridge login | status | rooms find --title TITLE | probe [--room ROOM_ID]"),
+        _ => bail!("Usage: webex-bridge login | me | status | devices status | rooms find --title TITLE | rooms verify --url SPACE_URL --title TITLE | routes init --url SPACE_URL --title TITLE --agent NAME --workspace PATH | probe [--room ROOM_ID]"),
     }
     Ok(())
 }

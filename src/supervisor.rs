@@ -30,20 +30,35 @@ pub fn device_name() -> String {
     )
 }
 
-fn authentication_error(error: &WebexError) -> bool {
-    match error {
-        WebexError::Status(code) | WebexError::StatusText(code, _) => {
-            matches!(code.as_u16(), 401 | 403)
-        }
-        WebexError::Reqwest(error) => error
-            .status()
-            .is_some_and(|code| matches!(code.as_u16(), 401 | 403)),
-        WebexError::Tungstenite(error, _) => {
-            matches!(error.as_ref(), tokio_tungstenite::tungstenite::Error::Http(response)
-                if matches!(response.status().as_u16(), 401 | 403))
-        }
-        _ => false,
-    }
+fn authentication_status(error: &WebexError) -> Option<u16> {
+    let code = match error {
+        WebexError::Status(code) | WebexError::StatusText(code, _) => Some(code.as_u16()),
+        WebexError::Reqwest(error) => error.status().map(|code| code.as_u16()),
+        WebexError::Tungstenite(error, _) => match error.as_ref() {
+            tokio_tungstenite::tungstenite::Error::Http(response) => {
+                Some(response.status().as_u16())
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    code.filter(|code| matches!(code, 401 | 403))
+}
+
+/// Read-only WDM device-list status check, without printing response content or token.
+/// This isolates device-scope failures from WebSocket authentication failures.
+pub async fn device_list_status(paths: &Paths) -> Result<u16> {
+    let tokens = auth::fresh_token(paths).await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let response = client
+        .get("https://wdm-a.wbx2.com/wdm/api/v1/devices")
+        .bearer_auth(tokens.access_token)
+        .send()
+        .await?;
+    Ok(response.status().as_u16())
 }
 
 fn next_backoff(previous: Duration) -> Duration {
@@ -116,15 +131,16 @@ where
                         event = stream.next() => match event {
                             Ok(event) => {
                                 if let Err(error) = on_event(event, client.clone()).await {
-                                    if authentication_error(&error) {
-                                        bail!("auth_required: Webex rejected event hydration; run webex-bridge login");
+                                    if let Some(status) = authentication_status(&error) {
+                                        bail!("auth_required: event hydration returned HTTP {status}; no scope change made");
                                     }
                                     // Never log a response body or event data via a Display impl.
                                     eprintln!("Webex event hydration failed; catch-up is required");
                                 }
                             }
-                            Err(error) if authentication_error(&error) => {
-                                bail!("auth_required: Webex rejected Mercury stream; run webex-bridge login");
+                            Err(error) if authentication_status(&error).is_some() => {
+                                let status = authentication_status(&error).unwrap_or_default();
+                                bail!("auth_required: Mercury stream returned HTTP {status}; no scope change made");
                             }
                             Err(_) => break,
                         }
@@ -135,8 +151,9 @@ where
                     continue;
                 }
             }
-            Ok(Err(error)) if authentication_error(&error) => {
-                bail!("auth_required: Webex rejected Mercury connection; run webex-bridge login");
+            Ok(Err(error)) if authentication_status(&error).is_some() => {
+                let status = authentication_status(&error).unwrap_or_default();
+                bail!("auth_required: Mercury connection returned HTTP {status}; no scope change made");
             }
             Ok(Err(_)) | Err(_) => {}
         }
@@ -169,14 +186,17 @@ mod tests {
     }
     #[test]
     fn rejects_auth_http_codes() {
-        assert!(authentication_error(&WebexError::Status(
-            reqwest::StatusCode::UNAUTHORIZED
-        )));
-        assert!(authentication_error(&WebexError::Status(
-            reqwest::StatusCode::FORBIDDEN
-        )));
-        assert!(!authentication_error(&WebexError::Status(
-            reqwest::StatusCode::TOO_MANY_REQUESTS
-        )));
+        assert_eq!(
+            authentication_status(&WebexError::Status(reqwest::StatusCode::UNAUTHORIZED)),
+            Some(401)
+        );
+        assert_eq!(
+            authentication_status(&WebexError::Status(reqwest::StatusCode::FORBIDDEN)),
+            Some(403)
+        );
+        assert_eq!(
+            authentication_status(&WebexError::Status(reqwest::StatusCode::TOO_MANY_REQUESTS)),
+            None
+        );
     }
 }

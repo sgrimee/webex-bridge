@@ -193,11 +193,11 @@ pub async fn login(paths: &Paths) -> Result<()> {
 }
 
 async fn exchange(form: &[(&str, &str)]) -> Result<TokenReply> {
-    let response = reqwest::Client::new()
-        .post(TOKEN_URL)
-        .form(form)
-        .send()
-        .await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(45))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let response = client.post(TOKEN_URL).form(form).send().await?;
     if !response.status().is_success() {
         if matches!(response.status().as_u16(), 401 | 403) {
             bail!("auth_required: Webex rejected the OAuth credentials; run webex-bridge login");
@@ -227,6 +227,25 @@ pub async fn fresh_token(paths: &Paths) -> Result<TokenSet> {
     if current >= tokens.refresh_expires_at {
         bail!("Webex refresh token expired; run webex-bridge login");
     }
+    refresh_locked(tokens).await
+}
+
+/// Development-only forced refresh for testing client/stream rebuilds.
+/// The caller must enforce `[dev]` mode and an allowed test room.
+pub async fn refresh_now(paths: &Paths) -> Result<TokenSet> {
+    let lock = paths.open_refresh_lock()?;
+    lock.lock_exclusive().context("Cannot lock token refresh")?;
+    let tokens = load()?.context("Login required: run webex-bridge login")?;
+    if tokens.scope_mode != selected_scope(paths)? {
+        bail!("OAuth scope configuration changed; reauthorize before refreshing");
+    }
+    if now()? >= tokens.refresh_expires_at {
+        bail!("Webex refresh token expired; run webex-bridge login");
+    }
+    refresh_locked(tokens).await
+}
+
+async fn refresh_locked(tokens: TokenSet) -> Result<TokenSet> {
     let credentials = secrets::credentials_cached()?;
     let reply = exchange(&[
         ("grant_type", "refresh_token"),

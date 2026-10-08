@@ -1,6 +1,6 @@
 //! Mercury connection owner. Refresh rebuilds client and stream; failures back off.
 
-use crate::{auth, paths::Paths};
+use crate::{auth, config::Config, paths::Paths};
 use anyhow::{bail, Context, Result};
 use rand::Rng;
 use std::{future::Future, time::Duration};
@@ -74,11 +74,29 @@ fn jitter(base: Duration) -> Duration {
 /// Connect and pass incoming events to the sync engine. No event body is logged.
 /// The callback must validate/hydrate events; errors are safe status codes, not payloads.
 /// A 401/403 stops permanently until explicit login (no reconnect loop).
-pub async fn run<H, F>(paths: &Paths, mut on_event: H) -> Result<()>
+pub async fn run<H, F>(paths: &Paths, on_event: H) -> Result<()>
 where
     H: FnMut(Event, Webex) -> F,
     F: Future<Output = Result<(), WebexError>>,
 {
+    run_with_refresh_after(paths, None, on_event).await
+}
+
+/// Same supervisor with a one-time forced refresh, only for the configured dev room.
+/// Never expose this override from an agent API or the production daemon.
+pub async fn run_with_refresh_after<H, F>(
+    paths: &Paths,
+    forced_refresh_after: Option<Duration>,
+    mut on_event: H,
+) -> Result<()>
+where
+    H: FnMut(Event, Webex) -> F,
+    F: Future<Output = Result<(), WebexError>>,
+{
+    if forced_refresh_after.is_some() && Config::load(paths)?.dev.is_none() {
+        bail!("Forced refresh is allowed only with the development write allowlist");
+    }
+    let mut force_once = forced_refresh_after;
     let mut term = signal(SignalKind::terminate())?;
     let mut backoff = Duration::from_secs(1);
     loop {
@@ -121,10 +139,23 @@ where
             Ok(Ok(mut stream)) => {
                 backoff = Duration::from_secs(1);
                 println!("Webex bridge: connected");
+                let mut forced = false;
+                let force_deadline = force_once.map(|delay| tokio::time::Instant::now() + delay);
                 loop {
                     let wait_for_refresh =
                         Duration::from_secs(tokens.refresh_at().saturating_sub(now()?));
                     tokio::select! {
+                        _ = async {
+                            if let Some(deadline) = force_deadline {
+                                tokio::time::sleep_until(deadline).await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        } => {
+                            force_once = None;
+                            forced = true;
+                            break;
+                        },
                         _ = term.recv() => return Ok(()),
                         _ = tokio::signal::ctrl_c() => return Ok(()),
                         _ = sleep(wait_for_refresh) => break,
@@ -147,6 +178,12 @@ where
                     }
                 }
                 // Rebuild the immutable token-bearing Webex client and stream.
+                if forced {
+                    println!("Webex bridge: token refresh starting");
+                    auth::refresh_now(paths).await?;
+                    println!("Webex bridge: token refreshed; rebuilding stream");
+                    continue;
+                }
                 if now()? >= tokens.refresh_at() {
                     continue;
                 }

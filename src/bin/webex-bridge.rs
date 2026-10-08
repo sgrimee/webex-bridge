@@ -1,6 +1,7 @@
 //! Read-only transport probe and safe, explicit integration authentication.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use std::time::Duration;
 use webex_bridge::{auth, config::Config, hydrate, paths::Paths, rooms, supervisor};
 
 #[tokio::main]
@@ -87,6 +88,22 @@ async fn main() -> Result<()> {
             })
             .await?;
         }
+        [command, room_flag, room_id, refresh_flag, seconds]
+            if command == "probe"
+                && room_flag == "--room"
+                && refresh_flag == "--refresh-after-secs" =>
+        {
+            Config::load(&paths)?.check_write_room(room_id)?;
+            let seconds = seconds.parse::<u64>().context("Expected refresh delay in seconds")?;
+            if !(1..=120).contains(&seconds) {
+                bail!("Forced refresh delay must be between 1 and 120 seconds");
+            }
+            let room_id = room_id.clone();
+            supervisor::run_with_refresh_after(&paths, Some(Duration::from_secs(seconds)), move |event, client| {
+                let filter = room_id.clone();
+                async move { hydrate::probe_event(event, client, Some(&filter)).await }
+            }).await?;
+        }
         [command, flag, room_id] if command == "probe" && flag == "--room" => {
             let room_id = room_id.clone();
             supervisor::run(&paths, move |event, client| {
@@ -95,7 +112,7 @@ async fn main() -> Result<()> {
             })
             .await?;
         }
-        _ => bail!("Usage: webex-bridge login | me | status | devices status | messages inspect --id ID | rooms find --title TITLE | rooms verify --url SPACE_URL --title TITLE | routes init --url SPACE_URL --title TITLE --agent NAME --workspace PATH | probe [--room ROOM_ID]"),
+        _ => bail!("Usage: webex-bridge login | me | status | devices status | messages inspect --id ID | rooms find --title TITLE | rooms verify --url SPACE_URL --title TITLE --agent NAME --workspace PATH | probe [--room ROOM_ID [--refresh-after-secs 1..120]]"),
     }
     Ok(())
 }

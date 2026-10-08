@@ -133,6 +133,10 @@ pub async fn synchronize_once(
             summary.backfilled_rooms += usize::from(outcome.done);
         }
     }
+    if let Some(retention) = config.webex.retention_max_age.as_deref() {
+        let retention_cutoff = (Utc::now() - catchup::max_age(retention)?).to_rfc3339();
+        let _ = mirror.with(|db| db.prune_before(&retention_cutoff)).await?;
+    }
     Ok(summary)
 }
 

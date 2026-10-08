@@ -636,6 +636,18 @@ impl Mirror {
         Ok(())
     }
 
+    /// Optional retention: remove every revision/tombstone before cutoff.
+    /// Disabled by default; callers must record the user-selected policy.
+    pub fn prune_before(&mut self, cutoff: &str) -> Result<usize> {
+        parse_timestamp(cutoff)?;
+        let tx = self.conn.transaction()?;
+        let removed = tx.execute("DELETE FROM messages WHERE created_at < ?1", [cutoff])?;
+        tx.execute("INSERT INTO audit(ts,scope,action,ref,detail_redacted) VALUES (?1,'system','retention',NULL,?2)",
+            params![Utc::now().to_rfc3339(), format!("removed={removed}")])?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
     /// Cursor for background initial backfill, recovered from durable rows after a crash.
     pub fn oldest_message_id(&self, room_id: &str) -> Result<Option<String>> {
         self.conn
@@ -824,6 +836,20 @@ mod tests {
         ] {
             assert!(!bytes.windows(secret.len()).any(|window| window == secret));
         }
+    }
+
+    #[test]
+    fn optional_retention_removes_old_revisions() {
+        let mut mirror = Mirror::in_memory([10_u8; 32]).unwrap();
+        mirror
+            .upsert_message(&message("old", "private", None))
+            .unwrap();
+        let mut new = message("new", "private", None);
+        new.created = Some("2026-10-09T12:00:00Z".into());
+        mirror.upsert_message(&new).unwrap();
+        assert_eq!(mirror.prune_before("2026-10-08T12:00:01Z").unwrap(), 1);
+        assert!(!mirror.contains_message("old").unwrap());
+        assert!(mirror.contains_message("new").unwrap());
     }
 
     #[test]

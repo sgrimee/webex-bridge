@@ -28,8 +28,11 @@ cargo run --bin webex-bridge -- probe --room <approved-room-id> --refresh-after-
 ```
 
 Probe output contains only IDs, timestamps, lengths and sanitized event types,
-not message bodies. All write paths must enforce `[dev] write_allowlist` in
-later steps. See [the local implementation plan](../docs/webex-agent-channel-plan.md)
+not message bodies. `webex-bridged --dev-room <allowlisted ID>` is a restricted
+Step 2 validation mode; without it, the daemon follows D7 and mirrors all
+rooms. Optional `[webex] retention_max_age = "365d"` prunes old encrypted
+message revisions; leaving it unset keeps all history. All write paths must
+enforce `[dev] write_allowlist` in later steps. See [the local implementation plan](../docs/webex-agent-channel-plan.md)
 and [`docs/events.md`](docs/events.md) for observations.
 
 During development this crate depends on the sibling `../webex-rust` checkout.

@@ -1,0 +1,27 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: workspace/webex-bridge
+      - name: Checkout sibling webex-rust (local path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: sgrimee/webex-rust
+          path: workspace/webex-rust
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: workspace/webex-bridge
+      - run: cargo fmt --check
+        working-directory: workspace/webex-bridge
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: workspace/webex-bridge
+      - run: cargo test
+        working-directory: workspace/webex-bridge

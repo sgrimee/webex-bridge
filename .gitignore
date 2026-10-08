@@ -1,0 +1,8 @@
+/target/
+/result
+.DS_Store
+*.db
+*.db-*
+*.sock
+config.toml
+.env

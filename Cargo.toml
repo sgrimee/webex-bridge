@@ -16,6 +16,8 @@ biometric-keychain = ["dep:security-framework"]
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
 chrono = "0.4"
 dirs = "6"
 fs2 = "0.4"
@@ -26,6 +28,7 @@ oauth2 = { version = "5", default-features = false, features = ["reqwest", "rust
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 rand = "0.8"
 rpassword = "7"
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "signal"] }
@@ -33,6 +36,7 @@ toml = "0.8"
 tokio-tungstenite = "0.28"
 webbrowser = "1"
 webex = { path = "../webex-rust" }
+zeroize = "1.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Optional data-protection Keychain API for future entitled, signed builds.

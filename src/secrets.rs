@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use keyring::{Entry, Error as KeyringError};
 
 const LEGACY_OAUTH_SERVICE: &str = "webex-bridge.oauth";
+const MIRROR_KEY_SERVICE: &str = "webex-bridge.mirror-key";
 
 #[cfg(all(target_os = "macos", feature = "biometric-keychain"))]
 const BIOMETRIC_OAUTH_SERVICE: &str = "webex-bridge.oauth.biometric";
@@ -111,6 +112,26 @@ pub fn set(account: &str, value: &str) -> Result<()> {
     legacy_entry(account)?
         .set_password(value)
         .context("Keychain write failed")
+}
+
+/// Load the 256-bit mirror key from the login Keychain (not a file or config).
+/// The daemon needs it during unattended sync, including after token refresh.
+pub fn get_mirror_key() -> Result<Option<String>> {
+    let entry =
+        Entry::new(MIRROR_KEY_SERVICE, "key").context("Mirror Keychain entry unavailable")?;
+    match entry.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(KeyringError::NoEntry) => Ok(None),
+        Err(error) => Err(error).context("Mirror Keychain read failed"),
+    }
+}
+
+/// Store a newly generated mirror key in the login Keychain.
+pub fn set_mirror_key(value: &str) -> Result<()> {
+    Entry::new(MIRROR_KEY_SERVICE, "key")
+        .context("Mirror Keychain entry unavailable")?
+        .set_password(value)
+        .context("Mirror Keychain write failed")
 }
 
 /// Credentials for the dedicated webex-bridge integration.

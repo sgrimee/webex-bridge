@@ -1,7 +1,11 @@
 //! Browser PKCE login and locked refresh for the dedicated Webex integration.
 //! No OAuth code, token, callback query or client secret is logged.
 
-use crate::{paths::Paths, secrets};
+use crate::{
+    config::{Config, OAuthScope},
+    paths::Paths,
+    secrets,
+};
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use oauth2::{
@@ -17,7 +21,7 @@ use tokio::time::{timeout_at, Instant};
 const AUTHORIZE_URL: &str = "https://webexapis.com/v1/authorize";
 const TOKEN_URL: &str = "https://webexapis.com/v1/access_token";
 const REDIRECT_URL: &str = "http://localhost:8765/callback";
-const SCOPES: [&str; 10] = [
+const GRANULAR_SCOPES: [&str; 10] = [
     "spark:messages_read",
     "spark:messages_write",
     "spark:rooms_read",
@@ -43,16 +47,21 @@ pub struct TokenSet {
     pub expires_at: u64,
     /// Unix seconds when the refresh token expires.
     pub refresh_expires_at: u64,
-    /// Whether the token response explicitly confirmed all ten requested granular scopes.
+    /// Whether the token response explicitly confirmed the selected scope set.
     #[serde(default)]
     pub scopes_verified: bool,
+    /// The scope mode under which this token was obtained, checked against config on use.
+    #[serde(default)]
+    pub scope_mode: OAuthScope,
 }
 
 impl TokenSet {
     /// Time at which the supervisor should rebuild the Webex client (80% of lifetime).
     #[must_use]
     pub fn refresh_at(&self) -> u64 {
-        self.issued_at + self.expires_at.saturating_sub(self.issued_at) * 4 / 5
+        let lifetime = self.expires_at.saturating_sub(self.issued_at);
+        self.issued_at
+            .saturating_add((lifetime / 5) * 4 + (lifetime % 5) * 4 / 5)
     }
 }
 
@@ -72,11 +81,32 @@ fn now() -> Result<u64> {
         .as_secs())
 }
 
-fn token_from_reply(reply: TokenReply, old: Option<&TokenSet>) -> Result<TokenSet> {
+fn requested_scopes(mode: OAuthScope) -> &'static [&'static str] {
+    match mode {
+        OAuthScope::Granular => &GRANULAR_SCOPES,
+        OAuthScope::SparkAll => &["spark:all"],
+    }
+}
+
+fn selected_scope(paths: &Paths) -> Result<OAuthScope> {
+    match std::fs::symlink_metadata(&paths.config) {
+        Ok(_) => Ok(Config::load(paths)?.webex.oauth_scope),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(OAuthScope::Granular),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn token_from_reply(
+    reply: TokenReply,
+    old: Option<&TokenSet>,
+    mode: OAuthScope,
+) -> Result<TokenSet> {
+    let requested = requested_scopes(mode);
     let scopes_verified = if let Some(scopes) = reply.scope.as_deref() {
         let actual: std::collections::HashSet<_> = scopes.split_whitespace().collect();
-        if actual.len() != SCOPES.len() || SCOPES.iter().any(|scope| !actual.contains(scope)) {
-            bail!("Webex did not grant the required granular scopes; stop and ask the user (never use spark:all)");
+        if actual.len() != requested.len() || requested.iter().any(|scope| !actual.contains(scope))
+        {
+            bail!("Webex did not grant exactly the configured OAuth scopes; stop and ask the user");
         }
         true
     } else {
@@ -104,6 +134,7 @@ fn token_from_reply(reply: TokenReply, old: Option<&TokenSet>) -> Result<TokenSe
         expires_at: issued_at.saturating_add(reply.expires_in),
         refresh_expires_at,
         scopes_verified,
+        scope_mode: mode,
     })
 }
 
@@ -121,6 +152,7 @@ fn save(tokens: &TokenSet) -> Result<()> {
 /// Browser login. Binds the callback before opening the browser and validates CSRF/PKCE.
 pub async fn login(paths: &Paths) -> Result<()> {
     paths.ensure_dirs()?;
+    let scope_mode = selected_scope(paths)?;
     let credentials = secrets::credentials()?;
     let listener = TcpListener::bind("127.0.0.1:8765")
         .await
@@ -134,8 +166,8 @@ pub async fn login(paths: &Paths) -> Result<()> {
     let mut request = client
         .authorize_url(CsrfToken::new_random)
         .set_pkce_challenge(challenge);
-    for scope in SCOPES {
-        request = request.add_scope(Scope::new(scope.to_owned()));
+    for scope in requested_scopes(scope_mode) {
+        request = request.add_scope(Scope::new((*scope).to_owned()));
     }
     let (auth_url, state) = request.url();
     webbrowser::open(auth_url.as_str()).context("Cannot open a browser for Webex login")?;
@@ -150,10 +182,10 @@ pub async fn login(paths: &Paths) -> Result<()> {
         ("code_verifier", verifier.secret()),
     ])
     .await?;
-    let tokens = token_from_reply(reply, None)?;
+    let tokens = token_from_reply(reply, None, scope_mode)?;
     save(&tokens)?;
     if tokens.scopes_verified {
-        println!("Webex explicitly confirmed all ten requested granular scopes.");
+        println!("Webex explicitly confirmed the configured OAuth scope set.");
     } else {
         println!("Webex token response did not report granted scopes; device access must be tested separately.");
     }
@@ -185,6 +217,9 @@ pub async fn fresh_token(paths: &Paths) -> Result<TokenSet> {
     lock.lock_exclusive().context("Cannot lock token refresh")?;
     // The lock is released when its file handle is dropped, including on error.
     let tokens = load()?.context("Login required: run webex-bridge login")?;
+    if tokens.scope_mode != selected_scope(paths)? {
+        bail!("OAuth scope configuration changed; reauthorize with webex-bridge login before any Webex request");
+    }
     let current = now()?;
     if current < tokens.refresh_at() {
         return Ok(tokens);
@@ -200,7 +235,7 @@ pub async fn fresh_token(paths: &Paths) -> Result<TokenSet> {
         ("client_secret", &credentials.secret),
     ])
     .await?;
-    let refreshed = token_from_reply(reply, Some(&tokens))?;
+    let refreshed = token_from_reply(reply, Some(&tokens), tokens.scope_mode)?;
     save(&refreshed)?;
     Ok(refreshed)
 }
@@ -326,7 +361,21 @@ mod tests {
             refresh_token_expires_in: Some(7200),
             scope: Some("spark:all".into()),
         };
-        assert!(token_from_reply(reply, None).is_err());
+        assert!(token_from_reply(reply, None, OAuthScope::Granular).is_err());
+    }
+
+    #[test]
+    fn broad_mode_requires_exact_single_scope() {
+        let reply = TokenReply {
+            access_token: "not-a-real-token".into(),
+            refresh_token: Some("not-a-real-refresh".into()),
+            expires_in: 3600,
+            refresh_token_expires_in: Some(7200),
+            scope: Some("spark:all".into()),
+        };
+        let tokens = token_from_reply(reply, None, OAuthScope::SparkAll).unwrap();
+        assert!(tokens.scopes_verified);
+        assert_eq!(tokens.scope_mode, OAuthScope::SparkAll);
     }
 
     #[test]
@@ -336,9 +385,9 @@ mod tests {
             refresh_token: Some("not-a-real-refresh".into()),
             expires_in: 3600,
             refresh_token_expires_in: Some(7200),
-            scope: Some(format!("{} spark:kms", SCOPES.join(" "))),
+            scope: Some(format!("{} spark:kms", GRANULAR_SCOPES.join(" "))),
         };
-        assert!(token_from_reply(reply, None).is_err());
+        assert!(token_from_reply(reply, None, OAuthScope::Granular).is_err());
     }
 
     #[test]
@@ -350,6 +399,6 @@ mod tests {
             refresh_token_expires_in: None,
             scope: None,
         };
-        assert!(token_from_reply(reply, None).is_err());
+        assert!(token_from_reply(reply, None, OAuthScope::Granular).is_err());
     }
 }

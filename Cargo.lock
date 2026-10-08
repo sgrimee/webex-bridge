@@ -2548,6 +2548,7 @@ name = "webex-bridge"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "dirs",
  "fs2",
  "gethostname",
@@ -2557,6 +2558,7 @@ dependencies = [
  "rand 0.8.8",
  "reqwest",
  "rpassword",
+ "security-framework 3.7.0",
  "serde",
  "serde_json",
  "tempfile",

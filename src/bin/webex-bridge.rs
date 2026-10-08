@@ -12,6 +12,12 @@ async fn main() -> Result<()> {
             auth::login(&paths).await?;
             println!("Webex bridge authentication complete; tokens are in Keychain.");
         }
+        [command, action, flag, id]
+            if command == "messages" && action == "inspect" && flag == "--id" =>
+        {
+            let tokens = auth::fresh_token(&paths).await?;
+            hydrate::inspect_message(&tokens.access_token, id).await?;
+        }
         [command, action] if command == "devices" && action == "status" => {
             println!("WDM device-list HTTP {}", supervisor::device_list_status(&paths).await?);
         }
@@ -21,13 +27,11 @@ async fn main() -> Result<()> {
         }
         [command] if command == "status" => {
             let state = match auth::load()? {
-                Some(tokens) if tokens.expires_at > now()? => {
-                    if tokens.scopes_verified {
-                        "authenticated; ten granular scopes confirmed by token response"
-                    } else {
-                        "authenticated; granted scopes not reported by token response"
-                    }
-                }
+                Some(tokens) if tokens.expires_at > now()? => match (tokens.scope_mode, tokens.scopes_verified) {
+                    (webex_bridge::config::OAuthScope::Granular, true) => "authenticated; ten granular scopes confirmed by token response",
+                    (webex_bridge::config::OAuthScope::SparkAll, true) => "authenticated; spark:all confirmed by token response",
+                    (_, false) => "authenticated; granted scopes not reported by token response",
+                },
                 Some(_) => "access token expired",
                 None => "login required",
             };
@@ -91,7 +95,7 @@ async fn main() -> Result<()> {
             })
             .await?;
         }
-        _ => bail!("Usage: webex-bridge login | me | status | devices status | rooms find --title TITLE | rooms verify --url SPACE_URL --title TITLE | routes init --url SPACE_URL --title TITLE --agent NAME --workspace PATH | probe [--room ROOM_ID]"),
+        _ => bail!("Usage: webex-bridge login | me | status | devices status | messages inspect --id ID | rooms find --title TITLE | rooms verify --url SPACE_URL --title TITLE | routes init --url SPACE_URL --title TITLE --agent NAME --workspace PATH | probe [--room ROOM_ID]"),
     }
     Ok(())
 }

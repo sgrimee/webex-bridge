@@ -10,9 +10,13 @@ description = "Local Webex mirror and scoped agent channel"
 default = ["server"]
 server = []
 client = []
+# Requires a properly signed macOS app with Keychain access-group entitlement.
+# Unsigned CLI/daemon builds use the login Keychain instead.
+biometric-keychain = ["dep:security-framework"]
 
 [dependencies]
 anyhow = "1"
+chrono = "0.4"
 dirs = "6"
 fs2 = "0.4"
 gethostname = "1"
@@ -29,6 +33,10 @@ toml = "0.8"
 tokio-tungstenite = "0.28"
 webbrowser = "1"
 webex = { path = "../webex-rust" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Optional data-protection Keychain API for future entitled, signed builds.
+security-framework = { version = "3.7.0", features = ["OSX_10_15"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

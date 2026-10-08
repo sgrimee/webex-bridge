@@ -30,6 +30,8 @@ pub struct Config {
 #[derive(Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebexConfig {
+    /// Explicit OAuth scope policy: granular by default, broad only after user approval.
+    pub oauth_scope: OAuthScope,
     /// Auto means `<hostname>-webex-bridge`.
     pub device_name: String,
     /// Oldest time a room can be backfilled.
@@ -43,12 +45,24 @@ pub struct WebexConfig {
 impl Default for WebexConfig {
     fn default() -> Self {
         Self {
+            oauth_scope: OAuthScope::Granular,
             device_name: "auto".into(),
             catchup_max_age: "180d".into(),
             initial_page_size: 50,
             retention_max_age: None,
         }
     }
+}
+
+/// Explicit user choice of OAuth scope set; never auto-upgrade on HTTP 403.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthScope {
+    /// Ten granular scopes in the initial feasibility test.
+    #[default]
+    Granular,
+    /// Broad `spark:all` only, as explicitly approved by this user.
+    SparkAll,
 }
 
 /// Daemon-enforced resource ceilings.
@@ -215,6 +229,13 @@ mod tests {
         assert!(config.check_write_room("elsewhere").is_err());
         assert!(config.check_write_room("social").is_ok());
         assert!(toml::from_str::<Config>("[webex]\nspark_all = true\n").is_err());
+        assert_eq!(
+            toml::from_str::<Config>("[webex]\noauth_scope = 'spark_all'\n")
+                .unwrap()
+                .webex
+                .oauth_scope,
+            OAuthScope::SparkAll
+        );
         assert!(toml::from_str::<Config>("[[routes]]\nid = 'r'\nroom_id = 'a'\nagent_name = 'b'\nallowed_senders = []\nworkspace = 'x'\nreceive = 'any'\n").is_err());
     }
 

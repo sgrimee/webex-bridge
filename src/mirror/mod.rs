@@ -105,6 +105,8 @@ pub struct MirrorStats {
     pub revisions: i64,
     /// Rooms whose initial six-month sync completed.
     pub initial_done: i64,
+    /// Known rooms whose initial sync/backfill has not finished.
+    pub initial_pending: i64,
     /// Rooms with a recorded recovery gap.
     pub gaps: i64,
     /// Room phases with a sanitized failure that retry on reconnect.
@@ -189,6 +191,11 @@ impl Mirror {
                 .query_row("SELECT count(*) FROM messages", [], |row| row.get(0))?,
             initial_done: self.conn.query_row(
                 "SELECT count(*) FROM room_sync WHERE initial_done=1",
+                [],
+                |row| row.get(0),
+            )?,
+            initial_pending: self.conn.query_row(
+                "SELECT count(*) FROM room_sync WHERE initial_done=0",
                 [],
                 |row| row.get(0),
             )?,

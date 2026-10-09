@@ -42,8 +42,8 @@ async fn main() -> Result<()> {
             if paths.mirror.exists() {
                 match Mirror::open(&paths).and_then(|mirror| mirror.stats()) {
                     Ok(stats) => println!(
-                        "Mirror: rooms={} revisions={} initialDone={} gaps={} retryableFailures={}",
-                        stats.rooms, stats.revisions, stats.initial_done, stats.gaps, stats.failures
+                        "Mirror: rooms={} revisions={} initialDone={} initialPending={} gaps={} retryableFailures={}",
+                        stats.rooms, stats.revisions, stats.initial_done, stats.initial_pending, stats.gaps, stats.failures
                     ),
                     // A locked Keychain means encrypted content remains unavailable;
                     // report health without creating a plaintext fallback.

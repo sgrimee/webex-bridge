@@ -156,6 +156,13 @@ impl Mirror {
     /// configuration and enqueue only messages that pass every delivery rule.
     /// Returns the number newly made pending.
     pub fn queue_deliveries(&mut self, config: &Config) -> Result<usize> {
+        Ok(self.queue_new_deliveries(config)?.len())
+    }
+
+    /// As [`Self::queue_deliveries`], but returns only newly queued metadata so
+    /// the daemon can emit a route-scoped `inbox.new` event without querying or
+    /// exposing already-pending deliveries.
+    pub fn queue_new_deliveries(&mut self, config: &Config) -> Result<Vec<Delivery>> {
         let routes = config
             .routes
             .iter()
@@ -185,14 +192,14 @@ impl Mirror {
         })?;
         let candidates = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
-        let mut queued = 0;
+        let mut queued = Vec::new();
         for (
             route_id,
             _route_created_at,
             message_id,
             revision,
             sender_id,
-            _created_at,
+            created_at,
             body_ct,
             body_nonce,
         ) in candidates
@@ -275,7 +282,14 @@ impl Mirror {
                  VALUES (?1,?2,?3,'pending',NULL)",
                 params![route_id, message_id, revision],
             )?;
-            queued += 1;
+            queued.push(Delivery {
+                id: key.encode(),
+                route_id,
+                sender_id: Some(sender_id),
+                created_at,
+                revision,
+                state: "pending".into(),
+            });
         }
         Ok(queued)
     }
@@ -475,7 +489,10 @@ mod tests {
         mirror
             .upsert_message(&message("sam/coder: please review"))
             .unwrap();
-        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
+        let queued = mirror.queue_new_deliveries(&config).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].route_id, "r");
+        assert_eq!(queued[0].state, "pending");
         let pending = mirror.deliveries(&["r".into()], Some("pending")).unwrap();
         assert_eq!(pending.len(), 1);
         let accepted = mirror

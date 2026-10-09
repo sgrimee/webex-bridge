@@ -53,7 +53,7 @@ pub enum ConnectionStatus {
 }
 
 impl ConnectionStatus {
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Disconnected => "disconnected",
             Self::Connected => "connected",
@@ -68,6 +68,7 @@ pub struct ApiState {
     mirror: SharedMirror,
     connection: watch::Receiver<ConnectionStatus>,
     sessions: auth::Sessions,
+    events: events::EventBus,
     config: Arc<Config>,
     rest: Option<watch::Receiver<Option<Arc<WebexRest>>>>,
 }
@@ -80,6 +81,7 @@ impl ApiState {
             mirror,
             connection,
             sessions: auth::Sessions::default(),
+            events: events::EventBus::default(),
             config: Arc::new(Config::default()),
             rest: None,
         }
@@ -96,6 +98,7 @@ impl ApiState {
             mirror,
             connection,
             sessions: auth::Sessions::default(),
+            events: events::EventBus::default(),
             config,
             rest: None,
         }
@@ -114,6 +117,7 @@ impl ApiState {
             mirror,
             connection,
             sessions: auth::Sessions::default(),
+            events: events::EventBus::default(),
             config,
             rest: Some(rest),
         }
@@ -146,6 +150,12 @@ impl ApiState {
     #[must_use]
     pub fn sessions(&self) -> auth::Sessions {
         self.sessions.clone()
+    }
+
+    /// In-process metadata-only event fanout for scoped SSE subscribers.
+    #[must_use]
+    pub fn events(&self) -> events::EventBus {
+        self.events.clone()
     }
 }
 
@@ -197,6 +207,7 @@ async fn status(State(state): State<ApiState>) -> Response {
 fn router(state: ApiState) -> Router {
     Router::new()
         .route("/v1/status", get(status))
+        .merge(events::router())
         .merge(agent::router())
         .merge(ui::router())
         .with_state(state)

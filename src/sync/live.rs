@@ -12,10 +12,10 @@ use tokio::time::sleep;
 use webex::{ActivityType, Event, GlobalId, GlobalIdType, MessageActivity, SpaceActivity};
 
 /// Outcome for a single live event, without message bodies.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum LiveResult {
     /// Canonical message created/edited/deduplicated.
-    Message(Upsert),
+    Message(LiveMessage),
     /// Room-scoped reconciliation after a delete signal.
     Reconciled(ReconcileResult),
     /// Room metadata or membership verified by REST.
@@ -24,6 +24,18 @@ pub enum LiveResult {
     RoomLeft,
     /// Typing, acknowledgement and unrelated control events.
     Ignored,
+}
+
+/// Metadata-only result for a hydrated canonical message. The body remains in
+/// the encrypted mirror; callers can use this only to name a UI SSE event.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LiveMessage {
+    /// Canonical room ID.
+    pub room_id: String,
+    /// Canonical REST message ID.
+    pub message_id: String,
+    /// Whether this observation created, edited or deduplicated a revision.
+    pub upsert: Upsert,
 }
 
 /// Counts from checking known canonical messages after a room-scoped signal.
@@ -149,9 +161,14 @@ pub async fn ingest_event(
                 "sync.live_message mentioned_people={}",
                 message.mentioned_people.as_ref().map_or(0, Vec::len)
             ));
-            Ok(LiveResult::Message(
-                mirror.with(|db| db.upsert_message(&message)).await?,
-            ))
+            Ok(LiveResult::Message(LiveMessage {
+                room_id: room_id.into(),
+                message_id: message
+                    .id
+                    .clone()
+                    .context("Hydrated message has no canonical ID")?,
+                upsert: mirror.with(|db| db.upsert_message(&message)).await?,
+            }))
         }
         ActivityType::Message(MessageActivity::Deleted) => {
             // `event.try_global_id()` mislabels this room target as a Message ID.
@@ -273,7 +290,11 @@ mod tests {
         };
         assert_eq!(
             ingest_event(&mirror, &rest, &event, None).await.unwrap(),
-            LiveResult::Message(Upsert::Edited(1))
+            LiveResult::Message(LiveMessage {
+                room_id: room_id.into(),
+                message_id: canonical.into(),
+                upsert: Upsert::Edited(1),
+            })
         );
         assert_eq!(
             mirror

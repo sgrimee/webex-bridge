@@ -7,11 +7,12 @@ use std::{
 };
 use tokio::sync::watch;
 use webex_bridge::{
-    api::{self, ApiState, ConnectionStatus},
+    api::{self, events::EventBus, ApiState, ConnectionStatus},
     config::Config,
     diagnostics,
-    mirror::{Mirror, SharedMirror},
+    mirror::{Mirror, SharedMirror, Upsert},
     paths::Paths,
+    routing::Delivery,
     supervisor,
     sync::{self, history::WebexRest, live},
 };
@@ -53,18 +54,20 @@ async fn main() -> Result<()> {
     diagnostics::info("daemon.mirror_opened");
     let (connected_tx, connected_rx) = watch::channel::<Option<Arc<WebexRest>>>(None);
     let (api_connection_tx, api_connection_rx) = watch::channel(ConnectionStatus::Disconnected);
-    let api_server = api::start(
-        &paths,
-        ApiState::with_config_and_rest(
-            mirror.clone(),
-            api_connection_rx,
-            Arc::clone(&background_config),
-            connected_rx.clone(),
-        ),
-    )
-    .await?;
+    let api_state = ApiState::with_config_and_rest(
+        mirror.clone(),
+        api_connection_rx,
+        Arc::clone(&background_config),
+        connected_rx.clone(),
+    );
+    let events = api_state.events();
+    let api_server = api::start(&paths, api_state).await?;
     diagnostics::info("daemon.api_listening");
-    let connection_task = tokio::spawn(watch_connection(connected_rx.clone(), api_connection_tx));
+    let connection_task = tokio::spawn(watch_connection(
+        connected_rx.clone(),
+        api_connection_tx,
+        events.clone(),
+    ));
     let background_mirror = mirror.clone();
     let live_dev_room = dev_room.clone();
     let sync_task = tokio::spawn(run_sync(
@@ -72,10 +75,12 @@ async fn main() -> Result<()> {
         background_mirror,
         Arc::clone(&background_config),
         dev_room,
+        events.clone(),
     ));
     diagnostics::debug("daemon.sync_task_started");
     let live_mirror = mirror.clone();
     let live_config = Arc::clone(&background_config);
+    let live_events = events.clone();
     let result = supervisor::run_daemon_with_refresh_after_and_gap(
         &paths,
         refresh_after,
@@ -84,6 +89,7 @@ async fn main() -> Result<()> {
             let mirror = live_mirror.clone();
             let dev_room = live_dev_room.clone();
             let config = Arc::clone(&live_config);
+            let events = live_events.clone();
             async move {
                 let verb: String = event
                     .data
@@ -100,14 +106,35 @@ async fn main() -> Result<()> {
                         // Queue from the encrypted mirror only after a
                         // successful hydration/upsert. Routing never reads a
                         // Mercury payload directly.
-                        let _queued = mirror
-                            .with(|db| db.queue_deliveries(&config))
+                        let queued = mirror
+                            .with(|db| db.queue_new_deliveries(&config))
                             .await
                             .map_err(|_| {
                                 webex::error::Error::Other("Agent routing failed".into())
                             })?;
-                        let outcome = match result {
-                            live::LiveResult::Message(_) => "message",
+                        publish_deliveries(&events, &queued);
+                        let outcome = match &result {
+                            live::LiveResult::Message(message) => {
+                                let event_name = match message.upsert {
+                                    Upsert::Created(_) => Some("message.created"),
+                                    Upsert::Edited(_) => Some("message.updated"),
+                                    Upsert::Unchanged | Upsert::IgnoredDeleted => None,
+                                };
+                                if let Some(event_name) = event_name {
+                                    events.publish_ui(
+                                        event_name,
+                                        serde_json::json!({
+                                            "roomId": message.room_id,
+                                            "messageId": message.message_id,
+                                            "revision": match message.upsert {
+                                                Upsert::Created(revision) | Upsert::Edited(revision) => revision,
+                                                Upsert::Unchanged | Upsert::IgnoredDeleted => 0,
+                                            },
+                                        }),
+                                    );
+                                }
+                                "message"
+                            }
                             live::LiveResult::Reconciled(_) => "reconciled",
                             live::LiveResult::RoomUpdated => "room_updated",
                             live::LiveResult::RoomLeft => "room_left",
@@ -218,6 +245,7 @@ fn sync_error_kind(error: &anyhow::Error) -> &'static str {
 async fn watch_connection(
     mut connected: watch::Receiver<Option<Arc<WebexRest>>>,
     status: watch::Sender<ConnectionStatus>,
+    events: EventBus,
 ) {
     loop {
         let next = if connected.borrow().is_some() {
@@ -226,9 +254,26 @@ async fn watch_connection(
             ConnectionStatus::Disconnected
         };
         let _ = status.send(next);
+        events.publish_both(
+            "connection.status",
+            serde_json::json!({ "connection": next.as_str() }),
+        );
         if connected.changed().await.is_err() {
             return;
         }
+    }
+}
+
+fn publish_deliveries(events: &EventBus, deliveries: &[Delivery]) {
+    for delivery in deliveries {
+        events.publish_agent_route(
+            &delivery.route_id,
+            "inbox.new",
+            serde_json::json!({
+                "deliveryId": delivery.id,
+                "revision": delivery.revision,
+            }),
+        );
     }
 }
 
@@ -237,6 +282,7 @@ async fn run_sync(
     mirror: SharedMirror,
     config: Arc<Config>,
     dev_room: Option<String>,
+    events: EventBus,
 ) -> Result<()> {
     loop {
         diagnostics::debug("sync.waiting_for_connection");
@@ -260,14 +306,24 @@ async fn run_sync(
                 match result {
                     Ok(summary) => {
                         let queued = mirror
-                            .with(|db| db.queue_deliveries(&config))
+                            .with(|db| db.queue_new_deliveries(&config))
                             .await
                             .context("Agent routing failed after synchronization")?;
+                        publish_deliveries(&events, &queued);
+                        events.publish_ui(
+                            "sync.progress",
+                            serde_json::json!({
+                                "rooms": summary.rooms,
+                                "initial": summary.initial_rooms,
+                                "gaps": summary.gaps,
+                                "failed": summary.failed_rooms,
+                            }),
+                        );
                         diagnostics::info(format!(
                             "sync.completed elapsed_ms={} rooms={} initial={} created={} edited={} deleted={} gaps={} backfilled={} failed={} agent_deliveries={}",
                             started.elapsed().as_millis(), summary.rooms, summary.initial_rooms,
                             summary.created, summary.edited, summary.deleted, summary.gaps,
-                            summary.backfilled_rooms, summary.failed_rooms, queued
+                            summary.backfilled_rooms, summary.failed_rooms, queued.len()
                         ));
                     },
                     // Never expose response bodies, tokens, room titles or message IDs in daemon logs.

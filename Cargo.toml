@@ -39,6 +39,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-uti
 toml = "0.8"
 tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = "0.28"
+tokio-stream = { version = "0.1", features = ["sync"] }
 webbrowser = "1"
 webex = { path = "../webex-rust" }
 zeroize = "1.8"

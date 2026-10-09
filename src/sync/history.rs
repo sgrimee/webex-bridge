@@ -19,6 +19,17 @@ pub struct WebexRest {
     token: String,
 }
 
+/// Outcome classification for a dispatched paired-UI mutation. Transport,
+/// server failures and malformed successful responses are ambiguous: Webex may
+/// have committed them even though the daemon cannot confirm a canonical result.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum UiWriteError {
+    /// Webex returned a definite 4xx rejection after receiving the request.
+    Rejected,
+    /// Dispatch or response confirmation failed after a possible commit.
+    DeliveryUnknown,
+}
+
 #[derive(Deserialize)]
 struct Page<T> {
     items: Vec<T>,
@@ -283,6 +294,58 @@ impl WebexRest {
         .await
     }
 
+    async fn ui_write_message<B: Serialize>(
+        &self,
+        method: Method,
+        message_id: Option<&str>,
+        body: &B,
+    ) -> std::result::Result<Message, UiWriteError> {
+        let response = self
+            .client
+            .request(
+                method,
+                self.endpoint("messages", message_id)
+                    .map_err(|_| UiWriteError::Rejected)?,
+            )
+            .bearer_auth(&self.token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|_| UiWriteError::DeliveryUnknown)?;
+        let status = response.status();
+        if status.is_success() {
+            return Self::decode_mirror_message(
+                response
+                    .json::<serde_json::Value>()
+                    .await
+                    .map_err(|_| UiWriteError::DeliveryUnknown)?,
+            )
+            .map_err(|_| UiWriteError::DeliveryUnknown);
+        }
+        if status.is_client_error() {
+            Err(UiWriteError::Rejected)
+        } else {
+            Err(UiWriteError::DeliveryUnknown)
+        }
+    }
+
+    async fn ui_delete(&self, path: Url) -> std::result::Result<(), UiWriteError> {
+        let response = self
+            .client
+            .delete(path)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|_| UiWriteError::DeliveryUnknown)?;
+        if response.status().is_success() {
+            Ok(())
+        } else if response.status().is_client_error() {
+            Err(UiWriteError::Rejected)
+        } else {
+            Err(UiWriteError::DeliveryUnknown)
+        }
+    }
+
     /// Send one UI body with explicit plain-text or Markdown provenance. This
     /// is UI-only; agent drafts retain their required Markdown/trailer format.
     pub async fn send_ui_body(
@@ -291,13 +354,15 @@ impl WebexRest {
         parent_id: Option<&str>,
         kind: &str,
         content: &str,
-    ) -> Result<Message> {
+    ) -> std::result::Result<Message, UiWriteError> {
         if content.is_empty() || content.len() > 7439 || content.contains('\0') {
-            bail!("Webex UI body must be between 1 and 7439 non-NUL bytes");
+            return Err(UiWriteError::Rejected);
         }
-        let _ = GlobalId::new(GlobalIdType::Room, room_id.to_owned())?;
+        GlobalId::new(GlobalIdType::Room, room_id.to_owned())
+            .map_err(|_| UiWriteError::Rejected)?;
         if let Some(parent_id) = parent_id {
-            let _ = GlobalId::new(GlobalIdType::Message, parent_id.to_owned())?;
+            GlobalId::new(GlobalIdType::Message, parent_id.to_owned())
+                .map_err(|_| UiWriteError::Rejected)?;
         }
         let mut outgoing = MessageOut {
             room_id: Some(room_id.into()),
@@ -307,9 +372,9 @@ impl WebexRest {
         match kind {
             "plainText" => outgoing.text = Some(content.into()),
             "markdown" => outgoing.markdown = Some(content.into()),
-            _ => bail!("Unsupported UI body kind"),
+            _ => return Err(UiWriteError::Rejected),
         }
-        self.write_message(Method::POST, None, &outgoing).await
+        self.ui_write_message(Method::POST, None, &outgoing).await
     }
 
     /// Edit one UI body with explicit plain-text or Markdown provenance.
@@ -319,19 +384,34 @@ impl WebexRest {
         room_id: &str,
         kind: &str,
         content: &str,
-    ) -> Result<Message> {
+    ) -> std::result::Result<Message, UiWriteError> {
         if content.is_empty() || content.len() > 7439 || content.contains('\0') {
-            bail!("Webex UI body must be between 1 and 7439 non-NUL bytes");
+            return Err(UiWriteError::Rejected);
         }
-        let _ = GlobalId::new(GlobalIdType::Message, message_id.to_owned())?;
-        let _ = GlobalId::new(GlobalIdType::Room, room_id.to_owned())?;
+        GlobalId::new(GlobalIdType::Message, message_id.to_owned())
+            .map_err(|_| UiWriteError::Rejected)?;
+        GlobalId::new(GlobalIdType::Room, room_id.to_owned())
+            .map_err(|_| UiWriteError::Rejected)?;
         let body = match kind {
             "plainText" => serde_json::json!({ "roomId": room_id, "text": content }),
             "markdown" => serde_json::json!({ "roomId": room_id, "markdown": content }),
-            _ => bail!("Unsupported UI body kind"),
+            _ => return Err(UiWriteError::Rejected),
         };
-        self.write_message(Method::PUT, Some(message_id), &body)
+        self.ui_write_message(Method::PUT, Some(message_id), &body)
             .await
+    }
+
+    /// Delete a paired-UI message without retrying an ambiguous dispatch.
+    pub async fn delete_ui_message(
+        &self,
+        message_id: &str,
+    ) -> std::result::Result<(), UiWriteError> {
+        GlobalId::new(GlobalIdType::Message, message_id.to_owned())
+            .map_err(|_| UiWriteError::Rejected)?;
+        let path = self
+            .endpoint("messages", Some(message_id))
+            .map_err(|_| UiWriteError::Rejected)?;
+        self.ui_delete(path).await
     }
 
     /// Delete a message through the daemon-owned Webex connection. No retry is
@@ -464,6 +544,46 @@ impl WebexRest {
             bail!("Webex room leave returned HTTP {status}");
         }
         Ok(())
+    }
+
+    /// Leave a paired UI room and classify only the dispatched membership
+    /// delete conservatively. Preflight failures happen before dispatch and are
+    /// definite rejections, never delivery-unknown outcomes.
+    pub async fn leave_ui_room(&self, room_id: &str) -> std::result::Result<(), UiWriteError> {
+        GlobalId::new(GlobalIdType::Room, room_id.to_owned())
+            .map_err(|_| UiWriteError::Rejected)?;
+        let me = self.me().await.map_err(|_| UiWriteError::Rejected)?;
+        let mut url = self
+            .endpoint("memberships", None)
+            .map_err(|_| UiWriteError::Rejected)?;
+        url.query_pairs_mut()
+            .append_pair("roomId", room_id)
+            .append_pair("personId", &me.id)
+            .append_pair("max", "2");
+        let response = self
+            .get(url)
+            .await
+            .map_err(|_| UiWriteError::Rejected)?
+            .ok_or(UiWriteError::Rejected)?;
+        let memberships = response
+            .json::<Page<Membership>>()
+            .await
+            .map_err(|_| UiWriteError::Rejected)?
+            .items;
+        let membership = memberships
+            .into_iter()
+            .find(|membership| membership.room_id == room_id && membership.person_id == me.id)
+            .ok_or(UiWriteError::Rejected)?;
+        if membership.id.is_empty()
+            || membership.id.len() > 1024
+            || membership.id.chars().any(char::is_control)
+        {
+            return Err(UiWriteError::Rejected);
+        }
+        let path = self
+            .endpoint("memberships", Some(&membership.id))
+            .map_err(|_| UiWriteError::Rejected)?;
+        self.ui_delete(path).await
     }
 
     /// Hydrate one person for encrypted UI metadata.
@@ -646,6 +766,46 @@ mod tests {
         rest.edit_ui_body(message, room, "markdown", "**rich**")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ui_write_classifies_rejection_and_post_dispatch_ambiguity() {
+        let room = "Y2lzY29zcGFyazovL3VzL1JPT00vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBhMDAx";
+        for (status, expected) in [
+            (400, UiWriteError::Rejected),
+            (500, UiWriteError::DeliveryUnknown),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .respond_with(ResponseTemplate::new(status))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let rest = WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap())
+                .unwrap();
+            assert_eq!(
+                rest.send_ui_body(room, None, "markdown", "write once")
+                    .await
+                    .unwrap_err(),
+                expected
+            );
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not JSON"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rest =
+            WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
+        assert_eq!(
+            rest.send_ui_body(room, None, "markdown", "write once")
+                .await
+                .unwrap_err(),
+            UiWriteError::DeliveryUnknown
+        );
     }
 
     #[tokio::test]

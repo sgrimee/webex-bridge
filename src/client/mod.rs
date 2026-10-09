@@ -74,6 +74,17 @@ impl ClientError {
         )
     }
 
+    /// Whether Webex definitely rejected a paired-UI write before the daemon
+    /// could report a confirmed mirror result. This is distinct from
+    /// [`Self::is_delivery_unknown`], which callers must never replay.
+    #[must_use]
+    pub fn is_definitely_rejected(&self) -> bool {
+        matches!(
+            self,
+            Self::Api { code, .. } if code == "webex_rejected"
+        )
+    }
+
     /// Whether the paired daemon has not yet mirrored an authoritative account
     /// identity. Callers can still show other locally available mirror data.
     #[must_use]
@@ -269,6 +280,17 @@ mod tests {
                 } if code == "delivery_unknown" && message == "The write may have succeeded"
             ));
         }
+    }
+
+    #[test]
+    fn explicit_webex_rejection_is_not_delivery_unknown() {
+        let error = BridgeClient::decode_json::<serde_json::Value>(
+            StatusCode::BAD_GATEWAY,
+            br#"{"code":"webex_rejected","message":"Webex rejected the message"}"#,
+        )
+        .unwrap_err();
+        assert!(error.is_definitely_rejected());
+        assert!(!error.is_delivery_unknown());
     }
 
     #[test]

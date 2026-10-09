@@ -239,6 +239,19 @@ fn write_allowed(state: &ApiState, room_id: &str) -> Result<(), Box<Response>> {
     })
 }
 
+fn ui_write_error(error: crate::sync::history::UiWriteError, action: &'static str) -> Response {
+    match error {
+        crate::sync::history::UiWriteError::Rejected => {
+            json_error(StatusCode::BAD_GATEWAY, "webex_rejected", action)
+        }
+        crate::sync::history::UiWriteError::DeliveryUnknown => json_error(
+            StatusCode::ACCEPTED,
+            "delivery_unknown",
+            "Webex may have accepted the write but delivery is not confirmed",
+        ),
+    }
+}
+
 async fn persisted_message(
     state: &ApiState,
     message: &webex::Message,
@@ -502,12 +515,8 @@ async fn leave_room(
             "Webex is not connected",
         );
     };
-    if rest.leave_room(&room.id).await.is_err() {
-        return json_error(
-            StatusCode::BAD_GATEWAY,
-            "webex_unavailable",
-            "Webex did not accept the room leave",
-        );
+    if let Err(error) = rest.leave_ui_room(&room.id).await {
+        return ui_write_error(error, "Webex rejected the room leave");
     }
     match state.mirror().with(|db| db.mark_room_left(&room.id)).await {
         Ok(()) => {
@@ -711,11 +720,7 @@ async fn create_message(
             "delivery_unknown",
             "Webex returned a message for an unexpected room",
         ),
-        Err(_) => json_error(
-            StatusCode::BAD_GATEWAY,
-            "webex_unavailable",
-            "Webex did not accept the message",
-        ),
+        Err(error) => ui_write_error(error, "Webex rejected the message"),
     }
 }
 
@@ -783,11 +788,7 @@ async fn edit_message(
             "delivery_unknown",
             "Webex returned an unexpected message",
         ),
-        Err(_) => json_error(
-            StatusCode::BAD_GATEWAY,
-            "webex_unavailable",
-            "Webex did not accept the edit",
-        ),
+        Err(error) => ui_write_error(error, "Webex rejected the edit"),
     }
 }
 
@@ -828,12 +829,8 @@ async fn delete_message(
             "Webex is not connected",
         );
     };
-    if rest.delete_message(&message_id).await.is_err() {
-        return json_error(
-            StatusCode::BAD_GATEWAY,
-            "webex_unavailable",
-            "Webex did not accept the delete",
-        );
+    if let Err(error) = rest.delete_ui_message(&message_id).await {
+        return ui_write_error(error, "Webex rejected the delete");
     }
     match state
         .mirror()

@@ -547,7 +547,29 @@ mod server_tests {
         let secret = "a-local-ui-secret-that-is-long-enough";
         let hash = URL_SAFE_NO_PAD.encode(Sha256::digest(secret.as_bytes()));
         mirror
-            .with(|db| db.pair_ui_client(&hash, "/test/webex-tui"))
+            .with(|db| {
+                db.pair_ui_client(&hash, "/test/webex-tui")?;
+                db.upsert_room(
+                    &webex::Room {
+                        id: room_id.into(),
+                        title: Some("Writable room".into()),
+                        room_type: "group".into(),
+                        is_locked: false,
+                        team_id: None,
+                        last_activity: "2026-10-08T12:00:00Z".into(),
+                        creator_id: "person-1".into(),
+                        created: "2026-10-08T12:00:00Z".into(),
+                    },
+                    true,
+                )?;
+                db.upsert_message(&webex::Message {
+                    id: Some("Y2lzY29zcGFyazovL3VzL01FU1NBR0UvMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBjMDA0".into()),
+                    room_id: Some(room_id.into()),
+                    created: Some("2026-10-08T12:00:00Z".into()),
+                    text: Some("seed message".into()),
+                    ..webex::Message::default()
+                })
+            })
             .await
             .unwrap();
         let (_connection_tx, connection_rx) = watch::channel(ConnectionStatus::Connected);
@@ -777,6 +799,84 @@ mod server_tests {
             .unwrap();
         assert_eq!(sent.body.as_ref().unwrap().kind, "plainText");
         assert_eq!(sent.attachment_count, 0);
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ui_writes_never_confirm_post_dispatch_ambiguity() {
+        let room_id =
+            "Y2lzY29zcGFyazovL3VzL1JPT00vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBhMDAx";
+        let message_id =
+            "Y2lzY29zcGFyazovL3VzL01FU1NBR0UvMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBjMDA0";
+        let person_id =
+            "Y2lzY29zcGFyazovL3VzL1BFT1BMRS8wMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMGIwMDE";
+        let membership_id =
+            "Y2lzY29zcGFyazovL3VzL01FTUJFUlNISVAvODc2NTQzMjEtNDMyMS00MzIxLTQzMjEtMjEwOTg3NjU0MzIx";
+        let remote = MockServer::start().await;
+        for (method_name, path_value) in [
+            ("POST", "/v1/messages".to_owned()),
+            ("PUT", format!("/v1/messages/{message_id}")),
+            ("DELETE", format!("/v1/messages/{message_id}")),
+            ("DELETE", format!("/v1/memberships/{membership_id}")),
+        ] {
+            Mock::given(method(method_name))
+                .and(path(path_value))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(1)
+                .mount(&remote)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/v1/people/me"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": person_id})),
+            )
+            .expect(1)
+            .mount(&remote)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/memberships"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"items": [{
+                    "id": membership_id,
+                    "roomId": room_id,
+                    "personId": person_id,
+                    "isModerator": false,
+                    "isMonitor": false,
+                    "created": "2026-10-08T12:00:00Z"
+                }]})),
+            )
+            .expect(1)
+            .mount(&remote)
+            .await;
+        let rest = Arc::new(
+            crate::sync::history::WebexRest::for_tests(
+                reqwest::Url::parse(&format!("{}/v1/", remote.uri())).unwrap(),
+            )
+            .unwrap(),
+        );
+        let (_temp, server, bridge) = writable_rest_server(rest, room_id).await;
+        let ui = bridge
+            .create_ui_session("a-local-ui-secret-that-is-long-enough")
+            .await
+            .unwrap();
+        let body = MessageBodyInput {
+            kind: "plainText".into(),
+            content: "write once".into(),
+        };
+        for error in [
+            ui.create_message_body(room_id, None, &body)
+                .await
+                .unwrap_err(),
+            ui.edit_message_body(message_id, room_id, &body)
+                .await
+                .unwrap_err(),
+            ui.delete_message(message_id).await.unwrap_err(),
+            ui.leave_room(room_id).await.unwrap_err(),
+        ] {
+            assert!(error.is_delivery_unknown());
+            assert!(!error.is_definitely_rejected());
+        }
         server.shutdown().await.unwrap();
     }
 

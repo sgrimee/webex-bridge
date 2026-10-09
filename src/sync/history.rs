@@ -120,6 +120,21 @@ impl WebexRest {
         Ok((rooms, next))
     }
 
+    /// Decode a message while deliberately discarding content-attachment payloads.
+    ///
+    /// The mirror is metadata-only for attachments (D20), and `webex::Message`
+    /// models adaptive cards strictly. A bot's newer or non-card attachment
+    /// must not make its complete message page unavailable for mirror sync.
+    /// The response is never logged and attachment payloads are neither stored
+    /// nor rendered.
+    fn decode_mirror_message(mut value: serde_json::Value) -> Result<Message> {
+        if let Some(object) = value.as_object_mut() {
+            object.remove("attachments");
+        }
+        serde_json::from_value(value)
+            .context("Invalid Webex message response after omitting attachments")
+    }
+
     /// List one page of messages in reverse chronological order.
     pub async fn messages_page(
         &self,
@@ -143,11 +158,14 @@ impl WebexRest {
             .get(url)
             .await?
             .context("Webex message list returned 404")?;
-        Ok(response
-            .json::<Page<Message>>()
+        let page = response
+            .json::<Page<serde_json::Value>>()
             .await
-            .context("Invalid Webex message list response")?
-            .items)
+            .context("Invalid Webex message list response")?;
+        page.items
+            .into_iter()
+            .map(Self::decode_mirror_message)
+            .collect()
     }
 
     /// Hydrate one canonical message; a 404 is a verified deletion only for a known ID.
@@ -157,12 +175,12 @@ impl WebexRest {
         let Some(response) = self.get(url).await? else {
             return Ok(None);
         };
-        Ok(Some(
+        Ok(Some(Self::decode_mirror_message(
             response
-                .json::<Message>()
+                .json::<serde_json::Value>()
                 .await
                 .context("Invalid Webex message response")?,
-        ))
+        )?))
     }
 
     /// Hydrate one room for membership verification, not just a Mercury verb.
@@ -273,6 +291,34 @@ mod tests {
         let page = rest.messages_page(room, None, 50).await.unwrap();
         assert_eq!(page.len(), 1);
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn message_page_ignores_unsupported_attachment_payloads() {
+        let server = MockServer::start().await;
+        let room = "Y2lzY29zcGFyazovL3VzL1JPT00vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBhMDAx";
+        Mock::given(method("GET"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [{
+                    "id": "message-1",
+                    "roomId": room,
+                    "created": "2026-10-08T12:00:00Z",
+                    "text": "private fixture",
+                    "attachments": [{
+                        "contentType": "application/vnd.example.card+json",
+                        "content": {"unmodeled": true}
+                    }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let rest =
+            WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
+        let messages = rest.messages_page(room, None, 50).await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].attachments.is_none());
+        assert_eq!(messages[0].text.as_deref(), Some("private fixture"));
     }
 
     #[tokio::test]

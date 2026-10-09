@@ -176,6 +176,9 @@ struct SyncStatus {
     initial_pending: i64,
     gaps: i64,
     failures: i64,
+    /// Non-content notification threshold used by scoped agent hosts to avoid
+    /// flooding the local UI during catch-up.
+    catchup_notify_threshold: u32,
 }
 
 async fn status(State(state): State<ApiState>) -> Response {
@@ -190,6 +193,7 @@ async fn status(State(state): State<ApiState>) -> Response {
                 initial_pending: stats.initial_pending,
                 gaps: stats.gaps,
                 failures: stats.failures,
+                catchup_notify_threshold: state.config().limits.catchup_notify_threshold,
             },
         })
         .into_response(),

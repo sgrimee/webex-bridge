@@ -36,6 +36,7 @@ type UpsertPrevious = (
     Option<Vec<u8>>,
     Option<Vec<u8>>,
     Option<Vec<u8>>,
+    Option<String>,
 );
 type StoredBody = (i64, String, Option<Vec<u8>>, Option<Vec<u8>>);
 type UiRoomRow = (
@@ -58,6 +59,8 @@ type UiMessageRow = (
     String,
     Option<Vec<u8>>,
     Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<String>,
 );
 type DeletePrevious = (
     i64,
@@ -67,6 +70,11 @@ type DeletePrevious = (
     Option<String>,
     Option<String>,
 );
+
+#[derive(serde::Deserialize, Serialize)]
+struct StoredAttachmentMeta {
+    count: u32,
+}
 
 /// Result of a canonical message upsert.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -143,7 +151,18 @@ pub struct UiMessage {
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub status: String,
+    /// Compatibility projection; use `body` for authoritative provenance.
     pub markdown: Option<String>,
+    pub body: Option<UiBody>,
+    pub attachment_count: u32,
+}
+
+/// A body retained for UI rendering/copy/edit with authoritative or legacy provenance.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiBody {
+    pub kind: String,
+    pub content: String,
 }
 
 /// Shared access that holds the DB lock only for synchronous operations.
@@ -751,12 +770,28 @@ impl Mirror {
             .as_deref()
             .context("REST message has no creation time")?;
         parse_timestamp(created_at)?;
-        let body = message.markdown.as_ref().or(message.text.as_ref());
-        let files = message.files.as_ref().map(serde_json::to_vec).transpose()?;
+        let (body, body_kind) = if let Some(markdown) = message.markdown.as_ref() {
+            (Some(markdown.as_str()), Some("markdown"))
+        } else if let Some(text) = message.text.as_ref() {
+            (Some(text.as_str()), Some("plain_text"))
+        } else {
+            (None, None)
+        };
+        // Never retain or project attachment URLs. New rows store only a count;
+        // legacy rows may still contain encrypted URLs until their revision is
+        // superseded or deleted.
+        let files = message
+            .files
+            .as_ref()
+            .map(|files| {
+                let count = u32::try_from(files.len()).context("Attachment count overflow")?;
+                Ok::<_, anyhow::Error>(serde_json::to_vec(&StoredAttachmentMeta { count })?)
+            })
+            .transpose()?;
         let previous: Option<UpsertPrevious> = self
             .conn
             .query_row(
-                "SELECT revision,status,updated_at,body_ct,body_nonce,files_meta_ct
+                "SELECT revision,status,updated_at,body_ct,body_nonce,files_meta_ct,body_kind
                  FROM messages WHERE message_id=?1 ORDER BY revision DESC LIMIT 1",
                 [id],
                 |row| {
@@ -767,11 +802,14 @@ impl Mirror {
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             )
             .optional()?;
-        if let Some((revision, status, updated, old_ct, old_nonce, old_files)) = &previous {
+        if let Some((revision, status, updated, old_ct, old_nonce, old_files, old_body_kind)) =
+            &previous
+        {
             if status == "deleted" {
                 return Ok(Upsert::IgnoredDeleted);
             }
@@ -792,7 +830,10 @@ impl Mirror {
                             .open_prefixed(blob, &message_aad("files", id, *revision))
                     })
                     .transpose()?;
-                if old_body.as_deref() == body.map(|text| text.as_bytes()) && old_files == files {
+                if old_body.as_deref() == body.map(str::as_bytes)
+                    && old_files == files
+                    && old_body_kind.as_deref() == body_kind
+                {
                     return Ok(Upsert::Unchanged);
                 }
             }
@@ -826,10 +867,10 @@ impl Mirror {
         )?;
         tx.execute(
             "INSERT INTO messages(room_id,message_id,revision,parent_id,sender_id,created_at,updated_at,
-                                  status,body_ct,body_nonce,files_meta_ct)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,'active',?8,?9,?10)",
+                                  status,body_ct,body_nonce,files_meta_ct,body_kind)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,'active',?8,?9,?10,?11)",
             params![room_id,id,revision,message.parent_id,message.person_id,created_at,
-                message.updated,body_ct,body_nonce,files_ct],
+                message.updated,body_ct,body_nonce,files_ct,body_kind],
         )?;
         tx.execute(
             "DELETE FROM ui_lookup WHERE resource='message' AND resource_id=?1",
@@ -1044,11 +1085,15 @@ impl Mirror {
         let row: Option<UiMessageRow> = self
             .conn
             .query_row(
-                "SELECT room_id,revision,parent_id,sender_id,created_at,updated_at,status,body_ct,body_nonce
+                "SELECT room_id,revision,parent_id,sender_id,created_at,updated_at,status,body_ct,body_nonce,
+                        files_meta_ct,body_kind
                  FROM messages WHERE message_id=?1
                  ORDER BY revision DESC LIMIT 1",
                 [message_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?)),
+                |row| Ok((
+                    row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
+                    row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?,
+                )),
             )
             .optional()?;
         let Some((
@@ -1061,6 +1106,8 @@ impl Mirror {
             status,
             body_ct,
             body_nonce,
+            files_meta_ct,
+            body_kind,
         )) = row
         else {
             return Ok(None);
@@ -1068,7 +1115,7 @@ impl Mirror {
         if room_filter.is_some_and(|expected| expected != room_id) {
             return Ok(None);
         }
-        let markdown = match (body_ct, body_nonce) {
+        let content = match (body_ct, body_nonce) {
             (Some(ct), Some(nonce)) if status == "active" => Some(
                 String::from_utf8(self.crypto.open(
                     &ct,
@@ -1081,6 +1128,34 @@ impl Mirror {
             _ if status == "deleted" => None,
             _ => bail!("Mirror body ciphertext/nonce mismatch"),
         };
+        let body = content.as_ref().map(|content| UiBody {
+            kind: match body_kind.as_deref() {
+                Some("markdown") => "markdown",
+                Some("plain_text") => "plainText",
+                _ => "legacyUnknown",
+            }
+            .into(),
+            content: content.clone(),
+        });
+        let attachment_count = if status == "active" {
+            files_meta_ct
+                .map(|blob| {
+                    let bytes = self
+                        .crypto
+                        .open_prefixed(&blob, &message_aad("files", message_id, revision))?;
+                    if let Ok(meta) = serde_json::from_slice::<StoredAttachmentMeta>(&bytes) {
+                        Ok(meta.count)
+                    } else {
+                        let legacy: Vec<serde_json::Value> = serde_json::from_slice(&bytes)
+                            .context("Invalid encrypted attachment metadata")?;
+                        u32::try_from(legacy.len()).context("Attachment count overflow")
+                    }
+                })
+                .transpose()?
+                .unwrap_or(0)
+        } else {
+            0
+        };
         Ok(Some(UiMessage {
             id: message_id.into(),
             room_id,
@@ -1090,7 +1165,9 @@ impl Mirror {
             created_at,
             updated_at,
             status,
-            markdown,
+            markdown: content,
+            body,
+            attachment_count,
         }))
     }
 
@@ -1128,7 +1205,10 @@ impl Mirror {
             .checked_add(1)
             .context("Message revision overflow")?;
         let tx = self.conn.transaction()?;
-        tx.execute("UPDATE messages SET body_ct=NULL, body_nonce=NULL, files_meta_ct=NULL WHERE message_id=?1", [message_id])?;
+        tx.execute(
+            "UPDATE messages SET body_ct=NULL, body_nonce=NULL, files_meta_ct=NULL,body_kind=NULL WHERE message_id=?1",
+            [message_id],
+        )?;
         tx.execute("INSERT INTO messages(room_id,message_id,revision,parent_id,sender_id,created_at,updated_at,status)
                     VALUES (?1,?2,?3,?4,?5,?6,?7,'deleted')",
             params![room_id,message_id,new_revision,parent,sender,created,Utc::now().to_rfc3339()])?;
@@ -1722,6 +1802,74 @@ mod tests {
         assert!(mirror
             .ui_room_messages("room-1", Some("missing"), 2)
             .is_err());
+    }
+
+    #[test]
+    fn ui_message_projects_body_kind_and_attachment_count_without_urls() {
+        let mut mirror = Mirror::in_memory([19_u8; 32]).unwrap();
+        let mut plain = message("plain", "plain body", None);
+        plain.files = Some(vec![
+            "https://files.example.test/private-report.pdf?token=secret".into(),
+        ]);
+        mirror.upsert_message(&plain).unwrap();
+        let projected = mirror.ui_message("plain").unwrap().unwrap();
+        assert_eq!(
+            projected.body,
+            Some(UiBody {
+                kind: "plainText".into(),
+                content: "plain body".into(),
+            })
+        );
+        assert_eq!(projected.attachment_count, 1);
+        let stored: Vec<u8> = mirror
+            .conn
+            .query_row(
+                "SELECT files_meta_ct FROM messages WHERE message_id='plain'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!stored
+            .windows(b"private-report.pdf".len())
+            .any(|window| window == b"private-report.pdf"));
+
+        let mut markdown = message("markdown", "plain fallback", None);
+        markdown.markdown = Some("**rich**".into());
+        mirror.upsert_message(&markdown).unwrap();
+        assert_eq!(
+            mirror
+                .ui_message("markdown")
+                .unwrap()
+                .unwrap()
+                .body
+                .unwrap()
+                .kind,
+            "markdown"
+        );
+
+        // Existing rows have ciphertext but no body_kind. Never relabel their
+        // content as plain text or Markdown without an authoritative hydrate.
+        mirror
+            .conn
+            .execute(
+                "UPDATE messages SET body_kind=NULL WHERE message_id='plain'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            mirror
+                .ui_message("plain")
+                .unwrap()
+                .unwrap()
+                .body
+                .unwrap()
+                .kind,
+            "legacyUnknown"
+        );
+        assert!(mirror.mark_deleted("room-1", "plain").unwrap());
+        let deleted = mirror.ui_message("plain").unwrap().unwrap();
+        assert!(deleted.body.is_none());
+        assert_eq!(deleted.attachment_count, 0);
     }
 
     #[test]

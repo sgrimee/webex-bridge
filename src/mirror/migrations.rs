@@ -1,6 +1,6 @@
 //! Atomic SQLite schema migrations.
 
-use super::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5};
+use super::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6};
 use anyhow::{bail, Result};
 use rusqlite::Connection;
 
@@ -51,6 +51,18 @@ fn migrate_v5(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_v6(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction()?;
+    if !has_column(&tx, "messages", "body_kind")? {
+        tx.execute_batch(
+            "ALTER TABLE messages ADD COLUMN body_kind TEXT CHECK (body_kind IN ('plain_text','markdown'));",
+        )?;
+    }
+    tx.execute_batch(SCHEMA_V6)?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Apply migrations or reject a database written by newer code.
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -62,25 +74,33 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
             migrate_v2(conn)?;
             migrate_v3(conn)?;
             migrate_v4(conn)?;
-            migrate_v5(conn)
+            migrate_v5(conn)?;
+            migrate_v6(conn)
         }
         1 => {
             migrate_v2(conn)?;
             migrate_v3(conn)?;
             migrate_v4(conn)?;
-            migrate_v5(conn)
+            migrate_v5(conn)?;
+            migrate_v6(conn)
         }
         2 => {
             migrate_v3(conn)?;
             migrate_v4(conn)?;
-            migrate_v5(conn)
+            migrate_v5(conn)?;
+            migrate_v6(conn)
         }
         3 => {
             migrate_v4(conn)?;
-            migrate_v5(conn)
+            migrate_v5(conn)?;
+            migrate_v6(conn)
         }
-        4 => migrate_v5(conn),
-        5 => Ok(()),
+        4 => {
+            migrate_v5(conn)?;
+            migrate_v6(conn)
+        }
+        5 => migrate_v6(conn),
+        6 => Ok(()),
         _ => bail!("Mirror database schema version {version} is unsupported"),
     }
 }
@@ -98,10 +118,11 @@ mod tests {
         assert!(has_column(&conn, "rooms", "is_locked").unwrap());
         assert!(has_column(&conn, "teams", "name_ct").unwrap());
         assert!(has_column(&conn, "ui_lookup", "checked_at").unwrap());
+        assert!(has_column(&conn, "messages", "body_kind").unwrap());
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                 .unwrap(),
-            5
+            6
         );
         conn.execute_batch("PRAGMA user_version=99").unwrap();
         assert!(migrate(&mut conn).is_err());
@@ -123,6 +144,7 @@ mod tests {
         assert!(has_column(&conn, "account_identity", "person_id_ct").unwrap());
         assert!(has_column(&conn, "rooms", "is_locked").unwrap());
         assert!(has_column(&conn, "teams", "name_ct").unwrap());
+        assert!(has_column(&conn, "messages", "body_kind").unwrap());
         assert_eq!(
             conn.query_row(
                 "SELECT is_locked FROM rooms WHERE room_id='old-room'",
@@ -135,7 +157,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                 .unwrap(),
-            5
+            6
         );
     }
 
@@ -150,12 +172,29 @@ mod tests {
         conn.execute_batch("ALTER TABLE rooms ADD COLUMN is_locked INTEGER;")
             .unwrap();
         conn.execute_batch(SCHEMA_V4).unwrap();
+        conn.execute_batch(
+            "INSERT INTO rooms(room_id,type,is_member,updated_at)
+             VALUES ('legacy-room','group',1,'2026-10-08T12:00:00Z');
+             INSERT INTO messages(room_id,message_id,revision,status,body_ct,body_nonce)
+             VALUES ('legacy-room','legacy-message',0,'active',X'01',X'02');",
+        )
+        .unwrap();
         migrate(&mut conn).unwrap();
         assert!(has_column(&conn, "ui_lookup", "checked_at").unwrap());
+        assert!(has_column(&conn, "messages", "body_kind").unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT body_kind FROM messages WHERE message_id='legacy-message'",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap(),
+            None
+        );
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                 .unwrap(),
-            5
+            6
         );
     }
 
@@ -169,7 +208,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                 .unwrap(),
-            5
+            6
         );
     }
 }

@@ -283,6 +283,57 @@ impl WebexRest {
         .await
     }
 
+    /// Send one UI body with explicit plain-text or Markdown provenance. This
+    /// is UI-only; agent drafts retain their required Markdown/trailer format.
+    pub async fn send_ui_body(
+        &self,
+        room_id: &str,
+        parent_id: Option<&str>,
+        kind: &str,
+        content: &str,
+    ) -> Result<Message> {
+        if content.is_empty() || content.len() > 7439 || content.contains('\0') {
+            bail!("Webex UI body must be between 1 and 7439 non-NUL bytes");
+        }
+        let _ = GlobalId::new(GlobalIdType::Room, room_id.to_owned())?;
+        if let Some(parent_id) = parent_id {
+            let _ = GlobalId::new(GlobalIdType::Message, parent_id.to_owned())?;
+        }
+        let mut outgoing = MessageOut {
+            room_id: Some(room_id.into()),
+            parent_id: parent_id.map(Into::into),
+            ..MessageOut::default()
+        };
+        match kind {
+            "plainText" => outgoing.text = Some(content.into()),
+            "markdown" => outgoing.markdown = Some(content.into()),
+            _ => bail!("Unsupported UI body kind"),
+        }
+        self.write_message(Method::POST, None, &outgoing).await
+    }
+
+    /// Edit one UI body with explicit plain-text or Markdown provenance.
+    pub async fn edit_ui_body(
+        &self,
+        message_id: &str,
+        room_id: &str,
+        kind: &str,
+        content: &str,
+    ) -> Result<Message> {
+        if content.is_empty() || content.len() > 7439 || content.contains('\0') {
+            bail!("Webex UI body must be between 1 and 7439 non-NUL bytes");
+        }
+        let _ = GlobalId::new(GlobalIdType::Message, message_id.to_owned())?;
+        let _ = GlobalId::new(GlobalIdType::Room, room_id.to_owned())?;
+        let body = match kind {
+            "plainText" => serde_json::json!({ "roomId": room_id, "text": content }),
+            "markdown" => serde_json::json!({ "roomId": room_id, "markdown": content }),
+            _ => bail!("Unsupported UI body kind"),
+        };
+        self.write_message(Method::PUT, Some(message_id), &body)
+            .await
+    }
+
     /// Delete a message through the daemon-owned Webex connection. No retry is
     /// attempted because the remote delete may already have succeeded.
     pub async fn delete_message(&self, message_id: &str) -> Result<()> {
@@ -481,7 +532,7 @@ mod tests {
         Arc,
     };
     use wiremock::{
-        matchers::{method, path, query_param},
+        matchers::{body_json, method, path, query_param},
         Mock, MockServer, ResponseTemplate,
     };
 
@@ -561,6 +612,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sent.room_id.as_deref(), Some(room));
+    }
+
+    #[tokio::test]
+    async fn ui_body_writes_preserve_plain_text_and_markdown_kinds() {
+        let server = MockServer::start().await;
+        let room = "Y2lzY29zcGFyazovL3VzL1JPT00vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBhMDAx";
+        let message =
+            "Y2lzY29zcGFyazovL3VzL01FU1NBR0UvMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBjMDAz";
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_json(serde_json::json!({"roomId": room, "text": "plain UI text"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": message, "roomId": room, "created": "2026-10-08T12:00:00Z", "text": "plain UI text"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/v1/messages/{message}")))
+            .and(body_json(serde_json::json!({"roomId": room, "markdown": "**rich**"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": message, "roomId": room, "created": "2026-10-08T12:00:00Z", "markdown": "**rich**"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rest =
+            WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
+        rest.send_ui_body(room, None, "plainText", "plain UI text")
+            .await
+            .unwrap();
+        rest.edit_ui_body(message, room, "markdown", "**rich**")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

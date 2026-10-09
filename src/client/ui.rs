@@ -5,8 +5,8 @@ use hyper::Method;
 use serde::{Deserialize, Serialize};
 
 pub use crate::dto::{
-    Message, MessagePage, MessageRead, Person, PersonRead, Room, Status, SyncStatus, Team,
-    ThreadChildren, ThreadParent,
+    Message, MessageBody, MessageBodyInput, MessagePage, MessageRead, Person, PersonRead, Room,
+    Status, SyncStatus, Team, ThreadChildren, ThreadParent,
 };
 
 #[derive(Deserialize)]
@@ -39,14 +39,16 @@ struct SessionResponse {
 struct CreateMessageRequest<'a> {
     room_id: &'a str,
     parent_id: Option<&'a str>,
-    markdown: &'a str,
+    markdown: Option<&'a str>,
+    body: Option<&'a MessageBodyInput>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct EditMessageRequest<'a> {
     room_id: &'a str,
-    markdown: &'a str,
+    markdown: Option<&'a str>,
+    body: Option<&'a MessageBodyInput>,
 }
 
 impl BridgeClient {
@@ -323,7 +325,30 @@ impl UiClient {
         let body = BridgeClient::json_body(&CreateMessageRequest {
             room_id,
             parent_id,
-            markdown,
+            markdown: Some(markdown),
+            body: None,
+        })?;
+        let response = self
+            .bridge
+            .request(Method::POST, "/v1/messages", Some(&self.token), Some(body))
+            .await?;
+        BridgeClient::json(response).await
+    }
+
+    /// Create a direct UI message with explicit plain-text or Markdown kind.
+    /// `legacyUnknown` is rejected by the daemon because it is read provenance,
+    /// not a Webex write format.
+    pub async fn create_message_body(
+        &self,
+        room_id: &str,
+        parent_id: Option<&str>,
+        body: &MessageBodyInput,
+    ) -> Result<Message> {
+        let body = BridgeClient::json_body(&CreateMessageRequest {
+            room_id,
+            parent_id,
+            markdown: None,
+            body: Some(body),
         })?;
         let response = self
             .bridge
@@ -339,7 +364,35 @@ impl UiClient {
         room_id: &str,
         markdown: &str,
     ) -> Result<Message> {
-        let body = BridgeClient::json_body(&EditMessageRequest { room_id, markdown })?;
+        let body = BridgeClient::json_body(&EditMessageRequest {
+            room_id,
+            markdown: Some(markdown),
+            body: None,
+        })?;
+        let response = self
+            .bridge
+            .request(
+                Method::PUT,
+                &format!("/v1/messages/{}", path_segment(message_id)),
+                Some(&self.token),
+                Some(body),
+            )
+            .await?;
+        BridgeClient::json(response).await
+    }
+
+    /// Edit one direct UI message with explicit plain-text or Markdown kind.
+    pub async fn edit_message_body(
+        &self,
+        message_id: &str,
+        room_id: &str,
+        body: &MessageBodyInput,
+    ) -> Result<Message> {
+        let body = BridgeClient::json_body(&EditMessageRequest {
+            room_id,
+            markdown: None,
+            body: Some(body),
+        })?;
         let response = self
             .bridge
             .request(
@@ -377,6 +430,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn typed_body_payload_preserves_plain_text_provenance() {
+        let body = MessageBodyInput {
+            kind: "plainText".into(),
+            content: "plain UI text".into(),
+        };
+        let encoded = BridgeClient::json_body(&CreateMessageRequest {
+            room_id: "room-1",
+            parent_id: None,
+            markdown: None,
+            body: Some(&body),
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&encoded).unwrap(),
+            serde_json::json!({
+                "roomId": "room-1",
+                "parentId": null,
+                "markdown": null,
+                "body": {"kind": "plainText", "content": "plain UI text"}
+            })
+        );
+    }
+
+    #[test]
     fn path_segments_do_not_interpret_remote_ids_as_paths_or_queries() {
         assert_eq!(path_segment("room/id?x=1"), "room%2Fid%3Fx%3D1");
     }
@@ -396,7 +473,7 @@ mod server_tests {
     use tokio::sync::watch;
     use tokio_stream::StreamExt;
     use wiremock::{
-        matchers::{method, path, query_param},
+        matchers::{body_json, method, path, query_param},
         Mock, MockServer, ResponseTemplate,
     };
 
@@ -449,6 +526,29 @@ mod server_tests {
         (temp, server, BridgeClient::new(paths.socket))
     }
 
+    async fn writable_rest_server(
+        rest: Arc<crate::sync::history::WebexRest>,
+        room_id: &str,
+    ) -> (tempfile::TempDir, api::ApiServer, BridgeClient) {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(temp.path().join("bridge"));
+        let mirror = SharedMirror::new(Mirror::in_memory([47_u8; 32]).unwrap());
+        let secret = "a-local-ui-secret-that-is-long-enough";
+        let hash = URL_SAFE_NO_PAD.encode(Sha256::digest(secret.as_bytes()));
+        mirror
+            .with(|db| db.pair_ui_client(&hash, "/test/webex-tui"))
+            .await
+            .unwrap();
+        let (_connection_tx, connection_rx) = watch::channel(ConnectionStatus::Connected);
+        let (_rest_tx, rest_rx) = watch::channel(Some(rest));
+        let mut config = crate::config::Config::default();
+        config.dev.as_mut().unwrap().write_allowlist = vec![room_id.into()];
+        let state =
+            ApiState::with_config_and_rest(mirror, connection_rx, Arc::new(config), rest_rx);
+        let server = api::start(&paths, state).await.unwrap();
+        (temp, server, BridgeClient::new(paths.socket))
+    }
+
     async fn offline_thread_server() -> (tempfile::TempDir, api::ApiServer, BridgeClient) {
         let temp = tempfile::tempdir().unwrap();
         let paths = Paths::under(temp.path().join("bridge"));
@@ -476,14 +576,18 @@ mod server_tests {
                         "2026-10-08T12:02:00Z",
                     ),
                 ] {
-                    db.upsert_message(&webex::Message {
+                    let mut message = webex::Message {
                         id: Some(id.into()),
                         room_id: Some("room-1".into()),
                         parent_id: Some(parent_id.into()),
                         created: Some(created.into()),
                         text: Some("private reply".into()),
                         ..webex::Message::default()
-                    })?;
+                    };
+                    if id == "orphan-reply" {
+                        message.files = Some(vec!["https://files.example.test/private.pdf".into()]);
+                    }
+                    db.upsert_message(&message)?;
                 }
                 Ok(())
             })
@@ -581,6 +685,55 @@ mod server_tests {
             }
         );
         drop(stream);
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_ui_create_payload_preserves_plain_text_body_kind() {
+        let room_id =
+            "Y2lzY29zcGFyazovL3VzL1JPT00vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBhMDAx";
+        let message_id =
+            "Y2lzY29zcGFyazovL3VzL01FU1NBR0UvMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBjMDAz";
+        let remote = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_json(serde_json::json!({
+                "roomId": room_id,
+                "text": "plain UI text"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": message_id,
+                "roomId": room_id,
+                "created": "2026-10-08T12:00:00Z",
+                "text": "plain UI text"
+            })))
+            .expect(1)
+            .mount(&remote)
+            .await;
+        let rest = Arc::new(
+            crate::sync::history::WebexRest::for_tests(
+                reqwest::Url::parse(&format!("{}/v1/", remote.uri())).unwrap(),
+            )
+            .unwrap(),
+        );
+        let (_temp, server, bridge) = writable_rest_server(rest, room_id).await;
+        let ui = bridge
+            .create_ui_session("a-local-ui-secret-that-is-long-enough")
+            .await
+            .unwrap();
+        let sent = ui
+            .create_message_body(
+                room_id,
+                None,
+                &MessageBodyInput {
+                    kind: "plainText".into(),
+                    content: "plain UI text".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(sent.body.as_ref().unwrap().kind, "plainText");
+        assert_eq!(sent.attachment_count, 0);
         server.shutdown().await.unwrap();
     }
 
@@ -821,6 +974,13 @@ mod server_tests {
         assert!(!history.complete);
         assert_eq!(history.partial_reason.as_deref(), Some("offline"));
         assert_eq!(history.next_before.as_deref(), Some("orphan-reply"));
+        let orphan = history
+            .messages
+            .iter()
+            .find(|message| message.id == "orphan-reply")
+            .unwrap();
+        assert_eq!(orphan.body.as_ref().unwrap().kind, "plainText");
+        assert_eq!(orphan.attachment_count, 1);
         let deleted = ui
             .thread_children("deleted-parent", None, Some(10))
             .await
@@ -972,6 +1132,8 @@ mod server_tests {
         for path in [
             "/v1/me",
             "/v1/teams/team-1",
+            "/v1/messages/missing-parent",
+            "/v1/messages/missing-parent/thread",
             "/v1/messages/missing-parent/children",
             "/v1/messages/missing-parent/read",
             "/v1/people/missing-person/read",

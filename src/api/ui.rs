@@ -148,6 +148,11 @@ fn message_dto(message: crate::mirror::UiMessage) -> dto::Message {
         updated_at: message.updated_at,
         status: message.status,
         markdown: message.markdown,
+        body: message.body.map(|body| dto::MessageBody {
+            kind: body.kind,
+            content: body.content,
+        }),
+        attachment_count: message.attachment_count,
     }
 }
 
@@ -182,18 +187,39 @@ struct ThreadChildrenQuery {
 struct CreateMessageRequest {
     room_id: String,
     parent_id: Option<String>,
-    markdown: String,
+    markdown: Option<String>,
+    body: Option<dto::MessageBodyInput>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct EditMessageRequest {
     room_id: String,
-    markdown: String,
+    markdown: Option<String>,
+    body: Option<dto::MessageBodyInput>,
 }
 
-fn valid_markdown(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 7439 && !value.contains('\0')
+fn request_body<'a>(
+    body: Option<&'a dto::MessageBodyInput>,
+    markdown: Option<&'a str>,
+) -> Option<(&'a str, &'a str)> {
+    match (body, markdown) {
+        (Some(_), Some(_)) => None,
+        (Some(body), None)
+            if matches!(body.kind.as_str(), "plainText" | "markdown")
+                && !body.content.is_empty()
+                && body.content.len() <= 7439
+                && !body.content.contains('\0') =>
+        {
+            Some((&body.kind, &body.content))
+        }
+        (None, Some(markdown))
+            if !markdown.is_empty() && markdown.len() <= 7439 && !markdown.contains('\0') =>
+        {
+            Some(("markdown", markdown))
+        }
+        _ => None,
+    }
 }
 
 fn write_allowed(state: &ApiState, room_id: &str) -> Result<(), Box<Response>> {
@@ -600,12 +626,20 @@ async fn create_message(
     if let Err(response) = ui_session(&state, peer, &headers) {
         return *response;
     }
+    let Some((body_kind, body_content)) =
+        request_body(request.body.as_ref(), request.markdown.as_deref())
+    else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Message request is invalid",
+        );
+    };
     if !valid_resource_id(&request.room_id)
         || request
             .parent_id
             .as_deref()
             .is_some_and(|id| !valid_resource_id(id))
-        || !valid_markdown(&request.markdown)
     {
         return json_error(
             StatusCode::BAD_REQUEST,
@@ -643,10 +677,11 @@ async fn create_message(
         );
     };
     match rest
-        .send_markdown(
+        .send_ui_body(
             &request.room_id,
             request.parent_id.as_deref(),
-            &request.markdown,
+            body_kind,
+            body_content,
         )
         .await
     {
@@ -676,10 +711,16 @@ async fn edit_message(
     if let Err(response) = ui_session(&state, peer, &headers) {
         return *response;
     }
-    if !valid_resource_id(&message_id)
-        || !valid_resource_id(&request.room_id)
-        || !valid_markdown(&request.markdown)
-    {
+    let Some((body_kind, body_content)) =
+        request_body(request.body.as_ref(), request.markdown.as_deref())
+    else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Message request is invalid",
+        );
+    };
+    if !valid_resource_id(&message_id) || !valid_resource_id(&request.room_id) {
         return json_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
@@ -710,7 +751,7 @@ async fn edit_message(
         );
     };
     match rest
-        .edit_markdown(&message_id, &existing.room_id, &request.markdown)
+        .edit_ui_body(&message_id, &existing.room_id, body_kind, body_content)
         .await
     {
         Ok(message)

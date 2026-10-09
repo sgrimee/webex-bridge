@@ -130,3 +130,7 @@ CREATE TABLE ui_lookup (
 );
 PRAGMA user_version=5;
 "#;
+
+// `NULL` is deliberate for rows written before B6: their encrypted body is
+// retained but its original text-vs-Markdown provenance is unknowable.
+pub(crate) const SCHEMA_V6: &str = "PRAGMA user_version=6;";

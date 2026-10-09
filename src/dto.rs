@@ -80,7 +80,31 @@ pub struct Message {
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub status: String,
+    /// Compatibility projection; use `body` for authoritative provenance.
     pub markdown: Option<String>,
+    pub body: Option<MessageBody>,
+    /// Count only: attachment URLs/bytes are never released by this API.
+    pub attachment_count: u32,
+}
+
+/// Content with an authoritative kind for new rows or `legacyUnknown` for
+/// rows written before the kind was mirrored.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageBody {
+    /// `plainText`, `markdown`, or `legacyUnknown`.
+    pub kind: String,
+    pub content: String,
+}
+
+/// UI create/edit body. The daemon rejects `legacyUnknown`: it is read-only
+/// provenance for old mirrored rows, never a Webex write format.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageBodyInput {
+    /// `plainText` or `markdown`.
+    pub kind: String,
+    pub content: String,
 }
 
 /// Result of a cache-miss-capable UI message point read. `state` is one of
@@ -157,6 +181,26 @@ mod tests {
                 "isMember": true,
                 "isLocked": null,
             })
+        );
+    }
+
+    #[test]
+    fn body_kind_wire_contract_preserves_legacy_provenance() {
+        let body = MessageBody {
+            kind: "legacyUnknown".into(),
+            content: "ambiguous historic body".into(),
+        };
+        let input = MessageBodyInput {
+            kind: "plainText".into(),
+            content: "new plain body".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(body).unwrap(),
+            serde_json::json!({"kind": "legacyUnknown", "content": "ambiguous historic body"})
+        );
+        assert_eq!(
+            serde_json::to_value(input).unwrap(),
+            serde_json::json!({"kind": "plainText", "content": "new plain body"})
         );
     }
 

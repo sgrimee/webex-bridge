@@ -1,5 +1,4 @@
-//! Per-user bridge daemon: Mercury live sync, encrypted local mirror and local status API.
-//! Scoped UI/agent sessions and message sends remain disabled until later Step 3 work.
+//! Per-user bridge daemon: Mercury live sync, encrypted local mirror and scoped local API.
 
 use anyhow::{Context, Result};
 use std::{

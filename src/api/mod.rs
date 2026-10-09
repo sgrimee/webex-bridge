@@ -532,6 +532,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_session_cannot_read_full_mirror_ui_routes() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(temp.path().join("bridge"));
+        let mut config = Config::default();
+        config.routes.push(Route {
+            id: "agents-social".into(),
+            room_id: "room-id-is-not-returned".into(),
+            agent_name: "sam/coder".into(),
+            allowed_senders: Vec::new(),
+            receive: Receive::Addressed,
+            workspace: "/workspace".into(),
+        });
+        let mirror = SharedMirror::new(Mirror::in_memory([97_u8; 32]).unwrap());
+        let (_connection_tx, connection_rx) = watch::channel(ConnectionStatus::Connected);
+        let server = start(
+            &paths,
+            ApiState::with_config(mirror, connection_rx, Arc::new(config)),
+        )
+        .await
+        .unwrap();
+        let body = r#"{"host":"pi","sessionId":"test-session","cwd":"/workspace","agentName":"sam/coder"}"#;
+        let session = request(
+            &paths.socket,
+            format!("POST /v1/agent/sessions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()),
+        )
+        .await;
+        let token =
+            serde_json::from_str::<serde_json::Value>(session.split("\r\n\r\n").nth(1).unwrap())
+                .unwrap()["token"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+        let rooms = request(
+            &paths.socket,
+            format!("GET /v1/rooms HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert!(rooms.starts_with("HTTP/1.1 403"));
+        assert!(rooms.contains("forbidden_scope"));
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn shutdown_does_not_unlink_a_replacement_socket() {
         let temp = tempfile::tempdir().unwrap();
         let paths = Paths::under(temp.path().join("bridge"));

@@ -14,6 +14,7 @@ use chrono::Utc;
 use crypto::{aad, MirrorCrypto};
 use rand::{rngs::OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
 use std::{
     fs::{self, OpenOptions},
     os::unix::fs::OpenOptionsExt,
@@ -35,6 +36,25 @@ type UpsertPrevious = (
     Option<Vec<u8>>,
 );
 type StoredBody = (i64, String, Option<Vec<u8>>, Option<Vec<u8>>);
+type UiRoomRow = (
+    Option<Vec<u8>>,
+    String,
+    Option<String>,
+    Option<String>,
+    bool,
+);
+type UiPersonRow = (Option<Vec<u8>>, Option<Vec<u8>>);
+type UiMessageRow = (
+    String,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+);
 type DeletePrevious = (
     i64,
     String,
@@ -74,6 +94,42 @@ pub struct RoomSync {
     pub last_result: Option<String>,
     /// Last observed Webex room activity watermark (not a message timestamp).
     pub observed_last_activity: Option<String>,
+}
+
+/// Full room metadata released only to an authorized UI session.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiRoom {
+    pub id: String,
+    pub title: Option<String>,
+    pub room_type: String,
+    pub team_id: Option<String>,
+    pub last_activity: Option<String>,
+    pub is_member: bool,
+}
+
+/// Full person metadata released only to an authorized UI session.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiPerson {
+    pub id: String,
+    pub display_name: Option<String>,
+    pub emails: Option<Vec<String>>,
+}
+
+/// Canonical mirror message released only to an authorized UI session.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiMessage {
+    pub id: String,
+    pub room_id: String,
+    pub revision: i64,
+    pub parent_id: Option<String>,
+    pub sender_id: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub status: String,
+    pub markdown: Option<String>,
 }
 
 /// Shared access that holds the DB lock only for synchronous operations.
@@ -393,6 +449,85 @@ impl Mirror {
             .transpose()
     }
 
+    /// List all room metadata for an authorized UI session, newest first.
+    pub fn ui_rooms(&self) -> Result<Vec<UiRoom>> {
+        let mut statement = self.conn.prepare(
+            "SELECT room_id,title_ct,type,team_id,last_activity,is_member FROM rooms
+             ORDER BY last_activity DESC,room_id DESC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, bool>(5)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, title_ct, room_type, team_id, last_activity, is_member) = row?;
+            let title = title_ct
+                .map(|blob| {
+                    self.crypto
+                        .open_prefixed(&blob, &aad("rooms", "title", &id))
+                        .and_then(|bytes| {
+                            String::from_utf8(bytes).context("Invalid encrypted room title")
+                        })
+                })
+                .transpose()?;
+            Ok(UiRoom {
+                id,
+                title,
+                room_type,
+                team_id,
+                last_activity,
+                is_member,
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+    }
+
+    /// Get one room's metadata for an authorized UI session.
+    pub fn ui_room(&self, room_id: &str) -> Result<Option<UiRoom>> {
+        let row: Option<UiRoomRow> = self
+            .conn
+            .query_row(
+                "SELECT title_ct,type,team_id,last_activity,is_member FROM rooms WHERE room_id=?1",
+                [room_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(title_ct, room_type, team_id, last_activity, is_member)| {
+            let title = title_ct
+                .map(|blob| {
+                    self.crypto
+                        .open_prefixed(&blob, &aad("rooms", "title", room_id))
+                        .and_then(|bytes| {
+                            String::from_utf8(bytes).context("Invalid encrypted room title")
+                        })
+                })
+                .transpose()?;
+            Ok(UiRoom {
+                id: room_id.into(),
+                title,
+                room_type,
+                team_id,
+                last_activity,
+                is_member,
+            })
+        })
+        .transpose()
+    }
+
     /// Upsert encrypted person name and email addresses for UI display only.
     pub fn upsert_person(&mut self, person: &Person) -> Result<()> {
         if person.id.is_empty() {
@@ -449,6 +584,45 @@ impl Mirror {
                     })
             })
             .transpose()
+    }
+
+    /// Get one person's decrypted metadata for an authorized UI session.
+    pub fn ui_person(&self, person_id: &str) -> Result<Option<UiPerson>> {
+        let row: Option<UiPersonRow> = self
+            .conn
+            .query_row(
+                "SELECT display_name_ct,emails_ct FROM people WHERE person_id=?1",
+                [person_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(name_ct, emails_ct)| {
+            let display_name = name_ct
+                .map(|blob| {
+                    self.crypto
+                        .open_prefixed(&blob, &aad("people", "display_name", person_id))
+                        .and_then(|bytes| {
+                            String::from_utf8(bytes).context("Invalid encrypted display name")
+                        })
+                })
+                .transpose()?;
+            let emails = emails_ct
+                .map(|blob| {
+                    self.crypto
+                        .open_prefixed(&blob, &aad("people", "emails", person_id))
+                        .and_then(|bytes| {
+                            serde_json::from_slice(&bytes)
+                                .context("Invalid encrypted person emails")
+                        })
+                })
+                .transpose()?;
+            Ok(UiPerson {
+                id: person_id.into(),
+                display_name,
+                emails,
+            })
+        })
+        .transpose()
     }
 
     /// Insert a new canonical message/revision or deduplicate an identical REST result.
@@ -579,6 +753,130 @@ impl Mirror {
             Some((_, status, _, _)) if status == "deleted" => Ok(None),
             _ => bail!("Mirror body ciphertext/nonce mismatch"),
         }
+    }
+
+    /// Get one canonical message (including a tombstone) for an authorized UI session.
+    pub fn ui_message(&self, message_id: &str) -> Result<Option<UiMessage>> {
+        self.ui_message_row(message_id, None)
+    }
+
+    /// List one reverse-chronological page of active canonical messages from the mirror.
+    /// `before_message_id`, when supplied, is resolved locally and never used as SQL syntax.
+    pub fn ui_room_messages(
+        &self,
+        room_id: &str,
+        before_message_id: Option<&str>,
+        max: u32,
+    ) -> Result<Vec<UiMessage>> {
+        if !(1..=100).contains(&max) {
+            bail!("Mirror message page size must be 1..=100");
+        }
+        let before = before_message_id
+            .map(|message_id| {
+                self.conn
+                    .query_row(
+                        "SELECT created_at,message_id FROM messages
+                         WHERE room_id=?1 AND message_id=?2
+                         ORDER BY revision DESC LIMIT 1",
+                        params![room_id, message_id],
+                        |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()?
+                    .context("Message cursor is not in this room")
+            })
+            .transpose()?;
+        let mut statement = if before.is_some() {
+            self.conn.prepare(
+                "SELECT message_id FROM messages AS m
+                 WHERE room_id=?1 AND status='active'
+                   AND revision=(SELECT MAX(revision) FROM messages WHERE message_id=m.message_id)
+                   AND (created_at < ?2 OR (created_at = ?2 AND message_id < ?3))
+                 ORDER BY created_at DESC,message_id DESC LIMIT ?4",
+            )?
+        } else {
+            self.conn.prepare(
+                "SELECT message_id FROM messages AS m
+                 WHERE room_id=?1 AND status='active'
+                   AND revision=(SELECT MAX(revision) FROM messages WHERE message_id=m.message_id)
+                 ORDER BY created_at DESC,message_id DESC LIMIT ?2",
+            )?
+        };
+        let ids = if let Some((created_at, id)) = before {
+            let created_at = created_at.context("Message cursor has no creation time")?;
+            statement
+                .query_map(params![room_id, created_at, id, max], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            statement
+                .query_map(params![room_id, max], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        ids.into_iter()
+            .map(|id| {
+                self.ui_message_row(&id, Some(room_id))?
+                    .context("Canonical mirror message disappeared during read")
+            })
+            .collect()
+    }
+
+    fn ui_message_row(
+        &self,
+        message_id: &str,
+        room_filter: Option<&str>,
+    ) -> Result<Option<UiMessage>> {
+        let row: Option<UiMessageRow> = self
+            .conn
+            .query_row(
+                "SELECT room_id,revision,parent_id,sender_id,created_at,updated_at,status,body_ct,body_nonce
+                 FROM messages WHERE message_id=?1
+                 ORDER BY revision DESC LIMIT 1",
+                [message_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?)),
+            )
+            .optional()?;
+        let Some((
+            room_id,
+            revision,
+            parent_id,
+            sender_id,
+            created_at,
+            updated_at,
+            status,
+            body_ct,
+            body_nonce,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        if room_filter.is_some_and(|expected| expected != room_id) {
+            return Ok(None);
+        }
+        let markdown = match (body_ct, body_nonce) {
+            (Some(ct), Some(nonce)) if status == "active" => Some(
+                String::from_utf8(self.crypto.open(
+                    &ct,
+                    &nonce,
+                    &message_aad("body", message_id, revision),
+                )?)
+                .context("Invalid encrypted message body")?,
+            ),
+            (None, None) => None,
+            _ if status == "deleted" => None,
+            _ => bail!("Mirror body ciphertext/nonce mismatch"),
+        };
+        Ok(Some(UiMessage {
+            id: message_id.into(),
+            room_id,
+            revision,
+            parent_id,
+            sender_id,
+            created_at,
+            updated_at,
+            status,
+            markdown,
+        }))
     }
 
     /// Tombstone a known canonical message and purge every stored revision's body/files.
@@ -1080,6 +1378,77 @@ mod tests {
         ] {
             assert!(!bytes.windows(secret.len()).any(|window| window == secret));
         }
+    }
+
+    #[test]
+    fn ui_views_decrypt_only_current_rows_and_paginate_messages() {
+        let mut mirror = Mirror::in_memory([14_u8; 32]).unwrap();
+        let room = Room {
+            id: "room-1".into(),
+            title: Some("Private room title".into()),
+            room_type: "group".into(),
+            is_locked: false,
+            team_id: Some("team-1".into()),
+            last_activity: "2026-10-08T12:03:00Z".into(),
+            creator_id: "person-1".into(),
+            created: "2026-10-08T12:00:00Z".into(),
+        };
+        mirror.upsert_room(&room, true).unwrap();
+        mirror
+            .upsert_person(&Person {
+                id: "person-1".into(),
+                display_name: "Private Person".into(),
+                emails: vec!["private@example.test".into()],
+                ..Person::default()
+            })
+            .unwrap();
+        for (id, created) in [
+            ("message-1", "2026-10-08T12:01:00Z"),
+            ("message-2", "2026-10-08T12:02:00Z"),
+            ("message-3", "2026-10-08T12:03:00Z"),
+        ] {
+            mirror
+                .upsert_message(&Message {
+                    id: Some(id.into()),
+                    room_id: Some("room-1".into()),
+                    person_id: Some("person-1".into()),
+                    text: Some(format!("body {id}")),
+                    created: Some(created.into()),
+                    ..Message::default()
+                })
+                .unwrap();
+        }
+
+        assert_eq!(
+            mirror.ui_rooms().unwrap()[0].title.as_deref(),
+            Some("Private room title")
+        );
+        assert_eq!(
+            mirror.ui_person("person-1").unwrap().unwrap().emails,
+            Some(vec!["private@example.test".into()])
+        );
+        let newest = mirror.ui_room_messages("room-1", None, 2).unwrap();
+        assert_eq!(
+            newest
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["message-3", "message-2"]
+        );
+        assert_eq!(newest[0].markdown.as_deref(), Some("body message-3"));
+        let older = mirror
+            .ui_room_messages("room-1", Some("message-2"), 2)
+            .unwrap();
+        assert_eq!(
+            older
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["message-1"]
+        );
+        assert!(mirror
+            .ui_room_messages("room-1", Some("missing"), 2)
+            .is_err());
     }
 
     #[test]

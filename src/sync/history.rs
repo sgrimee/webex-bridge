@@ -3,8 +3,8 @@
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use reqwest::{header, Client, Response, StatusCode, Url};
-use serde::Deserialize;
+use reqwest::{header, Client, Method, Response, StatusCode, Url};
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::time::sleep;
 use webex::{GlobalId, GlobalIdType, Message, MessageOut, Person, Room};
@@ -168,9 +168,37 @@ impl WebexRest {
             .collect()
     }
 
-    /// Send exactly one agent-approved Markdown message. This method never
-    /// retries: a transport failure may be ambiguous, and the caller records
-    /// `delivery-unknown` rather than risking a duplicate human-visible post.
+    async fn write_message<B: Serialize>(
+        &self,
+        method: Method,
+        message_id: Option<&str>,
+        body: &B,
+    ) -> Result<Message> {
+        let response = self
+            .client
+            .request(method, self.endpoint("messages", message_id)?)
+            .bearer_auth(&self.token)
+            .json(body)
+            .send()
+            .await
+            .context("Webex message write did not return a response")?;
+        let status = response.status();
+        if matches!(status.as_u16(), 401 | 403) {
+            bail!("auth_required: Webex message write returned HTTP {status}");
+        }
+        if !status.is_success() {
+            bail!("Webex message write returned HTTP {status}");
+        }
+        Self::decode_mirror_message(
+            response
+                .json::<serde_json::Value>()
+                .await
+                .context("Invalid Webex message write response")?,
+        )
+    }
+
+    /// Send exactly one agent-approved or direct-UI Markdown message. This
+    /// method never retries: a transport failure may be ambiguous.
     pub async fn send_markdown(
         &self,
         room_id: &str,
@@ -184,32 +212,58 @@ impl WebexRest {
         if let Some(parent_id) = parent_id {
             let _ = GlobalId::new(GlobalIdType::Message, parent_id.to_owned())?;
         }
-        let response = self
-            .client
-            .post(self.endpoint("messages", None)?)
-            .bearer_auth(&self.token)
-            .json(&MessageOut {
+        self.write_message(
+            Method::POST,
+            None,
+            &MessageOut {
                 room_id: Some(room_id.into()),
                 parent_id: parent_id.map(Into::into),
                 markdown: Some(markdown.into()),
                 ..MessageOut::default()
-            })
+            },
+        )
+        .await
+    }
+
+    /// Edit a message through the daemon-owned Webex connection.
+    pub async fn edit_markdown(
+        &self,
+        message_id: &str,
+        room_id: &str,
+        markdown: &str,
+    ) -> Result<Message> {
+        if markdown.is_empty() || markdown.len() > 7439 {
+            bail!("Webex Markdown must be between 1 and 7439 bytes");
+        }
+        let _ = GlobalId::new(GlobalIdType::Message, message_id.to_owned())?;
+        let _ = GlobalId::new(GlobalIdType::Room, room_id.to_owned())?;
+        self.write_message(
+            Method::PUT,
+            Some(message_id),
+            &serde_json::json!({ "roomId": room_id, "markdown": markdown }),
+        )
+        .await
+    }
+
+    /// Delete a message through the daemon-owned Webex connection. No retry is
+    /// attempted because the remote delete may already have succeeded.
+    pub async fn delete_message(&self, message_id: &str) -> Result<()> {
+        let _ = GlobalId::new(GlobalIdType::Message, message_id.to_owned())?;
+        let response = self
+            .client
+            .delete(self.endpoint("messages", Some(message_id))?)
+            .bearer_auth(&self.token)
             .send()
             .await
-            .context("Webex send did not return a response")?;
+            .context("Webex message delete did not return a response")?;
         let status = response.status();
         if matches!(status.as_u16(), 401 | 403) {
-            bail!("auth_required: Webex send returned HTTP {status}");
+            bail!("auth_required: Webex message delete returned HTTP {status}");
         }
         if !status.is_success() {
-            bail!("Webex send returned HTTP {status}");
+            bail!("Webex message delete returned HTTP {status}");
         }
-        Self::decode_mirror_message(
-            response
-                .json::<serde_json::Value>()
-                .await
-                .context("Invalid Webex send response")?,
-        )
+        Ok(())
     }
 
     /// Hydrate one canonical message; a 404 is a verified deletion only for a known ID.
@@ -387,6 +441,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sent.room_id.as_deref(), Some(room));
+    }
+
+    #[tokio::test]
+    async fn ui_edit_and_delete_use_one_direct_webex_request_each() {
+        let server = MockServer::start().await;
+        let room = "Y2lzY29zcGFyazovL3VzL1JPT00vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBhMDAx";
+        let message =
+            "Y2lzY29zcGFyazovL3VzL01FU1NBR0UvMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBjMDAz";
+        Mock::given(method("PUT"))
+            .and(path(format!("/v1/messages/{message}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": message,
+                "roomId": room,
+                "created": "2026-10-08T12:00:00Z",
+                "updated": "2026-10-08T12:01:00Z",
+                "markdown": "updated directly by the paired UI"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/v1/messages/{message}")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rest =
+            WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
+        let edited = rest
+            .edit_markdown(message, room, "updated directly by the paired UI")
+            .await
+            .unwrap();
+        assert_eq!(edited.id.as_deref(), Some(message));
+        rest.delete_message(message).await.unwrap();
     }
 
     #[tokio::test]

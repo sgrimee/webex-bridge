@@ -105,6 +105,74 @@ struct RoomMessagesQuery {
     max: Option<u32>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateMessageRequest {
+    room_id: String,
+    parent_id: Option<String>,
+    markdown: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EditMessageRequest {
+    room_id: String,
+    markdown: String,
+}
+
+fn valid_markdown(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 7439 && !value.contains('\0')
+}
+
+fn write_allowed(state: &ApiState, room_id: &str) -> Result<(), Box<Response>> {
+    state.config().check_write_room(room_id).map_err(|_| {
+        Box::new(json_error(
+            StatusCode::FORBIDDEN,
+            "write_not_allowed",
+            "Writes outside the configured development allowlist are refused",
+        ))
+    })
+}
+
+async fn persisted_message(
+    state: &ApiState,
+    message: &webex::Message,
+    event_name: &'static str,
+) -> Response {
+    let Some(message_id) = message.id.as_deref().filter(|id| !id.is_empty()) else {
+        return json_error(
+            StatusCode::ACCEPTED,
+            "delivery_unknown",
+            "Webex accepted the write but did not return a canonical message ID",
+        );
+    };
+    match state
+        .mirror()
+        .with(|db| {
+            db.upsert_message(message)?;
+            db.ui_message(message_id)
+        })
+        .await
+    {
+        Ok(Some(stored)) => {
+            state.events().publish_ui(
+                event_name,
+                serde_json::json!({
+                    "roomId": stored.room_id,
+                    "messageId": stored.id,
+                    "revision": stored.revision,
+                }),
+            );
+            Json(stored).into_response()
+        }
+        _ => json_error(
+            StatusCode::ACCEPTED,
+            "delivery_unknown",
+            "Webex accepted the write but the mirror has not yet confirmed it",
+        ),
+    }
+}
+
 async fn rooms(
     State(state): State<ApiState>,
     Extension(peer): Extension<auth::PeerIdentity>,
@@ -192,6 +260,211 @@ async fn room_messages(
             StatusCode::SERVICE_UNAVAILABLE,
             "bridge_unavailable",
             "Mirror is temporarily unavailable",
+        ),
+    }
+}
+
+async fn create_message(
+    State(state): State<ApiState>,
+    Extension(peer): Extension<auth::PeerIdentity>,
+    headers: HeaderMap,
+    Json(request): Json<CreateMessageRequest>,
+) -> Response {
+    if let Err(response) = ui_session(&state, peer, &headers) {
+        return *response;
+    }
+    if !valid_resource_id(&request.room_id)
+        || request
+            .parent_id
+            .as_deref()
+            .is_some_and(|id| !valid_resource_id(id))
+        || !valid_markdown(&request.markdown)
+    {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Message request is invalid",
+        );
+    }
+    if let Err(response) = write_allowed(&state, &request.room_id) {
+        return *response;
+    }
+    if let Some(parent_id) = request.parent_id.as_deref() {
+        match state.mirror().with(|db| db.ui_message(parent_id)).await {
+            Ok(Some(parent)) if parent.room_id == request.room_id && parent.status == "active" => {}
+            Ok(_) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "Message parent is not active in the requested room",
+                )
+            }
+            Err(_) => {
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "bridge_unavailable",
+                    "Mirror is temporarily unavailable",
+                )
+            }
+        }
+    }
+    let Some(rest) = state.rest() else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "webex_unavailable",
+            "Webex is not connected",
+        );
+    };
+    match rest
+        .send_markdown(
+            &request.room_id,
+            request.parent_id.as_deref(),
+            &request.markdown,
+        )
+        .await
+    {
+        Ok(message) if message.room_id.as_deref() == Some(&request.room_id) => {
+            persisted_message(&state, &message, "message.created").await
+        }
+        Ok(_) => json_error(
+            StatusCode::ACCEPTED,
+            "delivery_unknown",
+            "Webex returned a message for an unexpected room",
+        ),
+        Err(_) => json_error(
+            StatusCode::BAD_GATEWAY,
+            "webex_unavailable",
+            "Webex did not accept the message",
+        ),
+    }
+}
+
+async fn edit_message(
+    State(state): State<ApiState>,
+    Extension(peer): Extension<auth::PeerIdentity>,
+    Path(message_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<EditMessageRequest>,
+) -> Response {
+    if let Err(response) = ui_session(&state, peer, &headers) {
+        return *response;
+    }
+    if !valid_resource_id(&message_id)
+        || !valid_resource_id(&request.room_id)
+        || !valid_markdown(&request.markdown)
+    {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Message request is invalid",
+        );
+    }
+    let existing = match state.mirror().with(|db| db.ui_message(&message_id)).await {
+        Ok(Some(message)) if message.room_id == request.room_id && message.status == "active" => {
+            message
+        }
+        Ok(_) => return json_error(StatusCode::NOT_FOUND, "not_found", "Message was not found"),
+        Err(_) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bridge_unavailable",
+                "Mirror is temporarily unavailable",
+            )
+        }
+    };
+    if let Err(response) = write_allowed(&state, &existing.room_id) {
+        return *response;
+    }
+    let Some(rest) = state.rest() else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "webex_unavailable",
+            "Webex is not connected",
+        );
+    };
+    match rest
+        .edit_markdown(&message_id, &existing.room_id, &request.markdown)
+        .await
+    {
+        Ok(message)
+            if message.id.as_deref() == Some(&message_id)
+                && message.room_id.as_deref() == Some(existing.room_id.as_str()) =>
+        {
+            persisted_message(&state, &message, "message.updated").await
+        }
+        Ok(_) => json_error(
+            StatusCode::ACCEPTED,
+            "delivery_unknown",
+            "Webex returned an unexpected message",
+        ),
+        Err(_) => json_error(
+            StatusCode::BAD_GATEWAY,
+            "webex_unavailable",
+            "Webex did not accept the edit",
+        ),
+    }
+}
+
+async fn delete_message(
+    State(state): State<ApiState>,
+    Extension(peer): Extension<auth::PeerIdentity>,
+    Path(message_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = ui_session(&state, peer, &headers) {
+        return *response;
+    }
+    if !valid_resource_id(&message_id) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Message ID is invalid",
+        );
+    }
+    let existing = match state.mirror().with(|db| db.ui_message(&message_id)).await {
+        Ok(Some(message)) if message.status == "active" => message,
+        Ok(_) => return json_error(StatusCode::NOT_FOUND, "not_found", "Message was not found"),
+        Err(_) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bridge_unavailable",
+                "Mirror is temporarily unavailable",
+            )
+        }
+    };
+    if let Err(response) = write_allowed(&state, &existing.room_id) {
+        return *response;
+    }
+    let Some(rest) = state.rest() else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "webex_unavailable",
+            "Webex is not connected",
+        );
+    };
+    if rest.delete_message(&message_id).await.is_err() {
+        return json_error(
+            StatusCode::BAD_GATEWAY,
+            "webex_unavailable",
+            "Webex did not accept the delete",
+        );
+    }
+    match state
+        .mirror()
+        .with(|db| db.mark_deleted(&existing.room_id, &message_id))
+        .await
+    {
+        Ok(true) => {
+            state.events().publish_ui(
+                "message.deleted",
+                serde_json::json!({ "roomId": existing.room_id, "messageId": message_id }),
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+        _ => json_error(
+            StatusCode::ACCEPTED,
+            "delivery_unknown",
+            "Webex accepted the delete but the mirror has not yet confirmed it",
         ),
     }
 }
@@ -357,6 +630,10 @@ pub fn router() -> Router<ApiState> {
         .route("/v1/rooms", get(rooms))
         .route("/v1/rooms/{room_id}", get(room))
         .route("/v1/rooms/{room_id}/messages", get(room_messages))
-        .route("/v1/messages/{message_id}", get(message))
+        .route("/v1/messages", post(create_message))
+        .route(
+            "/v1/messages/{message_id}",
+            get(message).put(edit_message).delete(delete_message),
+        )
         .route("/v1/people/{person_id}", get(person))
 }

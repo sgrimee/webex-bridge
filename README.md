@@ -20,8 +20,8 @@ revalidates the process-bound token for each metadata-only event and filters
 agent events by claimed route. UI pairing uses a native macOS confirmation
 showing the kernel-resolved executable path, then creates an in-memory UI
 session. The macOS LaunchAgent installer is implemented; use the signed Mise
-tasks below for local service management. Typed Rust UI clients and attachment
-download remain in progress.
+tasks below for local service management. Typed Rust UI clients remain in progress. Attachment content is never downloaded
+by the bridge; the UI may offer a user-controlled external-open flow.
 
 The dedicated `webex-bridge` integration is separate from the TUI integration.
 OAuth defaults to ten granular scopes. The user explicitly approved

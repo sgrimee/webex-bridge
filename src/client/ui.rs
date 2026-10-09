@@ -104,7 +104,9 @@ impl UiClient {
         self.lease_ttl
     }
 
-    /// Resolve the daemon account and store it in the encrypted mirror.
+    /// Read the daemon account from the encrypted mirror, refreshing it from
+    /// Webex when available. A first-run offline daemon reports
+    /// `identity_not_ready` instead of guessing an account from person rows.
     pub async fn me(&self) -> Result<Person> {
         let response = self
             .bridge
@@ -308,6 +310,31 @@ mod server_tests {
         (temp, server, BridgeClient::new(paths.socket), events)
     }
 
+    async fn cached_identity_server() -> (tempfile::TempDir, api::ApiServer, BridgeClient) {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(temp.path().join("bridge"));
+        let mirror = SharedMirror::new(Mirror::in_memory([44_u8; 32]).unwrap());
+        let secret = "a-local-ui-secret-that-is-long-enough";
+        let hash = URL_SAFE_NO_PAD.encode(Sha256::digest(secret.as_bytes()));
+        mirror
+            .with(|db| {
+                db.cache_account_identity(&webex::Person {
+                    id: "account-person".into(),
+                    display_name: "Account Owner".into(),
+                    emails: vec!["owner@example.test".into()],
+                    ..webex::Person::default()
+                })?;
+                db.pair_ui_client(&hash, "/test/webex-tui")
+            })
+            .await
+            .unwrap();
+        let (_connection_tx, connection_rx) = watch::channel(ConnectionStatus::Disconnected);
+        let server = api::start(&paths, ApiState::new(mirror, connection_rx))
+            .await
+            .unwrap();
+        (temp, server, BridgeClient::new(paths.socket))
+    }
+
     async fn agent_server() -> (
         tempfile::TempDir,
         api::ApiServer,
@@ -361,6 +388,44 @@ mod server_tests {
             }
         );
         drop(stream);
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn offline_daemon_serves_the_cached_account_identity() {
+        let (_temp, server, bridge) = cached_identity_server().await;
+        let ui = bridge
+            .create_ui_session("a-local-ui-secret-that-is-long-enough")
+            .await
+            .unwrap();
+        assert_eq!(
+            ui.me().await.unwrap(),
+            Person {
+                id: "account-person".into(),
+                display_name: Some("Account Owner".into()),
+                emails: Some(vec!["owner@example.test".into()]),
+            }
+        );
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn first_run_offline_identity_is_explicitly_not_ready() {
+        let (_temp, server, bridge, _events) = paired_server().await;
+        let ui = bridge
+            .create_ui_session("a-local-ui-secret-that-is-long-enough")
+            .await
+            .unwrap();
+        let error = ui.me().await.unwrap_err();
+        assert!(error.is_identity_not_ready());
+        assert!(matches!(
+            error,
+            crate::client::ClientError::Api {
+                status: hyper::StatusCode::CONFLICT,
+                code,
+                ..
+            } if code == "identity_not_ready"
+        ));
         server.shutdown().await.unwrap();
     }
 

@@ -1,6 +1,6 @@
 //! Atomic SQLite schema migrations.
 
-use super::schema::{SCHEMA_V1, SCHEMA_V2};
+use super::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3};
 use anyhow::{bail, Result};
 use rusqlite::Connection;
 
@@ -25,6 +25,13 @@ fn migrate_v2(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_v3(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute_batch(SCHEMA_V3)?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Apply migrations or reject a database written by newer code.
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -33,10 +40,15 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
             let tx = conn.transaction()?;
             tx.execute_batch(SCHEMA_V1)?;
             tx.commit()?;
-            migrate_v2(conn)
+            migrate_v2(conn)?;
+            migrate_v3(conn)
         }
-        1 => migrate_v2(conn),
-        2 => Ok(()),
+        1 => {
+            migrate_v2(conn)?;
+            migrate_v3(conn)
+        }
+        2 => migrate_v3(conn),
+        3 => Ok(()),
         _ => bail!("Mirror database schema version {version} is unsupported"),
     }
 }
@@ -50,8 +62,30 @@ mod tests {
         migrate(&mut conn).unwrap();
         migrate(&mut conn).unwrap();
         assert!(has_column(&conn, "room_sync", "observed_last_activity").unwrap());
+        assert!(has_column(&conn, "account_identity", "person_id_ct").unwrap());
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                .unwrap(),
+            3
+        );
         conn.execute_batch("PRAGMA user_version=99").unwrap();
         assert!(migrate(&mut conn).is_err());
+    }
+
+    #[test]
+    fn v2_adds_the_encrypted_account_identity_table() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch("ALTER TABLE room_sync ADD COLUMN observed_last_activity TEXT;")
+            .unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        migrate(&mut conn).unwrap();
+        assert!(has_column(&conn, "account_identity", "person_id_ct").unwrap());
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                .unwrap(),
+            3
+        );
     }
 
     #[test]
@@ -64,7 +98,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                 .unwrap(),
-            2
+            3
         );
     }
 }

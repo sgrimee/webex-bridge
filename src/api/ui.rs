@@ -214,38 +214,50 @@ async fn me(
     if let Err(response) = ui_session(&state, peer, &headers) {
         return *response;
     }
-    let Some(rest) = state.rest() else {
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "webex_unavailable",
-            "Webex is not connected",
-        );
-    };
-    let person = match rest.me().await {
-        Ok(person) => person,
+    let cached_identity = match state.mirror().with(|db| db.ui_account_identity()).await {
+        Ok(identity) => identity,
         Err(_) => {
             return json_error(
-                StatusCode::BAD_GATEWAY,
-                "webex_unavailable",
-                "Webex current-user lookup failed",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bridge_unavailable",
+                "Mirror is temporarily unavailable",
             )
         }
     };
-    let person_id = person.id.clone();
-    match state
-        .mirror()
-        .with(|db| {
-            db.upsert_person(&person)?;
-            db.ui_person(&person_id)
-        })
-        .await
-    {
-        Ok(Some(person)) => Json(person_dto(person)).into_response(),
-        _ => json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "bridge_unavailable",
-            "Mirror is temporarily unavailable",
-        ),
+    let Some(rest) = state.rest() else {
+        return match cached_identity {
+            Some(person) => Json(person_dto(person)).into_response(),
+            None => json_error(
+                StatusCode::CONFLICT,
+                "identity_not_ready",
+                "Account identity has not yet been mirrored",
+            ),
+        };
+    };
+    match rest.me().await {
+        Ok(person) => match state
+            .mirror()
+            .with(|db| {
+                db.cache_account_identity(&person)?;
+                db.ui_account_identity()
+            })
+            .await
+        {
+            Ok(Some(person)) => Json(person_dto(person)).into_response(),
+            _ => json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bridge_unavailable",
+                "Mirror is temporarily unavailable",
+            ),
+        },
+        Err(_) => match cached_identity {
+            Some(person) => Json(person_dto(person)).into_response(),
+            None => json_error(
+                StatusCode::BAD_GATEWAY,
+                "webex_unavailable",
+                "Webex current-user lookup failed",
+            ),
+        },
     }
 }
 

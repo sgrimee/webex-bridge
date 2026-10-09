@@ -94,3 +94,14 @@ PRAGMA user_version=1;
 "#;
 
 pub(crate) const SCHEMA_V2: &str = "PRAGMA user_version=2;";
+
+// The account person ID is encrypted even though other resource IDs are indexed
+// plaintext. It identifies the local account and is needed only to locate the
+// already-encrypted person record for an authorized UI session.
+pub(crate) const SCHEMA_V3: &str = r#"
+CREATE TABLE account_identity (
+    slot INTEGER PRIMARY KEY CHECK (slot=1),
+    person_id_ct BLOB NOT NULL
+);
+PRAGMA user_version=3;
+"#;

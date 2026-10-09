@@ -26,6 +26,8 @@ use webex::{Message, Person, Room};
 use zeroize::Zeroizing;
 
 const KEY_CHECK: &[u8] = b"webex-bridge-mirror-v1";
+const ACCOUNT_IDENTITY_SLOT: i64 = 1;
+const ACCOUNT_IDENTITY_AAD_ID: &str = "current";
 
 type UpsertPrevious = (
     i64,
@@ -550,6 +552,45 @@ impl Mirror {
             params![person.id, name_ct, emails_ct, Utc::now().to_rfc3339()],
         )?;
         Ok(())
+    }
+
+    /// Persist the authenticated daemon account only after an authoritative
+    /// current-user lookup. The account ID is encrypted separately from the
+    /// cached person record so a first-run mirror cannot guess an identity.
+    pub fn cache_account_identity(&mut self, person: &Person) -> Result<()> {
+        self.upsert_person(person)?;
+        let person_id_ct = self.crypto.seal_prefixed(
+            person.id.as_bytes(),
+            &aad("account_identity", "person_id", ACCOUNT_IDENTITY_AAD_ID),
+        )?;
+        self.conn.execute(
+            "INSERT INTO account_identity(slot,person_id_ct) VALUES (?1,?2)
+             ON CONFLICT(slot) DO UPDATE SET person_id_ct=excluded.person_id_ct",
+            params![ACCOUNT_IDENTITY_SLOT, person_id_ct],
+        )?;
+        Ok(())
+    }
+
+    /// Read the cached daemon account for an authorized UI session. A missing
+    /// identity is normal before the first successful authoritative `/me`.
+    pub fn ui_account_identity(&self) -> Result<Option<UiPerson>> {
+        let person_id_ct: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT person_id_ct FROM account_identity WHERE slot=?1",
+                [ACCOUNT_IDENTITY_SLOT],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(person_id_ct) = person_id_ct else {
+            return Ok(None);
+        };
+        let person_id = String::from_utf8(self.crypto.open_prefixed(
+            &person_id_ct,
+            &aad("account_identity", "person_id", ACCOUNT_IDENTITY_AAD_ID),
+        )?)
+        .context("Invalid encrypted account person ID")?;
+        self.ui_person(&person_id)
     }
 
     /// Check cached person identity without decrypting free text.
@@ -1378,6 +1419,60 @@ mod tests {
         ] {
             assert!(!bytes.windows(secret.len()).any(|window| window == secret));
         }
+    }
+
+    #[test]
+    fn cached_account_identity_is_encrypted_and_never_guessed() {
+        let mut mirror = Mirror::in_memory([13_u8; 32]).unwrap();
+        assert!(mirror.ui_account_identity().unwrap().is_none());
+        let person = Person {
+            id: "account-person".into(),
+            display_name: "Account Owner".into(),
+            emails: vec!["owner@example.test".into()],
+            ..Person::default()
+        };
+        mirror.cache_account_identity(&person).unwrap();
+        assert_eq!(
+            mirror.ui_account_identity().unwrap(),
+            Some(UiPerson {
+                id: "account-person".into(),
+                display_name: Some("Account Owner".into()),
+                emails: Some(vec!["owner@example.test".into()]),
+            })
+        );
+        let encrypted: Vec<u8> = mirror
+            .conn
+            .query_row(
+                "SELECT person_id_ct FROM account_identity WHERE slot=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!encrypted
+            .windows(b"account-person".len())
+            .any(|window| window == b"account-person"));
+    }
+
+    #[test]
+    fn cached_account_identity_survives_mirror_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bridge.db");
+        let key = [15_u8; 32];
+        let mut mirror = Mirror::initialize(Connection::open(&path).unwrap(), key, true).unwrap();
+        mirror
+            .cache_account_identity(&Person {
+                id: "account-person".into(),
+                display_name: "Account Owner".into(),
+                emails: vec!["owner@example.test".into()],
+                ..Person::default()
+            })
+            .unwrap();
+        drop(mirror);
+        let mirror = Mirror::initialize(Connection::open(path).unwrap(), key, false).unwrap();
+        assert_eq!(
+            mirror.ui_account_identity().unwrap().unwrap().id,
+            "account-person"
+        );
     }
 
     #[test]

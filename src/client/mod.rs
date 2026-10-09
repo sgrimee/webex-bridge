@@ -73,6 +73,20 @@ impl ClientError {
             } if code == "delivery_unknown"
         )
     }
+
+    /// Whether the paired daemon has not yet mirrored an authoritative account
+    /// identity. Callers can still show other locally available mirror data.
+    #[must_use]
+    pub fn is_identity_not_ready(&self) -> bool {
+        matches!(
+            self,
+            Self::Api {
+                status: StatusCode::CONFLICT,
+                code,
+                ..
+            } if code == "identity_not_ready"
+        )
+    }
 }
 
 pub(crate) type Result<T> = std::result::Result<T, ClientError>;
@@ -265,5 +279,15 @@ mod tests {
         )
         .unwrap_err();
         assert!(!error.is_delivery_unknown());
+    }
+
+    #[test]
+    fn identity_not_ready_is_an_explicit_partial_ready_error() {
+        let error = BridgeClient::decode_json::<serde_json::Value>(
+            StatusCode::CONFLICT,
+            br#"{"code":"identity_not_ready","message":"Account identity has not yet been mirrored"}"#,
+        )
+        .unwrap_err();
+        assert!(error.is_identity_not_ready());
     }
 }

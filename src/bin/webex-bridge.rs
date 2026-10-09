@@ -53,6 +53,22 @@ async fn main() -> Result<()> {
                 println!("Mirror: not initialized");
             }
         }
+        [command, action] if command == "sync" && action == "failures" => {
+            let mirror = Mirror::open(&paths)?;
+            for failure in mirror.sync_failures()? {
+                // JSON encoding escapes terminal-control characters in a user-supplied
+                // title. This explicit CLI request is the only diagnostic path that
+                // decrypts a room title; daemon logs remain metadata-only.
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "roomId": failure.room_id,
+                        "title": failure.title,
+                        "result": failure.result,
+                    })
+                );
+            }
+        }
         [command, action, url_flag, link, title_flag, title, agent_flag, agent, workspace_flag, workspace]
             if command == "routes"
                 && action == "init"
@@ -127,7 +143,7 @@ async fn main() -> Result<()> {
             })
             .await?;
         }
-        _ => bail!("Usage: webex-bridge login | me | status | devices status | messages inspect --id ID | rooms find --title TITLE | rooms verify --url SPACE_URL --title TITLE | routes init --url SPACE_URL --title TITLE --agent NAME --workspace PATH | probe [--room ROOM_ID [--refresh-after-secs 1..120]]"),
+        _ => bail!("Usage: webex-bridge login | me | status | sync failures | devices status | messages inspect --id ID | rooms find --title TITLE | rooms verify --url SPACE_URL --title TITLE | routes init --url SPACE_URL --title TITLE --agent NAME --workspace PATH | probe [--room ROOM_ID [--refresh-after-secs 1..120]]"),
     }
     Ok(())
 }

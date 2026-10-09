@@ -113,6 +113,15 @@ pub struct MirrorStats {
     pub failures: i64,
 }
 
+/// A room whose last sync attempt failed. Names are decrypted only for the
+/// explicit local CLI request; this type is never written to daemon logs.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SyncFailure {
+    pub room_id: String,
+    pub title: Option<String>,
+    pub result: String,
+}
+
 /// A local encrypted mirror; callers serialize writes through one owner.
 pub struct Mirror {
     conn: Connection,
@@ -210,6 +219,44 @@ impl Mirror {
                 |row| row.get(0),
             )?,
         })
+    }
+
+    /// List retryable room failures for an explicit, local diagnostic request.
+    /// Room titles remain encrypted at rest and are never written to daemon logs.
+    pub fn sync_failures(&self) -> Result<Vec<SyncFailure>> {
+        let mut statement = self.conn.prepare(
+            "SELECT sync.room_id,rooms.title_ct,sync.last_result
+             FROM room_sync AS sync
+             LEFT JOIN rooms ON rooms.room_id=sync.room_id
+             WHERE sync.last_result LIKE '%_error'
+             ORDER BY sync.last_result,sync.room_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut failures = Vec::new();
+        for row in rows {
+            let (room_id, encrypted_title, result) = row?;
+            let title = encrypted_title
+                .map(|blob| {
+                    self.crypto
+                        .open_prefixed(&blob, &aad("rooms", "title", &room_id))
+                        .and_then(|bytes| {
+                            String::from_utf8(bytes).context("Invalid encrypted room title")
+                        })
+                })
+                .transpose()?;
+            failures.push(SyncFailure {
+                room_id,
+                title,
+                result,
+            });
+        }
+        Ok(failures)
     }
 
     /// Upsert room metadata; title is encrypted, IDs/activity dates are indexed.
@@ -882,6 +929,33 @@ mod tests {
         ] {
             assert!(!bytes.windows(secret.len()).any(|window| window == secret));
         }
+    }
+
+    #[test]
+    fn sync_failure_diagnostic_decrypts_title_only_for_explicit_request() {
+        let mut mirror = Mirror::in_memory([11_u8; 32]).unwrap();
+        let room = Room {
+            id: "room-1".into(),
+            title: Some("Private failing room".into()),
+            room_type: "group".into(),
+            is_locked: false,
+            team_id: None,
+            last_activity: "2026-10-08T12:00:00Z".into(),
+            creator_id: "person-1".into(),
+            created: "2026-10-08T12:00:00Z".into(),
+        };
+        mirror.upsert_room(&room, true).unwrap();
+        mirror
+            .record_sync_failure(&room.id, "initial", "timeout")
+            .unwrap();
+        assert_eq!(
+            mirror.sync_failures().unwrap(),
+            vec![SyncFailure {
+                room_id: "room-1".into(),
+                title: Some("Private failing room".into()),
+                result: "initial_timeout_error".into(),
+            }]
+        );
     }
 
     #[test]

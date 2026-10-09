@@ -284,6 +284,10 @@ async fn run_sync(
     dev_room: Option<String>,
     events: EventBus,
 ) -> Result<()> {
+    // A failed REST sync must recover without waiting for an unrelated Mercury
+    // reconnect. This is failure recovery, not steady-state polling: a clean
+    // pass still waits only for a connection change before the next sync.
+    let mut retry_backoff = Duration::from_secs(1);
     loop {
         diagnostics::debug("sync.waiting_for_connection");
         while connected.borrow().is_none() {
@@ -327,12 +331,27 @@ async fn run_sync(
                         ));
                     },
                     // Never expose response bodies, tokens, room titles or message IDs in daemon logs.
-                    Err(error) => diagnostics::warn(format!(
-                        "sync.failed elapsed_ms={} category={}; reconnect_or_catchup_will_retry",
-                        started.elapsed().as_millis(), sync_error_kind(&error)
-                    )),
+                    Err(error) => {
+                        diagnostics::warn(format!(
+                            "sync.failed elapsed_ms={} category={} retry_after_secs={}",
+                            started.elapsed().as_millis(),
+                            sync_error_kind(&error),
+                            retry_backoff.as_secs(),
+                        ));
+                        tokio::select! {
+                            changed = connected.changed() => {
+                                changed.context("Mercury supervisor stopped")?;
+                            }
+                            _ = tokio::time::sleep(retry_backoff) => {
+                                retry_backoff = (retry_backoff * 2).min(Duration::from_secs(300));
+                            }
+                        }
+                        continue;
+                    }
                 }
-                // No steady-state polling. Wait until a reconnect publishes a new REST client.
+                retry_backoff = Duration::from_secs(1);
+                // No steady-state polling. After a clean pass, wait until a
+                // reconnect publishes a new REST client.
                 connected.changed().await.context("Mercury supervisor stopped")?;
             }
         }

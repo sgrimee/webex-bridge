@@ -7,7 +7,7 @@ use reqwest::{header, Client, Method, Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::time::sleep;
-use webex::{GlobalId, GlobalIdType, Message, MessageOut, Person, Room};
+use webex::{GlobalId, GlobalIdType, Membership, Message, MessageOut, Person, Room};
 
 const REST_BASE: &str = "https://webexapis.com/v1/";
 
@@ -295,6 +295,64 @@ impl WebexRest {
         ))
     }
 
+    /// Read the authenticated user for an authorized paired UI request.
+    pub async fn me(&self) -> Result<Person> {
+        let response = self
+            .get(self.endpoint("people", Some("me"))?)
+            .await?
+            .context("Webex current-person endpoint returned 404")?;
+        response
+            .json::<Person>()
+            .await
+            .context("Invalid Webex current-person response")
+    }
+
+    /// Leave a group room using the current daemon account. The caller checks
+    /// local policy before this mutation; this method performs no retries.
+    pub async fn leave_room(&self, room_id: &str) -> Result<()> {
+        let _ = GlobalId::new(GlobalIdType::Room, room_id.to_owned())?;
+        let me = self.me().await?;
+        let mut url = self.endpoint("memberships", None)?;
+        url.query_pairs_mut()
+            .append_pair("roomId", room_id)
+            .append_pair("personId", &me.id)
+            .append_pair("max", "2");
+        let response = self
+            .get(url)
+            .await?
+            .context("Webex membership list returned 404")?;
+        let memberships = response
+            .json::<Page<Membership>>()
+            .await
+            .context("Invalid Webex membership list response")?
+            .items;
+        let membership = memberships
+            .into_iter()
+            .find(|membership| membership.room_id == room_id && membership.person_id == me.id)
+            .context("Current user has no membership in this room")?;
+        if membership.id.is_empty()
+            || membership.id.len() > 1024
+            || membership.id.chars().any(char::is_control)
+        {
+            bail!("Webex membership ID is invalid");
+        }
+        let response = self
+            .client
+            .delete(self.endpoint("memberships", Some(&membership.id))?)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .context("Webex room leave did not return a response")?;
+        let status = response.status();
+        if matches!(status.as_u16(), 401 | 403) {
+            bail!("auth_required: Webex room leave returned HTTP {status}");
+        }
+        if !status.is_success() {
+            bail!("Webex room leave returned HTTP {status}");
+        }
+        Ok(())
+    }
+
     /// Hydrate one person for encrypted UI metadata.
     pub async fn person(&self, id: &str) -> Result<Option<Person>> {
         let id = GlobalId::new(GlobalIdType::Person, id.to_owned())?;
@@ -475,6 +533,48 @@ mod tests {
             .unwrap();
         assert_eq!(edited.id.as_deref(), Some(message));
         rest.delete_message(message).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ui_leave_resolves_current_membership_then_deletes_once() {
+        let server = MockServer::start().await;
+        let room = "Y2lzY29zcGFyazovL3VzL1JPT00vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBhMDAx";
+        let person =
+            "Y2lzY29zcGFyazovL3VzL1BFT1BMRS8wMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMGIwMDE";
+        let membership =
+            "Y2lzY29zcGFyazovL3VzL01FTUJFUlNISVAvODc2NTQzMjEtNDMyMS00MzIxLTQzMjEtMjEwOTg3NjU0MzIx";
+        Mock::given(method("GET"))
+            .and(path("/v1/people/me"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": person
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/memberships"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [{
+                    "id": membership,
+                    "roomId": room,
+                    "personId": person,
+                    "isModerator": false,
+                    "isMonitor": false,
+                    "created": "2026-10-08T12:00:00Z"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/v1/memberships/{membership}")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rest =
+            WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
+        rest.leave_room(room).await.unwrap();
     }
 
     #[tokio::test]

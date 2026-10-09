@@ -10,7 +10,7 @@ use axum::{
     extract::{Extension, Path, Query, State},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -214,6 +214,73 @@ async fn room(
             StatusCode::SERVICE_UNAVAILABLE,
             "bridge_unavailable",
             "Mirror is temporarily unavailable",
+        ),
+    }
+}
+
+async fn leave_room(
+    State(state): State<ApiState>,
+    Extension(peer): Extension<auth::PeerIdentity>,
+    Path(room_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = ui_session(&state, peer, &headers) {
+        return *response;
+    }
+    if !valid_resource_id(&room_id) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Room ID is invalid",
+        );
+    }
+    let room = match state.mirror().with(|db| db.ui_room(&room_id)).await {
+        Ok(Some(room)) if room.is_member => room,
+        Ok(_) => return json_error(StatusCode::NOT_FOUND, "not_found", "Room was not found"),
+        Err(_) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bridge_unavailable",
+                "Mirror is temporarily unavailable",
+            )
+        }
+    };
+    if room.room_type == "direct" {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Webex does not support leaving direct rooms",
+        );
+    }
+    if let Err(response) = write_allowed(&state, &room.id) {
+        return *response;
+    }
+    let Some(rest) = state.rest() else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "webex_unavailable",
+            "Webex is not connected",
+        );
+    };
+    if rest.leave_room(&room.id).await.is_err() {
+        return json_error(
+            StatusCode::BAD_GATEWAY,
+            "webex_unavailable",
+            "Webex did not accept the room leave",
+        );
+    }
+    match state.mirror().with(|db| db.mark_room_left(&room.id)).await {
+        Ok(()) => {
+            state.events().publish_ui(
+                "membership.changed",
+                serde_json::json!({ "roomId": room.id, "isMember": false }),
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(_) => json_error(
+            StatusCode::ACCEPTED,
+            "delivery_unknown",
+            "Webex accepted the room leave but the mirror has not yet confirmed it",
         ),
     }
 }
@@ -629,6 +696,7 @@ pub fn router() -> Router<ApiState> {
         .route("/v1/ui/sessions", post(create_session))
         .route("/v1/rooms", get(rooms))
         .route("/v1/rooms/{room_id}", get(room))
+        .route("/v1/rooms/{room_id}/membership", delete(leave_room))
         .route("/v1/rooms/{room_id}/messages", get(room_messages))
         .route("/v1/messages", post(create_message))
         .route(

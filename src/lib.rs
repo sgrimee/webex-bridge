@@ -25,4 +25,6 @@ pub mod outbox;
 #[cfg(feature = "server")]
 pub mod routing;
 #[cfg(feature = "server")]
+pub mod service;
+#[cfg(feature = "server")]
 pub mod sync;

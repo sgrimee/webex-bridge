@@ -2,6 +2,7 @@
 //! Do not treat an event's text or a `leave` verb as an instruction/state change.
 
 use crate::{
+    diagnostics,
     mirror::{SharedMirror, Upsert},
     sync::history::WebexRest,
 };
@@ -141,6 +142,13 @@ pub async fn ingest_event(
                     }
                 }
             }
+            // Mention presence is transport metadata only; log its count in
+            // debug mode so the Step 1 probe can distinguish mention/no-mention
+            // without recording a person ID or message body.
+            diagnostics::debug(format!(
+                "sync.live_message mentioned_people={}",
+                message.mentioned_people.as_ref().map_or(0, Vec::len)
+            ));
             Ok(LiveResult::Message(
                 mirror.with(|db| db.upsert_message(&message)).await?,
             ))

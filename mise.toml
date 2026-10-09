@@ -1,0 +1,52 @@
+[tools]
+rust = "1.88"
+
+[tasks.build]
+description = "Build both local binaries and sign them for Keychain access"
+run = "./scripts/sign-bridged-dev"
+
+[tasks.check]
+description = "Format-check, test, and lint"
+run = """
+cargo fmt --check
+cargo test
+cargo clippy --all-targets -- -D warnings
+"""
+
+[tasks.test]
+description = "Run the Rust test suite"
+run = "cargo test"
+
+[tasks.lint]
+description = "Run Clippy with warnings denied"
+run = "cargo clippy --all-targets -- -D warnings"
+
+[tasks.fmt]
+description = "Format Rust sources"
+run = "cargo fmt"
+
+[tasks."daemon:run"]
+description = "Build, sign, and run the daemon in the foreground"
+run = "./scripts/run-bridged-dev"
+
+[tasks."service:start"]
+description = "Build/sign, then install and start the macOS LaunchAgent"
+depends = ["build"]
+run = "./target/debug/webex-bridge install-service"
+
+[tasks."service:stop"]
+description = "Stop and remove the macOS LaunchAgent"
+run = "./target/debug/webex-bridge uninstall-service"
+
+[tasks."service:restart"]
+description = "Build/sign, then replace and restart the macOS LaunchAgent"
+depends = ["build"]
+run = "./target/debug/webex-bridge install-service"
+
+[tasks."service:status"]
+description = "Show bridge authentication and mirror progress"
+run = "./target/debug/webex-bridge status"
+
+[tasks."service:logs"]
+description = "Follow redacted daemon lifecycle logs"
+run = "tail -f ~/Library/Logs/webex-bridge/bridged.log"

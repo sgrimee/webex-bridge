@@ -7,7 +7,7 @@ use reqwest::{header, Client, Response, StatusCode, Url};
 use serde::Deserialize;
 use std::time::Duration;
 use tokio::time::sleep;
-use webex::{GlobalId, GlobalIdType, Message, Person, Room};
+use webex::{GlobalId, GlobalIdType, Message, MessageOut, Person, Room};
 
 const REST_BASE: &str = "https://webexapis.com/v1/";
 
@@ -168,6 +168,50 @@ impl WebexRest {
             .collect()
     }
 
+    /// Send exactly one agent-approved Markdown message. This method never
+    /// retries: a transport failure may be ambiguous, and the caller records
+    /// `delivery-unknown` rather than risking a duplicate human-visible post.
+    pub async fn send_markdown(
+        &self,
+        room_id: &str,
+        parent_id: Option<&str>,
+        markdown: &str,
+    ) -> Result<Message> {
+        if markdown.is_empty() || markdown.len() > 7439 {
+            bail!("Webex Markdown must be between 1 and 7439 bytes");
+        }
+        let _ = GlobalId::new(GlobalIdType::Room, room_id.to_owned())?;
+        if let Some(parent_id) = parent_id {
+            let _ = GlobalId::new(GlobalIdType::Message, parent_id.to_owned())?;
+        }
+        let response = self
+            .client
+            .post(self.endpoint("messages", None)?)
+            .bearer_auth(&self.token)
+            .json(&MessageOut {
+                room_id: Some(room_id.into()),
+                parent_id: parent_id.map(Into::into),
+                markdown: Some(markdown.into()),
+                ..MessageOut::default()
+            })
+            .send()
+            .await
+            .context("Webex send did not return a response")?;
+        let status = response.status();
+        if matches!(status.as_u16(), 401 | 403) {
+            bail!("auth_required: Webex send returned HTTP {status}");
+        }
+        if !status.is_success() {
+            bail!("Webex send returned HTTP {status}");
+        }
+        Self::decode_mirror_message(
+            response
+                .json::<serde_json::Value>()
+                .await
+                .context("Invalid Webex send response")?,
+        )
+    }
+
     /// Hydrate one canonical message; a 404 is a verified deletion only for a known ID.
     pub async fn message(&self, id: &str) -> Result<Option<Message>> {
         let id = GlobalId::new(GlobalIdType::Message, id.to_owned())?;
@@ -319,6 +363,30 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert!(messages[0].attachments.is_none());
         assert_eq!(messages[0].text.as_deref(), Some("private fixture"));
+    }
+
+    #[tokio::test]
+    async fn approved_send_posts_once_without_followup_retry() {
+        let server = MockServer::start().await;
+        let room = "Y2lzY29zcGFyazovL3VzL1JPT00vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBhMDAx";
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "Y2lzY29zcGFyazovL3VzL01FU1NBR0UvMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBjMDAz",
+                "roomId": room,
+                "created": "2026-10-08T12:00:00Z",
+                "markdown": "sent only after approval"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rest =
+            WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
+        let sent = rest
+            .send_markdown(room, None, "sent only after approval")
+            .await
+            .unwrap();
+        assert_eq!(sent.room_id.as_deref(), Some(room));
     }
 
     #[tokio::test]

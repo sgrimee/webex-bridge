@@ -10,8 +10,14 @@ connection and maintains the encrypted SQLite mirror; `--dev-room` restricts
 validation to an allowlisted room, while normal mode mirrors all rooms. The
 daemon also exposes a same-user, 0600 HTTP-over-UDS status endpoint at
 `run/bridge.sock` (`GET /v1/status`), containing only API, connection and
-mirror-progress metadata. Sessions, scoped UI/agent endpoints and message
-sends remain unimplemented, so do not run the daemon as a service yet.
+mirror-progress metadata. Agent hosts can create an exclusive, process-bound
+60-second route lease and use the scoped inbox API: listing is metadata-only,
+and remote text is released only by an explicit local accept action. Agent
+sends are encrypted, route-bound drafts; a one-time approval binds the exact
+text and destination, then makes one non-retrying Webex request. UI pairing
+uses a native macOS confirmation showing the kernel-resolved executable path,
+then creates an in-memory UI session. SSE, actual UI endpoints and service
+installation remain unimplemented, so do not run the daemon as a service yet.
 
 The dedicated `webex-bridge` integration is separate from the TUI integration.
 OAuth defaults to ten granular scopes. The user explicitly approved
@@ -24,15 +30,39 @@ signed/entitled app). Never put tokens or client secrets in `config.toml`.
 
 Local testing:
 
+`mise.toml` provides the preferred, signing-safe shortcuts:
+
+```sh
+mise run check             # fmt check + tests + clippy
+mise run build             # build and sign both local executables
+mise run service:start     # signed build + install/start LaunchAgent
+mise run service:restart   # signed build + replace/restart LaunchAgent
+mise run service:status
+mise run service:stop
+```
+
 ```sh
 cargo run --bin webex-bridge -- login
 cargo run --bin webex-bridge -- status
+# Always build and persistently sign the daemon before starting/installing it:
+# an ad-hoc Cargo signature causes repeated Keychain/password prompts.
+./scripts/sign-bridged-dev
+# Installs/removes the per-user macOS LaunchAgent (persistent service).
+# The installer rejects unsigned or ad-hoc-signed daemon binaries.
+cargo run --bin webex-bridge -- install-service
+cargo run --bin webex-bridge -- uninstall-service
 # Explicit local diagnostic: emits roomId, title, isMember and result as JSON.
 # It decrypts the room title for stdout only; daemon logs remain metadata-only.
 cargo run --bin webex-bridge -- sync failures
 cargo run --bin webex-bridge -- probe --room <approved-room-id>
 # With [dev] write_allowlist configured, one-time refresh test:
 cargo run --bin webex-bridge -- probe --room <approved-room-id> --refresh-after-secs 20
+# For refresh-gap continuity, drop the listener for an explicit 1–120 s window.
+cargo run --bin webex-bridge -- probe --room <approved-room-id> --refresh-after-secs 10 --refresh-gap-secs 60
+# Explicit Step 1 membership diagnostics; the room must be allowlisted.
+cargo run --bin webex-bridge -- membership invite --room <approved-room-id> --email <consented-participant-email>
+# Temporarily removes and restores that existing participant; final state remains a member.
+cargo run --bin webex-bridge -- membership cycle --room <approved-room-id> --email <consented-participant-email>
 ```
 
 Probe output contains only IDs, timestamps, lengths and sanitized event types,

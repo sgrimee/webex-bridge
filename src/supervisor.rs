@@ -103,6 +103,23 @@ where
 pub async fn run_with_refresh_after<H, F>(
     paths: &Paths,
     forced_refresh_after: Option<Duration>,
+    on_event: H,
+) -> Result<()>
+where
+    H: FnMut(Event, Webex) -> F,
+    F: Future<Output = Result<(), WebexError>>,
+{
+    run_with_refresh_after_and_gap(paths, forced_refresh_after, None, on_event).await
+}
+
+/// Development-only refresh/rebuild with an intentional listener gap.
+///
+/// The gap lets a human post during a known outage so catch-up continuity can
+/// be verified. Both controls remain unavailable outside a configured dev room.
+pub async fn run_with_refresh_after_and_gap<H, F>(
+    paths: &Paths,
+    forced_refresh_after: Option<Duration>,
+    forced_refresh_gap: Option<Duration>,
     mut on_event: H,
 ) -> Result<()>
 where
@@ -112,6 +129,7 @@ where
     run_inner(
         paths,
         forced_refresh_after,
+        forced_refresh_gap,
         move |event, client, _rest| on_event(event, client),
         None,
     )
@@ -129,12 +147,36 @@ where
     H: FnMut(Event, Webex, Arc<WebexRest>) -> F,
     F: Future<Output = Result<(), WebexError>>,
 {
-    run_inner(paths, None, on_event, Some(connected)).await
+    run_daemon_with_refresh_after_and_gap(paths, None, None, on_event, connected).await
+}
+
+/// Daemon variant used only by explicit development continuity validation.
+/// The caller must restrict synchronization to an allowlisted dev room.
+pub async fn run_daemon_with_refresh_after_and_gap<H, F>(
+    paths: &Paths,
+    forced_refresh_after: Option<Duration>,
+    forced_refresh_gap: Option<Duration>,
+    on_event: H,
+    connected: watch::Sender<Option<Arc<WebexRest>>>,
+) -> Result<()>
+where
+    H: FnMut(Event, Webex, Arc<WebexRest>) -> F,
+    F: Future<Output = Result<(), WebexError>>,
+{
+    run_inner(
+        paths,
+        forced_refresh_after,
+        forced_refresh_gap,
+        on_event,
+        Some(connected),
+    )
+    .await
 }
 
 async fn run_inner<H, F>(
     paths: &Paths,
     forced_refresh_after: Option<Duration>,
+    forced_refresh_gap: Option<Duration>,
     mut on_event: H,
     connected: Option<watch::Sender<Option<Arc<WebexRest>>>>,
 ) -> Result<()>
@@ -142,8 +184,13 @@ where
     H: FnMut(Event, Webex, Arc<WebexRest>) -> F,
     F: Future<Output = Result<(), WebexError>>,
 {
-    if forced_refresh_after.is_some() && Config::load(paths)?.dev.is_none() {
+    if (forced_refresh_after.is_some() || forced_refresh_gap.is_some())
+        && Config::load(paths)?.dev.is_none()
+    {
         bail!("Forced refresh is allowed only with the development write allowlist");
+    }
+    if forced_refresh_gap.is_some() && forced_refresh_after.is_none() {
+        bail!("A forced refresh gap requires a forced refresh delay");
     }
     let mut force_once = forced_refresh_after;
     let mut term = signal(SignalKind::terminate())?;
@@ -251,6 +298,30 @@ where
                 // Rebuild the immutable token-bearing Webex client and stream.
                 if forced {
                     diagnostics::info("supervisor.token_refresh_starting");
+                    // Publish the disconnect before dropping the listener. The
+                    // daemon's sync task uses this transition to cancel any old
+                    // pass and runs catch-up with the newly authenticated REST
+                    // client after reconnect.
+                    if let Some(sender) = &connected {
+                        let _ = sender.send(None);
+                    }
+                    // The intentional development-only gap begins only after the
+                    // Mercury listener is dropped, so a message sent now must be
+                    // recovered by the rebuilt stream/catch-up path.
+                    drop(stream);
+                    drop(client);
+                    drop(rest);
+                    if let Some(gap) = forced_refresh_gap {
+                        diagnostics::info(format!(
+                            "supervisor.refresh_gap_started duration_secs={}",
+                            gap.as_secs()
+                        ));
+                        tokio::select! {
+                            _ = term.recv() => return Ok(()),
+                            _ = tokio::signal::ctrl_c() => return Ok(()),
+                            _ = sleep(gap) => {}
+                        }
+                    }
                     auth::refresh_now(paths).await?;
                     diagnostics::info("supervisor.token_refreshed; rebuilding_stream");
                     continue;

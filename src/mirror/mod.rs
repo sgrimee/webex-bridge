@@ -123,10 +123,21 @@ pub struct SyncFailure {
     pub result: String,
 }
 
+/// A persisted interval whose continuity was not proven within the normal
+/// catch-up limit. It contains timestamps only, never message content.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RecoveryGap {
+    pub room_id: String,
+    pub from: String,
+    pub to: String,
+}
+
 /// A local encrypted mirror; callers serialize writes through one owner.
 pub struct Mirror {
-    conn: Connection,
-    crypto: MirrorCrypto,
+    // Internal bridge modules implement durable routing/outbox operations on
+    // this connection; the fields remain unavailable outside this crate.
+    pub(crate) conn: Connection,
+    pub(crate) crypto: MirrorCrypto,
 }
 
 impl Mirror {
@@ -793,6 +804,93 @@ impl Mirror {
             .map_err(Into::into)
     }
 
+    /// Read one unresolved catch-up gap for an explicit, user-approved
+    /// recovery operation. The normal sync never expands its age limit.
+    pub fn recovery_gap(&self, room_id: &str) -> Result<Option<RecoveryGap>> {
+        let result: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT last_result FROM room_sync WHERE room_id=?1",
+                [room_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(result) = result else {
+            return Ok(None);
+        };
+        let Some((from, to)) = parse_gap(&result) else {
+            return Ok(None);
+        };
+        Ok(Some(RecoveryGap {
+            room_id: room_id.into(),
+            from,
+            to,
+        }))
+    }
+
+    /// Mark a particular persisted gap recovered only after the recovery scan
+    /// reached a known pre-gap message. This is auditable and cannot clear a
+    /// changed/newer gap by accident.
+    pub fn clear_recovery_gap(&mut self, gap: &RecoveryGap) -> Result<()> {
+        let expected = format!("gap:{}:{}", gap.from, gap.to);
+        if self.conn.execute(
+            "UPDATE room_sync SET last_result='ok',last_catchup_at=?2
+             WHERE room_id=?1 AND last_result=?3",
+            params![gap.room_id, Utc::now().to_rfc3339(), expected],
+        )? != 1
+        {
+            bail!("Recovery gap changed or is no longer pending");
+        }
+        self.conn.execute(
+            "INSERT INTO audit(ts,scope,action,ref,detail_redacted)
+             VALUES (?1,'system','gap_recovered',?2,'read_only_extended_history')",
+            params![Utc::now().to_rfc3339(), gap.room_id],
+        )?;
+        Ok(())
+    }
+
+    /// Store one user-confirmed UI pairing. The caller provides only a hash of
+    /// its 256-bit secret; the daemon never receives or persists the secret.
+    pub fn pair_ui_client(&mut self, secret_hash: &str, executable: &str) -> Result<()> {
+        if !(43..=128).contains(&secret_hash.len())
+            || !secret_hash
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+            || !executable.starts_with('/')
+            || executable.chars().any(char::is_control)
+        {
+            bail!("Invalid UI pairing data");
+        }
+        self.conn.execute(
+            "INSERT INTO ui_clients(secret_hash,exe_path,paired_at,last_seen)
+             VALUES (?1,?2,?3,?3)
+             ON CONFLICT(secret_hash) DO UPDATE SET exe_path=excluded.exe_path,last_seen=excluded.last_seen",
+            params![secret_hash, executable, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Check a UI secret hash after an explicit user-confirmed pairing.
+    pub fn ui_client_paired(&mut self, secret_hash: &str) -> Result<bool> {
+        let found = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM ui_clients WHERE secret_hash=?1",
+                [secret_hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if found {
+            self.conn.execute(
+                "UPDATE ui_clients SET last_seen=?2 WHERE secret_hash=?1",
+                params![secret_hash, Utc::now().to_rfc3339()],
+            )?;
+        }
+        Ok(found)
+    }
+
     /// Canonical IDs whose latest revision is active in a room. Reconcile only on events/outage.
     pub fn active_message_ids(&self, room_id: &str) -> Result<Vec<String>> {
         let mut statement = self.conn.prepare(
@@ -805,11 +903,26 @@ impl Mirror {
     }
 }
 
+fn parse_gap(value: &str) -> Option<(String, String)> {
+    let value = value.strip_prefix("gap:")?;
+    for (index, _) in value.char_indices().skip(1) {
+        if value.as_bytes().get(index - 1) != Some(&b':') {
+            continue;
+        }
+        let (from, to) = value.split_at(index - 1);
+        let to = &to[1..];
+        if parse_timestamp(from).is_ok() && parse_timestamp(to).is_ok() {
+            return Some((from.into(), to.into()));
+        }
+    }
+    None
+}
+
 fn parse_timestamp(value: &str) -> Result<chrono::DateTime<chrono::FixedOffset>> {
     chrono::DateTime::parse_from_rfc3339(value).context("Invalid Webex message timestamp")
 }
 
-fn message_aad(column: &str, id: &str, revision: i64) -> Vec<u8> {
+pub(crate) fn message_aad(column: &str, id: &str, revision: i64) -> Vec<u8> {
     aad("messages", column, &format!("{id}/{revision}"))
 }
 

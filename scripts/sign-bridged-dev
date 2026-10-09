@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Build and apply stable development signatures required for Keychain ACLs.
+set -euo pipefail
+
+repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repo_root"
+
+identity=${WEBEX_BRIDGE_CODESIGN_IDENTITY:-}
+if [[ -z "$identity" ]]; then
+    identity=$(security find-identity -v -p codesigning 2>/dev/null \
+        | awk -F '"' 'NF >= 2 { print $2; exit }')
+fi
+
+if [[ -z "$identity" ]]; then
+    cat >&2 <<'EOF'
+webex-bridge development signing requires a persistent Code Signing identity.
+
+Create an “Apple Development” (or local Code Signing) certificate in Keychain
+Access/Xcode, or select one explicitly:
+
+  WEBEX_BRIDGE_CODESIGN_IDENTITY='Webex Bridge Development' \
+    ./scripts/sign-bridged-dev
+EOF
+    exit 1
+fi
+
+# Both local executables access Keychain-backed bridge state. Signing both
+# avoids password prompts when invoking either the CLI or the launchd daemon.
+cargo build --bins
+for binary in webex-bridge webex-bridged; do
+    codesign --force --sign "$identity" \
+        --identifier "com.sgrimee.${binary}" \
+        --timestamp=none \
+        "target/debug/${binary}"
+done

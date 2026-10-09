@@ -424,12 +424,13 @@ impl Mirror {
             .map_err(Into::into)
     }
 
-    /// Mark rooms absent from a complete REST room listing as no longer joined.
-    /// Call only after every pagination page was fetched successfully.
-    pub fn mark_unobserved_rooms_left(
+    /// Return room IDs whose membership was marked departed after a complete
+    /// REST listing. Callers may publish metadata-only invalidations only after
+    /// this transaction has committed.
+    pub fn mark_unobserved_rooms_left_ids(
         &mut self,
         observed_room_ids: &std::collections::HashSet<String>,
-    ) -> Result<usize> {
+    ) -> Result<Vec<String>> {
         let mut statement = self
             .conn
             .prepare("SELECT room_id FROM rooms WHERE is_member=1")?;
@@ -437,16 +438,29 @@ impl Mirror {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
-        let mut left = 0;
+        let mut left = Vec::new();
         for room_id in current_members {
-            if !observed_room_ids.contains(&room_id) {
-                left += self.conn.execute(
+            if !observed_room_ids.contains(&room_id)
+                && self.conn.execute(
                     "UPDATE rooms SET is_member=0,updated_at=?2 WHERE room_id=?1",
                     params![room_id, Utc::now().to_rfc3339()],
-                )?;
+                )? == 1
+            {
+                left.push(room_id);
             }
         }
         Ok(left)
+    }
+
+    /// Mark rooms absent from a complete REST room listing as no longer joined.
+    /// Call only after every pagination page was fetched successfully.
+    pub fn mark_unobserved_rooms_left(
+        &mut self,
+        observed_room_ids: &std::collections::HashSet<String>,
+    ) -> Result<usize> {
+        Ok(self
+            .mark_unobserved_rooms_left_ids(observed_room_ids)?
+            .len())
     }
 
     /// Mark membership only after a REST check, never from a Mercury `leave` verb alone.

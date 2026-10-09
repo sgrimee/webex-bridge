@@ -7,6 +7,7 @@ use crate::{
     sync::history::WebexRest,
 };
 use anyhow::{bail, Context, Result};
+use serde_json::Value;
 use std::time::Duration;
 use tokio::time::sleep;
 use webex::{ActivityType, Event, GlobalId, GlobalIdType, MessageActivity, SpaceActivity};
@@ -17,11 +18,14 @@ pub enum LiveResult {
     /// Canonical message created/edited/deduplicated.
     Message(LiveMessage),
     /// Room-scoped reconciliation after a delete signal.
-    Reconciled(ReconcileResult),
+    Reconciled {
+        room_id: String,
+        result: ReconcileResult,
+    },
     /// Room metadata or membership verified by REST.
-    RoomUpdated,
+    RoomUpdated { room_id: String },
     /// Room membership was confirmed absent by REST.
-    RoomLeft,
+    RoomLeft { room_id: String },
     /// Typing, acknowledgement and unrelated control events.
     Ignored,
 }
@@ -47,6 +51,55 @@ pub struct ReconcileResult {
     pub edited: usize,
     /// Known missing IDs tombstoned and fully purged.
     pub deleted: usize,
+}
+
+/// One metadata-only UI invalidation emitted only for a committed mirror change.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UiInvalidation {
+    pub name: &'static str,
+    pub data: Value,
+}
+
+/// Convert a committed live outcome into narrow UI invalidations. Reconciliation
+/// intentionally requests a room resync rather than inventing individual
+/// message IDs from a room-scoped Mercury delete signal.
+pub fn ui_invalidations(result: &LiveResult) -> Vec<UiInvalidation> {
+    match result {
+        LiveResult::Message(message) => match message.upsert {
+            Upsert::Created(revision) => vec![UiInvalidation {
+                name: "message.created",
+                data: serde_json::json!({
+                    "roomId": message.room_id,
+                    "messageId": message.message_id,
+                    "revision": revision,
+                }),
+            }],
+            Upsert::Edited(revision) => vec![UiInvalidation {
+                name: "message.updated",
+                data: serde_json::json!({
+                    "roomId": message.room_id,
+                    "messageId": message.message_id,
+                    "revision": revision,
+                }),
+            }],
+            Upsert::Unchanged | Upsert::IgnoredDeleted => Vec::new(),
+        },
+        LiveResult::Reconciled { room_id, result } if result.edited != 0 || result.deleted != 0 => {
+            vec![UiInvalidation {
+                name: "room.resync",
+                data: serde_json::json!({ "roomId": room_id, "reason": "reconciled" }),
+            }]
+        }
+        LiveResult::RoomUpdated { room_id } => vec![UiInvalidation {
+            name: "room.updated",
+            data: serde_json::json!({ "roomId": room_id }),
+        }],
+        LiveResult::RoomLeft { room_id } => vec![UiInvalidation {
+            name: "membership.changed",
+            data: serde_json::json!({ "roomId": room_id, "isMember": false }),
+        }],
+        LiveResult::Reconciled { .. } | LiveResult::Ignored => Vec::new(),
+    }
 }
 
 fn event_room_id(event: &Event, from_delete_target: bool) -> Result<String> {
@@ -129,9 +182,10 @@ pub async fn ingest_event(
                 // A post can race a deletion. Never persist the event's body;
                 // reconcile known messages in its room instead.
                 let room_id = event_room_id(event, false)?;
-                return Ok(LiveResult::Reconciled(
-                    reconcile_room(mirror, rest, &room_id).await?,
-                ));
+                return Ok(LiveResult::Reconciled {
+                    result: reconcile_room(mirror, rest, &room_id).await?,
+                    room_id,
+                });
             };
             let room_id = message
                 .room_id
@@ -176,9 +230,10 @@ pub async fn ingest_event(
             if only_room.is_some_and(|allowed| allowed != room_id) {
                 return Ok(LiveResult::Ignored);
             }
-            Ok(LiveResult::Reconciled(
-                reconcile_room(mirror, rest, &room_id).await?,
-            ))
+            Ok(LiveResult::Reconciled {
+                result: reconcile_room(mirror, rest, &room_id).await?,
+                room_id,
+            })
         }
         ActivityType::Space(
             SpaceActivity::Changed
@@ -197,7 +252,9 @@ pub async fn ingest_event(
             }
             if let Some(room) = rest.room(id.id()).await? {
                 mirror.with(|db| db.upsert_room(&room, true)).await?;
-                Ok(LiveResult::RoomUpdated)
+                Ok(LiveResult::RoomUpdated {
+                    room_id: id.id().into(),
+                })
             } else if was_left_verb {
                 mirror
                     .with(|db| {
@@ -207,7 +264,9 @@ pub async fn ingest_event(
                         Ok(())
                     })
                     .await?;
-                Ok(LiveResult::RoomLeft)
+                Ok(LiveResult::RoomLeft {
+                    room_id: id.id().into(),
+                })
             } else {
                 bail!("Mercury room event could not be verified by REST")
             }
@@ -247,6 +306,49 @@ mod tests {
             updated: updated.map(str::to_owned),
             ..webex::Message::default()
         }
+    }
+
+    #[test]
+    fn committed_live_results_emit_only_metadata_invalidations() {
+        let message = LiveResult::Message(LiveMessage {
+            room_id: "room-1".into(),
+            message_id: "message-1".into(),
+            upsert: Upsert::Edited(2),
+        });
+        assert_eq!(
+            ui_invalidations(&message),
+            vec![UiInvalidation {
+                name: "message.updated",
+                data: serde_json::json!({
+                    "roomId": "room-1", "messageId": "message-1", "revision": 2
+                }),
+            }]
+        );
+        let reconciled = LiveResult::Reconciled {
+            room_id: "room-1".into(),
+            result: ReconcileResult {
+                checked: 3,
+                edited: 0,
+                deleted: 1,
+            },
+        };
+        assert_eq!(
+            ui_invalidations(&reconciled),
+            vec![UiInvalidation {
+                name: "room.resync",
+                data: serde_json::json!({"roomId": "room-1", "reason": "reconciled"}),
+            }]
+        );
+        assert_eq!(
+            ui_invalidations(&LiveResult::RoomLeft {
+                room_id: "room-1".into(),
+            }),
+            vec![UiInvalidation {
+                name: "membership.changed",
+                data: serde_json::json!({"roomId": "room-1", "isMember": false}),
+            }]
+        );
+        assert!(ui_invalidations(&LiveResult::Ignored).is_empty());
     }
 
     #[tokio::test]
@@ -388,7 +490,9 @@ mod tests {
         };
         assert_eq!(
             ingest_event(&mirror, &rest, &event, None).await.unwrap(),
-            LiveResult::RoomUpdated
+            LiveResult::RoomUpdated {
+                room_id: room_id.into(),
+            }
         );
         assert_eq!(
             mirror.with(|db| db.is_member(room_id)).await.unwrap(),

@@ -10,7 +10,7 @@ use webex_bridge::{
     api::{self, events::EventBus, ApiState, ConnectionStatus},
     config::Config,
     diagnostics,
-    mirror::{Mirror, SharedMirror, Upsert},
+    mirror::{Mirror, SharedMirror},
     paths::Paths,
     routing::Delivery,
     supervisor,
@@ -113,31 +113,14 @@ async fn main() -> Result<()> {
                                 webex::error::Error::Other("Agent routing failed".into())
                             })?;
                         publish_deliveries(&events, &queued);
+                        for invalidation in live::ui_invalidations(&result) {
+                            events.publish_ui(invalidation.name, invalidation.data);
+                        }
                         let outcome = match &result {
-                            live::LiveResult::Message(message) => {
-                                let event_name = match message.upsert {
-                                    Upsert::Created(_) => Some("message.created"),
-                                    Upsert::Edited(_) => Some("message.updated"),
-                                    Upsert::Unchanged | Upsert::IgnoredDeleted => None,
-                                };
-                                if let Some(event_name) = event_name {
-                                    events.publish_ui(
-                                        event_name,
-                                        serde_json::json!({
-                                            "roomId": message.room_id,
-                                            "messageId": message.message_id,
-                                            "revision": match message.upsert {
-                                                Upsert::Created(revision) | Upsert::Edited(revision) => revision,
-                                                Upsert::Unchanged | Upsert::IgnoredDeleted => 0,
-                                            },
-                                        }),
-                                    );
-                                }
-                                "message"
-                            }
-                            live::LiveResult::Reconciled(_) => "reconciled",
-                            live::LiveResult::RoomUpdated => "room_updated",
-                            live::LiveResult::RoomLeft => "room_left",
+                            live::LiveResult::Message(_) => "message",
+                            live::LiveResult::Reconciled { .. } => "reconciled",
+                            live::LiveResult::RoomUpdated { .. } => "room_updated",
+                            live::LiveResult::RoomLeft { .. } => "room_left",
                             live::LiveResult::Ignored => "ignored",
                         };
                         diagnostics::debug(format!(
@@ -314,6 +297,18 @@ async fn run_sync(
                             .await
                             .context("Agent routing failed after synchronization")?;
                         publish_deliveries(&events, &queued);
+                        for room_id in &summary.departed_rooms {
+                            events.publish_ui(
+                                "membership.changed",
+                                serde_json::json!({ "roomId": room_id, "isMember": false }),
+                            );
+                        }
+                        for room_id in &summary.changed_rooms {
+                            events.publish_ui(
+                                "room.resync",
+                                serde_json::json!({ "roomId": room_id, "reason": "sync" }),
+                            );
+                        }
                         events.publish_ui(
                             "sync.progress",
                             serde_json::json!({

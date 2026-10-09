@@ -35,6 +35,10 @@ pub struct SyncSummary {
     pub backfilled_rooms: usize,
     /// Room phases that failed with sanitized metadata and will retry on reconnect.
     pub failed_rooms: usize,
+    /// Opaque room IDs whose committed history/metadata changed during this run.
+    pub changed_rooms: Vec<String>,
+    /// Opaque room IDs whose membership was committed as departed.
+    pub departed_rooms: Vec<String>,
 }
 
 fn activity(room: &Room) -> Result<DateTime<Utc>> {
@@ -108,15 +112,17 @@ pub async fn synchronize_once(
     // normal mode, retain history for departed rooms but exclude them from
     // active sync progress and retry counts. Never do this for a dev-room
     // scan, which deliberately filters the authoritative listing.
-    if dev_room.is_none() {
+    let departed_rooms = if dev_room.is_none() {
         let observed_room_ids = rooms
             .iter()
             .map(|room| room.id.clone())
             .collect::<HashSet<_>>();
-        let _ = mirror
-            .with(|db| db.mark_unobserved_rooms_left(&observed_room_ids))
-            .await?;
-    }
+        mirror
+            .with(|db| db.mark_unobserved_rooms_left_ids(&observed_room_ids))
+            .await?
+    } else {
+        Vec::new()
+    };
     let mut prioritized = rooms
         .into_iter()
         .map(|room| Ok((activity(&room)?, room)))
@@ -125,6 +131,7 @@ pub async fn synchronize_once(
     let rooms: Vec<Room> = prioritized.into_iter().map(|(_, room)| room).collect();
     let mut summary = SyncSummary {
         rooms: rooms.len(),
+        departed_rooms,
         ..SyncSummary::default()
     };
     // Stage 1: room metadata and the latest page before any deep backfill.
@@ -143,6 +150,9 @@ pub async fn synchronize_once(
                     summary.created += outcome.created;
                     summary.edited += outcome.edited;
                     summary.skipped += outcome.skipped;
+                    if outcome.created != 0 || outcome.edited != 0 {
+                        summary.changed_rooms.push(room.id.clone());
+                    }
                 }
                 Err(error) => {
                     mirror
@@ -168,10 +178,16 @@ pub async fn synchronize_once(
                     summary.created += outcome.created;
                     summary.edited += outcome.edited;
                     summary.gaps += usize::from(outcome.gap.is_some());
+                    if outcome.created != 0 || outcome.edited != 0 || outcome.gap.is_some() {
+                        summary.changed_rooms.push(room.id.clone());
+                    }
                     match live::reconcile_room(mirror, rest, &room.id).await {
                         Ok(checked) => {
                             summary.edited += checked.edited;
                             summary.deleted += checked.deleted;
+                            if checked.edited != 0 || checked.deleted != 0 {
+                                summary.changed_rooms.push(room.id.clone());
+                            }
                         }
                         Err(error) => {
                             mirror
@@ -213,6 +229,9 @@ pub async fn synchronize_once(
                     summary.edited += outcome.edited;
                     summary.skipped += outcome.skipped;
                     summary.backfilled_rooms += usize::from(outcome.done);
+                    if outcome.created != 0 || outcome.edited != 0 {
+                        summary.changed_rooms.push(room.id.clone());
+                    }
                 }
                 Err(error) => {
                     mirror
@@ -229,6 +248,8 @@ pub async fn synchronize_once(
         let retention_cutoff = (Utc::now() - catchup::max_age(retention)?).to_rfc3339();
         let _ = mirror.with(|db| db.prune_before(&retention_cutoff)).await?;
     }
+    summary.changed_rooms.sort();
+    summary.changed_rooms.dedup();
     Ok(summary)
 }
 
@@ -289,6 +310,8 @@ mod tests {
             .unwrap();
         assert_eq!(summary.rooms, 1);
         assert_eq!(summary.created, 1);
+        assert_eq!(summary.changed_rooms, vec![room_id.to_owned()]);
+        assert!(summary.departed_rooms.is_empty());
         assert!(!mirror.with(|db| db.has_room(other)).await.unwrap());
         assert_eq!(
             mirror
@@ -347,6 +370,7 @@ mod tests {
         assert_eq!(summary.rooms, 2);
         assert_eq!(summary.initial_rooms, 1);
         assert_eq!(summary.created, 1);
+        assert_eq!(summary.changed_rooms, vec![new_room.to_owned()]);
         assert!(
             mirror
                 .with(|db| db.room_sync(ready_room))
@@ -362,6 +386,35 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .initial_done
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_room_listing_reports_committed_departures() {
+        let server = MockServer::start().await;
+        let room_id =
+            "Y2lzY29zcGFyazovL3VzL1JPT00vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBhMDAx";
+        Mock::given(method("GET"))
+            .and(path("/v1/rooms"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"items": []})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rest =
+            WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
+        let mut db = Mirror::in_memory([80_u8; 32]).unwrap();
+        db.upsert_room(&room(room_id, "2026-10-08T12:00:00Z"), true)
+            .unwrap();
+        let mirror = SharedMirror::new(db);
+        let summary = synchronize_once(&mirror, &rest, &Config::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(summary.departed_rooms, vec![room_id.to_owned()]);
+        assert_eq!(
+            mirror.with(|db| db.is_member(room_id)).await.unwrap(),
+            Some(false)
         );
     }
 

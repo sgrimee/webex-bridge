@@ -356,6 +356,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn events_require_a_scoped_local_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(temp.path().join("bridge"));
+        let mirror = SharedMirror::new(Mirror::in_memory([90_u8; 32]).unwrap());
+        let (_connection_tx, connection_rx) = watch::channel(ConnectionStatus::Connected);
+        let server = start(&paths, ApiState::new(mirror, connection_rx))
+            .await
+            .unwrap();
+        let response = request(
+            &paths.socket,
+            "GET /v1/events HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".into(),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 401"));
+        assert!(response.contains("auth_required"));
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn agent_session_is_route_scoped_and_exclusive() {
         let temp = tempfile::tempdir().unwrap();
         let paths = Paths::under(temp.path().join("bridge"));

@@ -28,6 +28,10 @@ client = [
 # Requires a properly signed macOS app with Keychain access-group entitlement.
 # Unsigned CLI/daemon builds use the login Keychain instead.
 biometric-keychain = ["server", "dep:security-framework"]
+# Explicitly opt-in, foreground-only development interface. It is inert until
+# the daemon bootstrap supplies all independent guards; production defaults
+# remain Keychain-backed.
+dev-env-secrets = ["server"]
 
 [dependencies]
 # Neutral paths, DTOs and client error types.

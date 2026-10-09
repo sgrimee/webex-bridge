@@ -17,6 +17,10 @@ pub mod api;
 pub mod auth;
 #[cfg(feature = "server")]
 pub mod config;
+/// Feature-gated, injected-environment development-secret bootstrap guards.
+/// This module never reads this process environment by itself.
+#[cfg(feature = "dev-env-secrets")]
+pub mod dev_env_secrets;
 #[cfg(feature = "server")]
 pub mod diagnostics;
 #[cfg(feature = "server")]

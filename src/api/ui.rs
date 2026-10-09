@@ -173,6 +173,49 @@ async fn persisted_message(
     }
 }
 
+async fn me(
+    State(state): State<ApiState>,
+    Extension(peer): Extension<auth::PeerIdentity>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = ui_session(&state, peer, &headers) {
+        return *response;
+    }
+    let Some(rest) = state.rest() else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "webex_unavailable",
+            "Webex is not connected",
+        );
+    };
+    let person = match rest.me().await {
+        Ok(person) => person,
+        Err(_) => {
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                "webex_unavailable",
+                "Webex current-user lookup failed",
+            )
+        }
+    };
+    let person_id = person.id.clone();
+    match state
+        .mirror()
+        .with(|db| {
+            db.upsert_person(&person)?;
+            db.ui_person(&person_id)
+        })
+        .await
+    {
+        Ok(Some(person)) => Json(person).into_response(),
+        _ => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "bridge_unavailable",
+            "Mirror is temporarily unavailable",
+        ),
+    }
+}
+
 async fn rooms(
     State(state): State<ApiState>,
     Extension(peer): Extension<auth::PeerIdentity>,
@@ -308,27 +351,62 @@ async fn room_messages(
         );
     }
     let max = query.max.unwrap_or(50);
-    match state
+    let mut messages = match state
         .mirror()
         .with(|db| db.ui_room_messages(&room_id, query.before.as_deref(), max))
         .await
     {
-        Ok(messages) => Json(serde_json::json!({ "messages": messages })).into_response(),
+        Ok(messages) => messages,
         Err(error)
             if error.to_string().contains("cursor") || error.to_string().contains("page size") =>
         {
-            json_error(
+            return json_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
                 "Message pagination is invalid",
             )
         }
-        Err(_) => json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "bridge_unavailable",
-            "Mirror is temporarily unavailable",
-        ),
+        Err(_) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bridge_unavailable",
+                "Mirror is temporarily unavailable",
+            )
+        }
+    };
+    // A short local page after a cursor means the UI is approaching the edge
+    // of the initial/background mirror. Hydrate exactly one older page on
+    // demand, then serve it from the encrypted mirror. A Webex failure leaves
+    // the already available local page usable offline.
+    if messages.len() < max as usize {
+        if let (Some(before), Some(rest)) = (query.before.as_deref(), state.rest()) {
+            if let Ok(page) = rest.messages_page(&room_id, Some(before), max).await {
+                let page = page
+                    .into_iter()
+                    .filter(|message| message.room_id.as_deref() == Some(room_id.as_str()))
+                    .collect::<Vec<_>>();
+                if !page.is_empty()
+                    && state
+                        .mirror()
+                        .with(|db| {
+                            for message in &page {
+                                db.upsert_message(message)?;
+                            }
+                            db.ui_room_messages(&room_id, query.before.as_deref(), max)
+                        })
+                        .await
+                        .map(|hydrated| messages = hydrated)
+                        .is_ok()
+                {
+                    state.events().publish_ui(
+                        "sync.progress",
+                        serde_json::json!({ "roomId": room_id, "lazyHistory": true }),
+                    );
+                }
+            }
+        }
     }
+    Json(serde_json::json!({ "messages": messages })).into_response()
 }
 
 async fn create_message(
@@ -694,6 +772,7 @@ pub fn router() -> Router<ApiState> {
     Router::new()
         .route("/v1/ui/pair", post(pair))
         .route("/v1/ui/sessions", post(create_session))
+        .route("/v1/me", get(me))
         .route("/v1/rooms", get(rooms))
         .route("/v1/rooms/{room_id}", get(room))
         .route("/v1/rooms/{room_id}/membership", delete(leave_room))

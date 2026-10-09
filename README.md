@@ -25,7 +25,7 @@ Local testing:
 ```sh
 cargo run --bin webex-bridge -- login
 cargo run --bin webex-bridge -- status
-# Explicit local diagnostic: emits one JSON object per retryable failure.
+# Explicit local diagnostic: emits roomId, title, isMember and result as JSON.
 # It decrypts the room title for stdout only; daemon logs remain metadata-only.
 cargo run --bin webex-bridge -- sync failures
 cargo run --bin webex-bridge -- probe --room <approved-room-id>

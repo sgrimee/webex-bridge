@@ -119,6 +119,7 @@ pub struct MirrorStats {
 pub struct SyncFailure {
     pub room_id: String,
     pub title: Option<String>,
+    pub is_member: bool,
     pub result: String,
 }
 
@@ -192,29 +193,39 @@ impl Mirror {
     /// Read counts only; no encrypted free text is decrypted.
     pub fn stats(&self) -> Result<MirrorStats> {
         Ok(MirrorStats {
-            rooms: self
-                .conn
-                .query_row("SELECT count(*) FROM rooms", [], |row| row.get(0))?,
+            rooms: self.conn.query_row(
+                "SELECT count(*) FROM rooms WHERE is_member=1",
+                [],
+                |row| row.get(0),
+            )?,
             revisions: self
                 .conn
                 .query_row("SELECT count(*) FROM messages", [], |row| row.get(0))?,
             initial_done: self.conn.query_row(
-                "SELECT count(*) FROM room_sync WHERE initial_done=1",
+                "SELECT count(*) FROM room_sync AS sync
+                 JOIN rooms ON rooms.room_id=sync.room_id
+                 WHERE rooms.is_member=1 AND sync.initial_done=1",
                 [],
                 |row| row.get(0),
             )?,
             initial_pending: self.conn.query_row(
-                "SELECT count(*) FROM room_sync WHERE initial_done=0",
+                "SELECT count(*) FROM room_sync AS sync
+                 JOIN rooms ON rooms.room_id=sync.room_id
+                 WHERE rooms.is_member=1 AND sync.initial_done=0",
                 [],
                 |row| row.get(0),
             )?,
             gaps: self.conn.query_row(
-                "SELECT count(*) FROM room_sync WHERE last_result LIKE 'gap:%'",
+                "SELECT count(*) FROM room_sync AS sync
+                 JOIN rooms ON rooms.room_id=sync.room_id
+                 WHERE rooms.is_member=1 AND sync.last_result LIKE 'gap:%'",
                 [],
                 |row| row.get(0),
             )?,
             failures: self.conn.query_row(
-                "SELECT count(*) FROM room_sync WHERE last_result LIKE '%_error'",
+                "SELECT count(*) FROM room_sync AS sync
+                 JOIN rooms ON rooms.room_id=sync.room_id
+                 WHERE rooms.is_member=1 AND sync.last_result LIKE '%_error'",
                 [],
                 |row| row.get(0),
             )?,
@@ -225,7 +236,7 @@ impl Mirror {
     /// Room titles remain encrypted at rest and are never written to daemon logs.
     pub fn sync_failures(&self) -> Result<Vec<SyncFailure>> {
         let mut statement = self.conn.prepare(
-            "SELECT sync.room_id,rooms.title_ct,sync.last_result
+            "SELECT sync.room_id,rooms.title_ct,rooms.is_member,sync.last_result
              FROM room_sync AS sync
              LEFT JOIN rooms ON rooms.room_id=sync.room_id
              WHERE sync.last_result LIKE '%_error'
@@ -235,12 +246,13 @@ impl Mirror {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<Vec<u8>>>(1)?,
-                row.get::<_, String>(2)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })?;
         let mut failures = Vec::new();
         for row in rows {
-            let (room_id, encrypted_title, result) = row?;
+            let (room_id, encrypted_title, is_member, result) = row?;
             let title = encrypted_title
                 .map(|blob| {
                     self.crypto
@@ -253,6 +265,7 @@ impl Mirror {
             failures.push(SyncFailure {
                 room_id,
                 title,
+                is_member,
                 result,
             });
         }
@@ -308,6 +321,31 @@ impl Mirror {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Mark rooms absent from a complete REST room listing as no longer joined.
+    /// Call only after every pagination page was fetched successfully.
+    pub fn mark_unobserved_rooms_left(
+        &mut self,
+        observed_room_ids: &std::collections::HashSet<String>,
+    ) -> Result<usize> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT room_id FROM rooms WHERE is_member=1")?;
+        let current_members = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let mut left = 0;
+        for room_id in current_members {
+            if !observed_room_ids.contains(&room_id) {
+                left += self.conn.execute(
+                    "UPDATE rooms SET is_member=0,updated_at=?2 WHERE room_id=?1",
+                    params![room_id, Utc::now().to_rfc3339()],
+                )?;
+            }
+        }
+        Ok(left)
     }
 
     /// Mark membership only after a REST check, never from a Mercury `leave` verb alone.
@@ -953,6 +991,53 @@ mod tests {
             vec![SyncFailure {
                 room_id: "room-1".into(),
                 title: Some("Private failing room".into()),
+                is_member: true,
+                result: "initial_timeout_error".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn unobserved_rooms_leave_active_progress_but_keep_history() {
+        let mut mirror = Mirror::in_memory([21_u8; 32]).unwrap();
+        let room = Room {
+            id: "room-1".into(),
+            title: Some("Former room".into()),
+            room_type: "group".into(),
+            is_locked: false,
+            team_id: None,
+            last_activity: "2026-10-08T12:00:00Z".into(),
+            creator_id: "person-1".into(),
+            created: "2026-10-08T12:00:00Z".into(),
+        };
+        mirror.upsert_room(&room, true).unwrap();
+        mirror
+            .record_sync_failure(&room.id, "initial", "timeout")
+            .unwrap();
+        assert_eq!(
+            mirror
+                .mark_unobserved_rooms_left(&std::collections::HashSet::new())
+                .unwrap(),
+            1
+        );
+        assert_eq!(mirror.is_member(&room.id).unwrap(), Some(false));
+        assert_eq!(
+            mirror.stats().unwrap(),
+            MirrorStats {
+                rooms: 0,
+                revisions: 0,
+                initial_done: 0,
+                initial_pending: 0,
+                gaps: 0,
+                failures: 0,
+            }
+        );
+        assert_eq!(
+            mirror.sync_failures().unwrap(),
+            vec![SyncFailure {
+                room_id: room.id,
+                title: Some("Former room".into()),
+                is_member: false,
                 result: "initial_timeout_error".into(),
             }]
         );

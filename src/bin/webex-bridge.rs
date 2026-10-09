@@ -64,6 +64,7 @@ async fn main() -> Result<()> {
                     serde_json::json!({
                         "roomId": failure.room_id,
                         "title": failure.title,
+                        "isMember": failure.is_member,
                         "result": failure.result,
                     })
                 );

@@ -103,6 +103,19 @@ pub async fn synchronize_once(
     if dev_room.is_some() && rooms.len() != 1 {
         bail!("Dev test room missing or duplicated in authorized Webex rooms");
     }
+    // The REST listing is authoritative only after every page completed. In
+    // normal mode, retain history for departed rooms but exclude them from
+    // active sync progress and retry counts. Never do this for a dev-room
+    // scan, which deliberately filters the authoritative listing.
+    if dev_room.is_none() {
+        let observed_room_ids = rooms
+            .iter()
+            .map(|room| room.id.clone())
+            .collect::<HashSet<_>>();
+        let _ = mirror
+            .with(|db| db.mark_unobserved_rooms_left(&observed_room_ids))
+            .await?;
+    }
     let mut prioritized = rooms
         .into_iter()
         .map(|room| Ok((activity(&room)?, room)))

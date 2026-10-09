@@ -37,6 +37,9 @@ pub struct Draft {
     pub draft_id: String,
     pub sha256: String,
     pub preview: String,
+    /// Decrypted only for the local extension's approval dialog. It is never
+    /// returned from a model tool or exposed as a room-listing API.
+    pub room_title: Option<String>,
     pub approval_token: String,
     pub expires_at: String,
 }
@@ -169,6 +172,7 @@ impl Mirror {
             draft_id,
             sha256,
             preview: markdown.into(),
+            room_title: self.room_title(&route.room_id)?,
             approval_token,
             expires_at,
         })
@@ -379,7 +383,7 @@ mod tests {
         config::{DevConfig, Receive},
         mirror::Mirror,
     };
-    use webex::Message;
+    use webex::{Message, Room};
 
     fn config() -> Config {
         Config {
@@ -402,9 +406,25 @@ mod tests {
     fn draft_approval_binds_text_destination_and_is_single_use() {
         let config = config();
         let mut mirror = Mirror::in_memory([41; 32]).unwrap();
+        mirror
+            .upsert_room(
+                &Room {
+                    id: "room".into(),
+                    title: Some("Approved room".into()),
+                    room_type: "group".into(),
+                    is_locked: false,
+                    team_id: None,
+                    last_activity: "2026-10-08T12:00:00Z".into(),
+                    creator_id: "person".into(),
+                    created: "2026-10-08T12:00:00Z".into(),
+                },
+                true,
+            )
+            .unwrap();
         let body = "Hello humans\n\n— 🤖 sam/coder · ref abc";
         let draft = mirror.create_draft(&config, "r", None, body).unwrap();
         assert_eq!(draft.preview, body);
+        assert_eq!(draft.room_title.as_deref(), Some("Approved room"));
         assert!(mirror
             .approve_draft(
                 &config,

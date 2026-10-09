@@ -1,8 +1,8 @@
 //! Route-claiming session endpoints for local agent hosts.
 //!
 //! This module deliberately exposes no room or message content. An agent can
-//! obtain a short-lived token only for routes whose agent name and workspace
-//! exactly match the validated local configuration.
+//! obtain a short-lived token only for routes whose agent name and configured
+//! workspace contain the validated local client cwd.
 
 use super::{auth, ApiState};
 use axum::{
@@ -13,7 +13,10 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{
+    path::{Component, Path as FsPath},
+    time::Duration,
+};
 
 const LEASE_TTL: Duration = Duration::from_secs(60);
 
@@ -54,6 +57,20 @@ fn valid_identifier(value: &str, max: usize) -> bool {
         && value
             .chars()
             .all(|ch| ch.is_ascii_graphic() && !ch.is_ascii_control())
+}
+
+/// A route workspace owns its directory tree. Reject relative and parent-dir
+/// client paths so a lexical prefix cannot escape the configured workspace.
+fn workspace_matches(route_workspace: &str, cwd: &str) -> bool {
+    let valid_absolute = |path: &FsPath| {
+        path.is_absolute()
+            && path
+                .components()
+                .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
+    };
+    let workspace = FsPath::new(route_workspace);
+    let cwd = FsPath::new(cwd);
+    valid_absolute(workspace) && valid_absolute(cwd) && cwd.starts_with(workspace)
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -112,7 +129,10 @@ async fn create_session(
         .config()
         .routes
         .iter()
-        .filter(|route| route.agent_name == request.agent_name && route.workspace == request.cwd)
+        .filter(|route| {
+            route.agent_name == request.agent_name
+                && workspace_matches(&route.workspace, &request.cwd)
+        })
         .map(|route| route.id.clone())
         .collect::<Vec<_>>();
     if route_ids.is_empty() {
@@ -440,4 +460,22 @@ pub fn router() -> Router<ApiState> {
         .route("/v1/agent/outbox", post(create_draft))
         .route("/v1/agent/outbox/{draft_id}", get(outbox_status))
         .route("/v1/agent/outbox/{draft_id}/approve", post(approve_draft))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_claims_are_limited_to_the_configured_tree() {
+        assert!(workspace_matches("/work/project", "/work/project"));
+        assert!(workspace_matches("/work/project", "/work/project/webex-pi"));
+        assert!(!workspace_matches("/work/project", "/work/project-copy"));
+        assert!(!workspace_matches(
+            "/work/project",
+            "/work/project/../private"
+        ));
+        assert!(!workspace_matches("relative/project", "/work/project"));
+        assert!(!workspace_matches("/work/project", "relative/project"));
+    }
 }

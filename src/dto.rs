@@ -58,6 +58,16 @@ pub struct Person {
     pub emails: Option<Vec<String>>,
 }
 
+/// Result of a cache-miss-capable UI person point read. `state` is one of
+/// `mirrored`, `hydrated`, `not_found`, `offline`, or `unavailable`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersonRead {
+    pub id: String,
+    pub state: String,
+    pub person: Option<Person>,
+}
+
 /// Canonical message or deletion tombstone available to a paired UI only.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -71,6 +81,16 @@ pub struct Message {
     pub updated_at: Option<String>,
     pub status: String,
     pub markdown: Option<String>,
+}
+
+/// Result of a cache-miss-capable UI message point read. `state` is one of
+/// `mirrored`, `hydrated`, `deleted`, `not_found`, `offline`, or `unavailable`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageRead {
+    pub id: String,
+    pub state: String,
+    pub message: Option<Message>,
 }
 
 /// One reverse-chronological room-history page. `next_before` is an opaque
@@ -137,6 +157,28 @@ mod tests {
                 "isMember": true,
                 "isLocked": null,
             })
+        );
+    }
+
+    #[test]
+    fn point_read_wire_contract_distinguishes_offline_from_confirmed_missing() {
+        let person = PersonRead {
+            id: "person-1".into(),
+            state: "offline".into(),
+            person: None,
+        };
+        let message = MessageRead {
+            id: "message-1".into(),
+            state: "not_found".into(),
+            message: None,
+        };
+        assert_eq!(
+            serde_json::to_value(person).unwrap(),
+            serde_json::json!({"id": "person-1", "state": "offline", "person": null})
+        );
+        assert_eq!(
+            serde_json::to_value(message).unwrap(),
+            serde_json::json!({"id": "message-1", "state": "not_found", "message": null})
         );
     }
 

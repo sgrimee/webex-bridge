@@ -5,7 +5,8 @@ use hyper::Method;
 use serde::{Deserialize, Serialize};
 
 pub use crate::dto::{
-    Message, MessagePage, Person, Room, Status, SyncStatus, Team, ThreadChildren, ThreadParent,
+    Message, MessagePage, MessageRead, Person, PersonRead, Room, Status, SyncStatus, Team,
+    ThreadChildren, ThreadParent,
 };
 
 #[derive(Deserialize)]
@@ -252,6 +253,22 @@ impl UiClient {
         BridgeClient::json(response).await
     }
 
+    /// Read one message with bounded daemon-side cache-miss hydration. The
+    /// result explicitly distinguishes mirrored/hydrated content, tombstones,
+    /// confirmed misses, offline, and temporary remote unavailability.
+    pub async fn message_read(&self, message_id: &str) -> Result<MessageRead> {
+        let response = self
+            .bridge
+            .request(
+                Method::GET,
+                &format!("/v1/messages/{}/read", path_segment(message_id)),
+                Some(&self.token),
+                None,
+            )
+            .await?;
+        BridgeClient::json(response).await
+    }
+
     /// Read one canonical message or deletion tombstone.
     pub async fn message(&self, message_id: &str) -> Result<Message> {
         let response = self
@@ -259,6 +276,22 @@ impl UiClient {
             .request(
                 Method::GET,
                 &format!("/v1/messages/{}", path_segment(message_id)),
+                Some(&self.token),
+                None,
+            )
+            .await?;
+        BridgeClient::json(response).await
+    }
+
+    /// Read one person with bounded daemon-side cache-miss hydration. Offline
+    /// and remote failures return a typed placeholder so callers can keep an
+    /// ID/unknown-name view and allow an explicit retry.
+    pub async fn person_read(&self, person_id: &str) -> Result<PersonRead> {
+        let response = self
+            .bridge
+            .request(
+                Method::GET,
+                &format!("/v1/people/{}/read", path_segment(person_id)),
                 Some(&self.token),
                 None,
             )
@@ -433,6 +466,8 @@ mod server_tests {
                     ..webex::Message::default()
                 })?;
                 db.mark_deleted("room-1", "deleted-parent")?;
+                db.cache_ui_not_found("person", "confirmed-missing-person")?;
+                db.cache_ui_not_found("message", "confirmed-missing-message")?;
                 for (id, parent_id, created) in [
                     ("orphan-reply", "missing-parent", "2026-10-08T12:01:00Z"),
                     (
@@ -546,6 +581,110 @@ mod server_tests {
             }
         );
         drop(stream);
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn point_reads_hydrate_once_then_serve_the_encrypted_mirror() {
+        let person_id =
+            "Y2lzY29zcGFyazovL3VzL1BFT1BMRS8wMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMGIwMDE";
+        let message_id =
+            "Y2lzY29zcGFyazovL3VzL01FU1NBR0UvMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBjMDAz";
+        let room_id =
+            "Y2lzY29zcGFyazovL3VzL1JPT00vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBhMDAx";
+        let remote = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/people/{person_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": person_id,
+                "displayName": "Hydrated person",
+                "emails": ["person@example.test"]
+            })))
+            .expect(1)
+            .mount(&remote)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/messages/{message_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": message_id,
+                "roomId": room_id,
+                "created": "2026-10-08T12:00:00Z",
+                "text": "private hydrated message"
+            })))
+            .expect(1)
+            .mount(&remote)
+            .await;
+        let rest = Arc::new(
+            crate::sync::history::WebexRest::for_tests(
+                reqwest::Url::parse(&format!("{}/v1/", remote.uri())).unwrap(),
+            )
+            .unwrap(),
+        );
+        let (_temp, server, bridge) = hydrated_rest_server(rest).await;
+        let ui = bridge
+            .create_ui_session("a-local-ui-secret-that-is-long-enough")
+            .await
+            .unwrap();
+        let person = ui.person_read(person_id).await.unwrap();
+        assert_eq!(person.state, "hydrated");
+        assert_eq!(
+            person.person.unwrap().display_name.as_deref(),
+            Some("Hydrated person")
+        );
+        let message = ui.message_read(message_id).await.unwrap();
+        assert_eq!(message.state, "hydrated");
+        assert_eq!(message.message.unwrap().room_id, room_id);
+        assert_eq!(ui.person_read(person_id).await.unwrap().state, "mirrored");
+        assert_eq!(ui.message_read(message_id).await.unwrap().state, "mirrored");
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn point_reads_keep_confirmed_not_found_distinct_from_unavailable() {
+        let person_id =
+            "Y2lzY29zcGFyazovL3VzL1BFT1BMRS8wMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMGIwMDE";
+        let message_id =
+            "Y2lzY29zcGFyazovL3VzL01FU1NBR0UvMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBjMDAz";
+        let unavailable_message_id =
+            "Y2lzY29zcGFyazovL3VzL01FU1NBR0UvMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBjMDA0";
+        let remote = MockServer::start().await;
+        for path_value in [
+            format!("/v1/people/{person_id}"),
+            format!("/v1/messages/{message_id}"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(path_value))
+                .respond_with(ResponseTemplate::new(404))
+                .expect(1)
+                .mount(&remote)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/messages/{unavailable_message_id}")))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&remote)
+            .await;
+        let rest = Arc::new(
+            crate::sync::history::WebexRest::for_tests(
+                reqwest::Url::parse(&format!("{}/v1/", remote.uri())).unwrap(),
+            )
+            .unwrap(),
+        );
+        let (_temp, server, bridge) = hydrated_rest_server(rest).await;
+        let ui = bridge
+            .create_ui_session("a-local-ui-secret-that-is-long-enough")
+            .await
+            .unwrap();
+        assert_eq!(ui.person_read(person_id).await.unwrap().state, "not_found");
+        assert_eq!(
+            ui.message_read(message_id).await.unwrap().state,
+            "not_found"
+        );
+        assert_eq!(
+            ui.message_read(unavailable_message_id).await.unwrap().state,
+            "unavailable"
+        );
         server.shutdown().await.unwrap();
     }
 
@@ -690,6 +829,32 @@ mod server_tests {
         assert_eq!(deleted.children[0].id, "deleted-parent-reply");
         assert!(!deleted.complete);
         assert_eq!(deleted.partial_reason.as_deref(), Some("offline"));
+        assert_eq!(
+            ui.message_read("deleted-parent").await.unwrap().state,
+            "deleted"
+        );
+        assert_eq!(
+            ui.message_read("confirmed-missing-message")
+                .await
+                .unwrap()
+                .state,
+            "not_found"
+        );
+        assert_eq!(
+            ui.message_read("unseen-message").await.unwrap().state,
+            "offline"
+        );
+        assert_eq!(
+            ui.person_read("confirmed-missing-person")
+                .await
+                .unwrap()
+                .state,
+            "not_found"
+        );
+        assert_eq!(
+            ui.person_read("unseen-person").await.unwrap().state,
+            "offline"
+        );
         server.shutdown().await.unwrap();
     }
 
@@ -808,6 +973,8 @@ mod server_tests {
             "/v1/me",
             "/v1/teams/team-1",
             "/v1/messages/missing-parent/children",
+            "/v1/messages/missing-parent/read",
+            "/v1/people/missing-person/read",
         ] {
             let response = bridge
                 .request(Method::GET, path, Some(&token), None)

@@ -619,6 +619,7 @@ impl Mirror {
              updated_at=excluded.updated_at",
             params![person.id, name_ct, emails_ct, Utc::now().to_rfc3339()],
         )?;
+        self.clear_ui_not_found("person", &person.id)?;
         Ok(())
     }
 
@@ -830,6 +831,10 @@ impl Mirror {
             params![room_id,id,revision,message.parent_id,message.person_id,created_at,
                 message.updated,body_ct,body_nonce,files_ct],
         )?;
+        tx.execute(
+            "DELETE FROM ui_lookup WHERE resource='message' AND resource_id=?1",
+            [id],
+        )?;
         tx.commit()?;
         Ok(if revision == 0 {
             Upsert::Created(0)
@@ -862,6 +867,45 @@ impl Mirror {
             Some((_, status, _, _)) if status == "deleted" => Ok(None),
             _ => bail!("Mirror body ciphertext/nonce mismatch"),
         }
+    }
+
+    /// Record a Webex-confirmed negative UI point lookup. This never records
+    /// transport/offline failures, so callers can safely retry those later.
+    pub fn cache_ui_not_found(&mut self, resource: &str, resource_id: &str) -> Result<()> {
+        if !matches!(resource, "person" | "message") || resource_id.is_empty() {
+            bail!("Invalid UI lookup resource");
+        }
+        self.conn.execute(
+            "INSERT INTO ui_lookup(resource,resource_id,state,checked_at) VALUES (?1,?2,'not_found',?3)
+             ON CONFLICT(resource,resource_id) DO UPDATE SET state='not_found',checked_at=excluded.checked_at",
+            params![resource, resource_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Whether an earlier online point read confirmed this opaque resource ID
+    /// does not exist. Online reads intentionally retry instead of trusting it.
+    pub fn ui_not_found(&self, resource: &str, resource_id: &str) -> Result<bool> {
+        if !matches!(resource, "person" | "message") || resource_id.is_empty() {
+            bail!("Invalid UI lookup resource");
+        }
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM ui_lookup WHERE resource=?1 AND resource_id=?2 AND state='not_found'",
+                params![resource, resource_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    fn clear_ui_not_found(&mut self, resource: &str, resource_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM ui_lookup WHERE resource=?1 AND resource_id=?2",
+            params![resource, resource_id],
+        )?;
+        Ok(())
     }
 
     /// Get one canonical message (including a tombstone) for an authorized UI session.
@@ -1090,6 +1134,10 @@ impl Mirror {
             params![room_id,message_id,new_revision,parent,sender,created,Utc::now().to_rfc3339()])?;
         tx.execute(
             "UPDATE deliveries SET state='deleted' WHERE message_id=?1",
+            [message_id],
+        )?;
+        tx.execute(
+            "DELETE FROM ui_lookup WHERE resource='message' AND resource_id=?1",
             [message_id],
         )?;
         tx.commit()?;
@@ -1674,6 +1722,39 @@ mod tests {
         assert!(mirror
             .ui_room_messages("room-1", Some("missing"), 2)
             .is_err());
+    }
+
+    #[test]
+    fn confirmed_not_found_cache_clears_on_hydrate_but_tombstones_stay_final() {
+        let mut mirror = Mirror::in_memory([18_u8; 32]).unwrap();
+        mirror.cache_ui_not_found("person", "person-1").unwrap();
+        mirror.cache_ui_not_found("message", "message-1").unwrap();
+        assert!(mirror.ui_not_found("person", "person-1").unwrap());
+        assert!(mirror.ui_not_found("message", "message-1").unwrap());
+        mirror
+            .upsert_person(&Person {
+                id: "person-1".into(),
+                display_name: "Hydrated person".into(),
+                emails: Vec::new(),
+                ..Person::default()
+            })
+            .unwrap();
+        mirror
+            .upsert_message(&message("message-1", "body", None))
+            .unwrap();
+        assert!(!mirror.ui_not_found("person", "person-1").unwrap());
+        assert!(!mirror.ui_not_found("message", "message-1").unwrap());
+        assert!(mirror.mark_deleted("room-1", "message-1").unwrap());
+        assert_eq!(
+            mirror
+                .upsert_message(&message("message-1", "stale body", None))
+                .unwrap(),
+            Upsert::IgnoredDeleted
+        );
+        assert_eq!(
+            mirror.ui_message("message-1").unwrap().unwrap().status,
+            "deleted"
+        );
     }
 
     #[test]

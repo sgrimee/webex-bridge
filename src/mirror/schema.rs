@@ -116,3 +116,17 @@ CREATE TABLE IF NOT EXISTS teams (
 );
 PRAGMA user_version=4;
 "#;
+
+// Confirmed negative UI lookups contain only opaque resource IDs. They are
+// consulted offline, but an online point read always retries Webex so a stale
+// negative result cannot permanently suppress an explicit user retry.
+pub(crate) const SCHEMA_V5: &str = r#"
+CREATE TABLE ui_lookup (
+    resource TEXT NOT NULL CHECK (resource IN ('person','message')),
+    resource_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state='not_found'),
+    checked_at TEXT NOT NULL,
+    PRIMARY KEY(resource, resource_id)
+);
+PRAGMA user_version=5;
+"#;

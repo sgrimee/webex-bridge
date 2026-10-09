@@ -125,6 +125,18 @@ fn person_dto(person: crate::mirror::UiPerson) -> dto::Person {
     }
 }
 
+fn person_read_dto(
+    id: &str,
+    state: &str,
+    person: Option<crate::mirror::UiPerson>,
+) -> dto::PersonRead {
+    dto::PersonRead {
+        id: id.into(),
+        state: state.into(),
+        person: person.map(person_dto),
+    }
+}
+
 fn message_dto(message: crate::mirror::UiMessage) -> dto::Message {
     dto::Message {
         id: message.id,
@@ -136,6 +148,18 @@ fn message_dto(message: crate::mirror::UiMessage) -> dto::Message {
         updated_at: message.updated_at,
         status: message.status,
         markdown: message.markdown,
+    }
+}
+
+fn message_read_dto(
+    id: &str,
+    state: &str,
+    message: Option<crate::mirror::UiMessage>,
+) -> dto::MessageRead {
+    dto::MessageRead {
+        id: id.into(),
+        state: state.into(),
+        message: message.map(message_dto),
     }
 }
 
@@ -990,6 +1014,183 @@ async fn thread_children(
     .into_response()
 }
 
+async fn message_read(
+    State(state): State<ApiState>,
+    Extension(peer): Extension<auth::PeerIdentity>,
+    Path(message_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = ui_session(&state, peer, &headers) {
+        return *response;
+    }
+    if !valid_resource_id(&message_id) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Message ID is invalid",
+        );
+    }
+    let cached = match state.mirror().with(|db| db.ui_message(&message_id)).await {
+        Ok(message) => message,
+        Err(_) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bridge_unavailable",
+                "Mirror is temporarily unavailable",
+            )
+        }
+    };
+    if let Some(message) = cached {
+        let state = if message.status == "deleted" {
+            "deleted"
+        } else {
+            "mirrored"
+        };
+        return Json(message_read_dto(&message_id, state, Some(message))).into_response();
+    }
+    let Some(rest) = state.rest() else {
+        return match state
+            .mirror()
+            .with(|db| db.ui_not_found("message", &message_id))
+            .await
+        {
+            Ok(confirmed_missing) => {
+                let state = if confirmed_missing {
+                    "not_found"
+                } else {
+                    "offline"
+                };
+                Json(message_read_dto(&message_id, state, None)).into_response()
+            }
+            Err(_) => json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bridge_unavailable",
+                "Mirror is temporarily unavailable",
+            ),
+        };
+    };
+    match rest.message(&message_id).await {
+        Ok(Some(message)) if message.id.as_deref() == Some(message_id.as_str()) => match state
+            .mirror()
+            .with(|db| {
+                db.upsert_message(&message)?;
+                db.ui_message(&message_id)
+            })
+            .await
+        {
+            Ok(Some(message)) => {
+                Json(message_read_dto(&message_id, "hydrated", Some(message))).into_response()
+            }
+            _ => json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bridge_unavailable",
+                "Mirror is temporarily unavailable",
+            ),
+        },
+        Ok(None) => match state
+            .mirror()
+            .with(|db| db.cache_ui_not_found("message", &message_id))
+            .await
+        {
+            Ok(()) => Json(message_read_dto(&message_id, "not_found", None)).into_response(),
+            Err(_) => json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bridge_unavailable",
+                "Mirror is temporarily unavailable",
+            ),
+        },
+        Ok(Some(_)) | Err(_) => {
+            Json(message_read_dto(&message_id, "unavailable", None)).into_response()
+        }
+    }
+}
+
+async fn person_read(
+    State(state): State<ApiState>,
+    Extension(peer): Extension<auth::PeerIdentity>,
+    Path(person_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = ui_session(&state, peer, &headers) {
+        return *response;
+    }
+    if !valid_resource_id(&person_id) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Person ID is invalid",
+        );
+    }
+    let cached = match state.mirror().with(|db| db.ui_person(&person_id)).await {
+        Ok(person) => person,
+        Err(_) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bridge_unavailable",
+                "Mirror is temporarily unavailable",
+            )
+        }
+    };
+    if let Some(person) = cached {
+        return Json(person_read_dto(&person_id, "mirrored", Some(person))).into_response();
+    }
+    let Some(rest) = state.rest() else {
+        return match state
+            .mirror()
+            .with(|db| db.ui_not_found("person", &person_id))
+            .await
+        {
+            Ok(confirmed_missing) => {
+                let state = if confirmed_missing {
+                    "not_found"
+                } else {
+                    "offline"
+                };
+                Json(person_read_dto(&person_id, state, None)).into_response()
+            }
+            Err(_) => json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bridge_unavailable",
+                "Mirror is temporarily unavailable",
+            ),
+        };
+    };
+    match rest.person(&person_id).await {
+        Ok(Some(person)) if person.id == person_id => match state
+            .mirror()
+            .with(|db| {
+                db.upsert_person(&person)?;
+                db.ui_person(&person_id)
+            })
+            .await
+        {
+            Ok(Some(person)) => {
+                Json(person_read_dto(&person_id, "hydrated", Some(person))).into_response()
+            }
+            _ => json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bridge_unavailable",
+                "Mirror is temporarily unavailable",
+            ),
+        },
+        Ok(None) => match state
+            .mirror()
+            .with(|db| db.cache_ui_not_found("person", &person_id))
+            .await
+        {
+            Ok(()) => Json(person_read_dto(&person_id, "not_found", None)).into_response(),
+            Err(_) => json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bridge_unavailable",
+                "Mirror is temporarily unavailable",
+            ),
+        },
+        Ok(Some(_)) | Err(_) => {
+            Json(person_read_dto(&person_id, "unavailable", None)).into_response()
+        }
+    }
+}
+
 async fn message(
     State(state): State<ApiState>,
     Extension(peer): Extension<auth::PeerIdentity>,
@@ -1157,9 +1358,11 @@ pub fn router() -> Router<ApiState> {
         .route("/v1/messages", post(create_message))
         .route("/v1/messages/{message_id}/thread", get(thread_parent))
         .route("/v1/messages/{message_id}/children", get(thread_children))
+        .route("/v1/messages/{message_id}/read", get(message_read))
         .route(
             "/v1/messages/{message_id}",
             get(message).put(edit_message).delete(delete_message),
         )
+        .route("/v1/people/{person_id}/read", get(person_read))
         .route("/v1/people/{person_id}", get(person))
 }

@@ -8,43 +8,60 @@ description = "Local Webex mirror and scoped agent channel"
 
 [features]
 default = ["server"]
-server = []
-client = ["dep:http-body-util", "dep:hyperlocal", "hyper-util/client-legacy"]
+# The daemon, encrypted mirror, Webex/OAuth transport and local API server.
+server = [
+    "dep:axum", "dep:base64", "dep:chacha20poly1305", "dep:chrono",
+    "dep:fs2", "dep:gethostname", "dep:hyper", "dep:hyper-util",
+    "dep:keyring", "dep:oauth2", "dep:rand", "dep:reqwest", "dep:rpassword",
+    "dep:rusqlite", "dep:sha2", "dep:tokio", "dep:tokio-stream", "dep:toml",
+    "dep:tower", "dep:tokio-tungstenite", "dep:webbrowser", "dep:webex",
+    "dep:zeroize", "hyper/http1", "hyper/server", "hyper-util/server-auto",
+    "hyper-util/tokio", "tokio/macros", "tokio/rt-multi-thread", "tokio/net",
+    "tokio/io-util", "tokio/time", "tokio/signal", "tokio/sync", "tokio-stream/sync",
+]
+# Typed HTTP-over-UDS API client. It deliberately has no Webex or daemon stack.
+client = [
+    "dep:http-body-util", "dep:hyper", "dep:hyper-util", "dep:hyperlocal",
+    "dep:tokio-stream", "hyper/http1", "hyper-util/client-legacy",
+    "hyper-util/http1", "hyper-util/tokio", "hyperlocal/client",
+]
 # Requires a properly signed macOS app with Keychain access-group entitlement.
 # Unsigned CLI/daemon builds use the login Keychain instead.
-biometric-keychain = ["dep:security-framework"]
+biometric-keychain = ["server", "dep:security-framework"]
 
 [dependencies]
+# Neutral paths, DTOs and client error types.
 anyhow = "1"
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
-base64 = "0.22"
-chacha20poly1305 = "0.10"
-chrono = "0.4"
 dirs = "6"
-fs2 = "0.4"
-gethostname = "1"
-hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
-http-body-util = { version = "0.1", optional = true }
-hyperlocal = { version = "0.9", optional = true }
-keyring = { version = "3.6.3", features = ["apple-native"] }
 libc = "0.2"
-oauth2 = { version = "5", default-features = false, features = ["reqwest", "rustls-tls"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-rand = "0.8"
-rpassword = "7"
-rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "signal", "sync"] }
-toml = "0.8"
-tower = { version = "0.5", features = ["util"] }
-tokio-tungstenite = "0.28"
-tokio-stream = { version = "0.1", features = ["sync"] }
-webbrowser = "1"
-webex = { path = "../webex-rust" }
-zeroize = "1.8"
+
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"], optional = true }
+base64 = { version = "0.22", optional = true }
+chacha20poly1305 = { version = "0.10", optional = true }
+chrono = { version = "0.4", optional = true }
+fs2 = { version = "0.4", optional = true }
+gethostname = { version = "1", optional = true }
+hyper = { version = "1", default-features = false, optional = true }
+hyper-util = { version = "0.1", default-features = false, optional = true }
+http-body-util = { version = "0.1", optional = true }
+hyperlocal = { version = "0.9", default-features = false, optional = true }
+keyring = { version = "3.6.3", features = ["apple-native"], optional = true }
+oauth2 = { version = "5", default-features = false, features = ["reqwest", "rustls-tls"], optional = true }
+rand = { version = "0.8", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
+rpassword = { version = "7", optional = true }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+sha2 = { version = "0.10", optional = true }
+tokio = { version = "1", default-features = false, optional = true }
+tokio-stream = { version = "0.1", default-features = false, optional = true }
+toml = { version = "0.8", optional = true }
+tower = { version = "0.5", features = ["util"], optional = true }
+tokio-tungstenite = { version = "0.28", optional = true }
+webbrowser = { version = "1", optional = true }
+webex = { path = "../webex-rust", optional = true }
+zeroize = { version = "1.8", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Optional data-protection Keychain API for future entitled, signed builds.

@@ -163,3 +163,17 @@ impl Stream for EventStream {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resync_event_is_detectable_without_the_daemon_feature() {
+        let event = BridgeEvent {
+            name: RESYNC_REQUIRED_EVENT.into(),
+            data: serde_json::json!({"reason": "event_lag"}),
+        };
+        assert!(event.requires_resync());
+    }
+}

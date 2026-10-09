@@ -5,7 +5,7 @@
 //! native dialog; only that scope can decrypt and read full-mirror content.
 
 use super::{auth, ApiState};
-use crate::dialog;
+use crate::{dialog, dto};
 use axum::{
     extract::{Extension, Path, Query, State},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
@@ -98,6 +98,39 @@ fn valid_resource_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 1024 && !value.chars().any(char::is_control)
 }
 
+fn room_dto(room: crate::mirror::UiRoom) -> dto::Room {
+    dto::Room {
+        id: room.id,
+        title: room.title,
+        room_type: room.room_type,
+        team_id: room.team_id,
+        last_activity: room.last_activity,
+        is_member: room.is_member,
+    }
+}
+
+fn person_dto(person: crate::mirror::UiPerson) -> dto::Person {
+    dto::Person {
+        id: person.id,
+        display_name: person.display_name,
+        emails: person.emails,
+    }
+}
+
+fn message_dto(message: crate::mirror::UiMessage) -> dto::Message {
+    dto::Message {
+        id: message.id,
+        room_id: message.room_id,
+        revision: message.revision,
+        parent_id: message.parent_id,
+        sender_id: message.sender_id,
+        created_at: message.created_at,
+        updated_at: message.updated_at,
+        status: message.status,
+        markdown: message.markdown,
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RoomMessagesQuery {
@@ -163,7 +196,7 @@ async fn persisted_message(
                     "revision": stored.revision,
                 }),
             );
-            Json(stored).into_response()
+            Json(message_dto(stored)).into_response()
         }
         _ => json_error(
             StatusCode::ACCEPTED,
@@ -207,7 +240,7 @@ async fn me(
         })
         .await
     {
-        Ok(Some(person)) => Json(person).into_response(),
+        Ok(Some(person)) => Json(person_dto(person)).into_response(),
         _ => json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "bridge_unavailable",
@@ -225,7 +258,10 @@ async fn rooms(
         return *response;
     }
     match state.mirror().with(|db| db.ui_rooms()).await {
-        Ok(rooms) => Json(serde_json::json!({ "rooms": rooms })).into_response(),
+        Ok(rooms) => Json(
+            serde_json::json!({ "rooms": rooms.into_iter().map(room_dto).collect::<Vec<_>>() }),
+        )
+        .into_response(),
         Err(_) => json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "bridge_unavailable",
@@ -251,7 +287,7 @@ async fn room(
         );
     }
     match state.mirror().with(|db| db.ui_room(&room_id)).await {
-        Ok(Some(room)) => Json(room).into_response(),
+        Ok(Some(room)) => Json(room_dto(room)).into_response(),
         Ok(None) => json_error(StatusCode::NOT_FOUND, "not_found", "Room was not found"),
         Err(_) => json_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -406,7 +442,7 @@ async fn room_messages(
             }
         }
     }
-    Json(serde_json::json!({ "messages": messages })).into_response()
+    Json(serde_json::json!({ "messages": messages.into_iter().map(message_dto).collect::<Vec<_>>() })).into_response()
 }
 
 async fn create_message(
@@ -631,7 +667,7 @@ async fn message(
         );
     }
     match state.mirror().with(|db| db.ui_message(&message_id)).await {
-        Ok(Some(message)) => Json(message).into_response(),
+        Ok(Some(message)) => Json(message_dto(message)).into_response(),
         Ok(None) => json_error(StatusCode::NOT_FOUND, "not_found", "Message was not found"),
         Err(_) => json_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -658,7 +694,7 @@ async fn person(
         );
     }
     match state.mirror().with(|db| db.ui_person(&person_id)).await {
-        Ok(Some(person)) => Json(person).into_response(),
+        Ok(Some(person)) => Json(person_dto(person)).into_response(),
         Ok(None) => json_error(StatusCode::NOT_FOUND, "not_found", "Person was not found"),
         Err(_) => json_error(
             StatusCode::SERVICE_UNAVAILABLE,

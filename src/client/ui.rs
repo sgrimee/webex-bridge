@@ -4,62 +4,7 @@ use super::{events::EventStream, path_segment, BridgeClient, Result};
 use hyper::Method;
 use serde::{Deserialize, Serialize};
 
-/// Metadata-only daemon health response, available before UI pairing.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct Status {
-    pub api_version: u32,
-    pub connection: String,
-    pub sync: SyncStatus,
-}
-
-/// Mirror progress included in [`Status`].
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct SyncStatus {
-    pub rooms: i64,
-    pub revisions: i64,
-    pub initial_done: i64,
-    pub initial_pending: i64,
-    pub gaps: i64,
-    pub failures: i64,
-}
-
-/// Full room metadata available to a paired UI only.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct Room {
-    pub id: String,
-    pub title: Option<String>,
-    pub room_type: String,
-    pub team_id: Option<String>,
-    pub last_activity: Option<String>,
-    pub is_member: bool,
-}
-
-/// Full person metadata available to a paired UI only.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct Person {
-    pub id: String,
-    pub display_name: Option<String>,
-    pub emails: Option<Vec<String>>,
-}
-
-/// Canonical message or deletion tombstone available to a paired UI only.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct Message {
-    pub id: String,
-    pub room_id: String,
-    pub revision: i64,
-    pub parent_id: Option<String>,
-    pub sender_id: Option<String>,
-    pub created_at: Option<String>,
-    pub updated_at: Option<String>,
-    pub status: String,
-    pub markdown: Option<String>,
-}
+pub use crate::dto::{Message, Person, Room, Status, SyncStatus};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -325,6 +270,16 @@ impl UiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_segments_do_not_interpret_remote_ids_as_paths_or_queries() {
+        assert_eq!(path_segment("room/id?x=1"), "room%2Fid%3Fx%3D1");
+    }
+}
+
+#[cfg(all(test, feature = "server"))]
+mod server_tests {
+    use super::*;
     use crate::{
         api::{self, events::EventBus, ApiState, ConnectionStatus},
         mirror::{Mirror, SharedMirror},
@@ -335,11 +290,6 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::watch;
     use tokio_stream::StreamExt;
-
-    #[test]
-    fn path_segments_do_not_interpret_remote_ids_as_paths_or_queries() {
-        assert_eq!(path_segment("room/id?x=1"), "room%2Fid%3Fx%3D1");
-    }
 
     async fn paired_server() -> (tempfile::TempDir, api::ApiServer, BridgeClient, EventBus) {
         let temp = tempfile::tempdir().unwrap();

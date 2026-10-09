@@ -42,6 +42,28 @@ fn activity(room: &Room) -> Result<DateTime<Utc>> {
         .with_timezone(&Utc))
 }
 
+/// Persist only a small, non-sensitive failure category; never response text.
+fn failure_kind(error: &anyhow::Error) -> &'static str {
+    let detail = error.to_string();
+    if detail.contains("auth_required") {
+        "auth"
+    } else if detail.contains("HTTP 429") {
+        "rate_limited"
+    } else if detail.contains("HTTP 5") {
+        "server"
+    } else if detail.contains("404") {
+        "not_found"
+    } else if detail.contains("timed out") || detail.contains("timeout") {
+        "timeout"
+    } else if detail.contains("pagination") {
+        "pagination"
+    } else if detail.contains("timestamp") {
+        "timestamp"
+    } else {
+        "other"
+    }
+}
+
 /// Start after Mercury is connected, prioritize recent rooms, then backfill.
 /// Pass `dev_room` only with a configured development allowlist for limited tests.
 /// A reconnect cancels this run and starts a fresh one with a new token.
@@ -108,9 +130,11 @@ pub async fn synchronize_once(
                     summary.edited += outcome.edited;
                     summary.skipped += outcome.skipped;
                 }
-                Err(_) => {
+                Err(error) => {
                     mirror
-                        .with(|db| db.record_sync_failure(&room.id, "initial"))
+                        .with(|db| {
+                            db.record_sync_failure(&room.id, "initial", failure_kind(&error))
+                        })
                         .await?;
                     summary.failed_rooms += 1;
                 }
@@ -135,17 +159,25 @@ pub async fn synchronize_once(
                             summary.edited += checked.edited;
                             summary.deleted += checked.deleted;
                         }
-                        Err(_) => {
+                        Err(error) => {
                             mirror
-                                .with(|db| db.record_sync_failure(&room.id, "reconcile"))
+                                .with(|db| {
+                                    db.record_sync_failure(
+                                        &room.id,
+                                        "reconcile",
+                                        failure_kind(&error),
+                                    )
+                                })
                                 .await?;
                             summary.failed_rooms += 1;
                         }
                     }
                 }
-                Err(_) => {
+                Err(error) => {
                     mirror
-                        .with(|db| db.record_sync_failure(&room.id, "catchup"))
+                        .with(|db| {
+                            db.record_sync_failure(&room.id, "catchup", failure_kind(&error))
+                        })
                         .await?;
                     summary.failed_rooms += 1;
                 }
@@ -168,9 +200,11 @@ pub async fn synchronize_once(
                     summary.skipped += outcome.skipped;
                     summary.backfilled_rooms += usize::from(outcome.done);
                 }
-                Err(_) => {
+                Err(error) => {
                     mirror
-                        .with(|db| db.record_sync_failure(&room.id, "backfill"))
+                        .with(|db| {
+                            db.record_sync_failure(&room.id, "backfill", failure_kind(&error))
+                        })
                         .await?;
                     summary.failed_rooms += 1;
                 }
@@ -366,7 +400,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!failed.initial_done);
-        assert_eq!(failed.last_result.as_deref(), Some("initial_error"));
+        assert_eq!(failed.last_result.as_deref(), Some("initial_server_error"));
         assert!(
             mirror
                 .with(|db| db.room_sync(succeeding_room))

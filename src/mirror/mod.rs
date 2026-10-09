@@ -626,13 +626,30 @@ impl Mirror {
     }
 
     /// Record a sanitized sync phase failure for status/retry; no remote response content.
-    pub fn record_sync_failure(&mut self, room_id: &str, phase: &str) -> Result<()> {
+    pub fn record_sync_failure(&mut self, room_id: &str, phase: &str, kind: &str) -> Result<()> {
         if !matches!(phase, "initial" | "catchup" | "backfill" | "reconcile") {
             bail!("Unknown sync failure phase");
         }
+        if !matches!(
+            kind,
+            "auth"
+                | "rate_limited"
+                | "server"
+                | "not_found"
+                | "timeout"
+                | "pagination"
+                | "timestamp"
+                | "other"
+        ) {
+            bail!("Unknown sync failure kind");
+        }
         if self.conn.execute(
             "UPDATE room_sync SET last_result=?2,last_catchup_at=?3 WHERE room_id=?1",
-            params![room_id, format!("{phase}_error"), Utc::now().to_rfc3339()],
+            params![
+                room_id,
+                format!("{phase}_{kind}_error"),
+                Utc::now().to_rfc3339()
+            ],
         )? != 1
         {
             bail!("Cannot record failure for unknown room");

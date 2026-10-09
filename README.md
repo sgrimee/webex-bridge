@@ -8,16 +8,20 @@ lookup, a metadata-only Mercury probe, explicit development-only forced
 refresh, and mirror progress status. `webex-bridged` owns the Mercury
 connection and maintains the encrypted SQLite mirror; `--dev-room` restricts
 validation to an allowlisted room, while normal mode mirrors all rooms. The
-daemon also exposes a same-user, 0600 HTTP-over-UDS status endpoint at
-`run/bridge.sock` (`GET /v1/status`), containing only API, connection and
-mirror-progress metadata. Agent hosts can create an exclusive, process-bound
-60-second route lease and use the scoped inbox API: listing is metadata-only,
-and remote text is released only by an explicit local accept action. Agent
-sends are encrypted, route-bound drafts; a one-time approval binds the exact
-text and destination, then makes one non-retrying Webex request. UI pairing
-uses a native macOS confirmation showing the kernel-resolved executable path,
-then creates an in-memory UI session. SSE, actual UI endpoints and service
-installation remain unimplemented, so do not run the daemon as a service yet.
+daemon exposes a same-user, 0600 HTTP-over-UDS API at `run/bridge.sock`.
+`GET /v1/status` is metadata-only; a paired `ui` session can read the encrypted
+mirror, lazily hydrate one older message page, and directly send, edit, delete
+or leave an allowlisted group room. Agent hosts can create an exclusive,
+process-bound 60-second route lease and use the scoped inbox API: listing is
+metadata-only, and remote text is released only by an explicit local accept.
+Agent sends are encrypted, route-bound drafts; a one-time approval binds the
+exact text and destination, then makes one non-retrying Webex request. SSE
+revalidates the process-bound token for each metadata-only event and filters
+agent events by claimed route. UI pairing uses a native macOS confirmation
+showing the kernel-resolved executable path, then creates an in-memory UI
+session. The macOS LaunchAgent installer is implemented; use the signed Mise
+tasks below for local service management. Typed Rust UI clients and attachment
+download remain in progress.
 
 The dedicated `webex-bridge` integration is separate from the TUI integration.
 OAuth defaults to ten granular scopes. The user explicitly approved

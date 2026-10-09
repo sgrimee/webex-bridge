@@ -8,8 +8,10 @@ lookup, a metadata-only Mercury probe, explicit development-only forced
 refresh, and mirror progress status. `webex-bridged` owns the Mercury
 connection and maintains the encrypted SQLite mirror; `--dev-room` restricts
 validation to an allowlisted room, while normal mode mirrors all rooms. The
-scoped local API and message sends remain unimplemented, so do not run the
-daemon as a service yet.
+daemon also exposes a same-user, 0600 HTTP-over-UDS status endpoint at
+`run/bridge.sock` (`GET /v1/status`), containing only API, connection and
+mirror-progress metadata. Sessions, scoped UI/agent endpoints and message
+sends remain unimplemented, so do not run the daemon as a service yet.
 
 The dedicated `webex-bridge` integration is separate from the TUI integration.
 OAuth defaults to ten granular scopes. The user explicitly approved

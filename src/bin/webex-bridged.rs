@@ -1,10 +1,11 @@
-//! Per-user bridge daemon: Mercury live sync plus encrypted local mirror.
-//! Local HTTP API and message sends are deliberately not enabled in Step 2.
+//! Per-user bridge daemon: Mercury live sync, encrypted local mirror and local status API.
+//! Scoped UI/agent sessions and message sends remain disabled until later Step 3 work.
 
 use anyhow::{Context, Result};
 use std::{sync::Arc, time::Instant};
 use tokio::sync::watch;
 use webex_bridge::{
+    api::{self, ApiState, ConnectionStatus},
     config::Config,
     diagnostics,
     mirror::{Mirror, SharedMirror},
@@ -34,6 +35,10 @@ async fn main() -> Result<()> {
     let mirror = SharedMirror::new(Mirror::open(&paths)?);
     diagnostics::info("daemon.mirror_opened");
     let (connected_tx, connected_rx) = watch::channel::<Option<Arc<WebexRest>>>(None);
+    let (api_connection_tx, api_connection_rx) = watch::channel(ConnectionStatus::Disconnected);
+    let api_server = api::start(&paths, ApiState::new(mirror.clone(), api_connection_rx)).await?;
+    diagnostics::info("daemon.api_listening");
+    let connection_task = tokio::spawn(watch_connection(connected_rx.clone(), api_connection_tx));
     let background_mirror = mirror.clone();
     let live_dev_room = dev_room.clone();
     let background_config = Arc::new(config);
@@ -67,6 +72,9 @@ async fn main() -> Result<()> {
     .await;
     sync_task.abort();
     let _ = sync_task.await;
+    connection_task.abort();
+    let _ = connection_task.await;
+    api_server.shutdown().await?;
     if result.is_ok() {
         diagnostics::info("daemon.stopped");
     }
@@ -108,6 +116,25 @@ fn sync_error_kind(error: &anyhow::Error) -> &'static str {
         "timestamp"
     } else {
         "other"
+    }
+}
+
+/// Convert the daemon's connection publication into safe API metadata. The
+/// local HTTP server never receives a Webex client or token.
+async fn watch_connection(
+    mut connected: watch::Receiver<Option<Arc<WebexRest>>>,
+    status: watch::Sender<ConnectionStatus>,
+) {
+    loop {
+        let next = if connected.borrow().is_some() {
+            ConnectionStatus::Connected
+        } else {
+            ConnectionStatus::Disconnected
+        };
+        let _ = status.send(next);
+        if connected.changed().await.is_err() {
+            return;
+        }
     }
 }
 

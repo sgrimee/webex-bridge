@@ -16,12 +16,15 @@ biometric-keychain = ["dep:security-framework"]
 
 [dependencies]
 anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 base64 = "0.22"
 chacha20poly1305 = "0.10"
 chrono = "0.4"
 dirs = "6"
 fs2 = "0.4"
 gethostname = "1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 keyring = { version = "3.6.3", features = ["apple-native"] }
 libc = "0.2"
 oauth2 = { version = "5", default-features = false, features = ["reqwest", "rustls-tls"] }
@@ -33,6 +36,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "signal", "sync"] }
 toml = "0.8"
+tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = "0.28"
 webbrowser = "1"
 webex = { path = "../webex-rust" }

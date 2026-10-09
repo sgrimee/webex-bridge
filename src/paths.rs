@@ -15,6 +15,8 @@ pub struct Paths {
     pub config: PathBuf,
     /// SQLite mirror (Step 2).
     pub mirror: PathBuf,
+    /// HTTP-over-UDS endpoint owned solely by the daemon.
+    pub socket: PathBuf,
     /// Refresh lock, shared by the CLI and daemon.
     pub refresh_lock: PathBuf,
 }
@@ -35,6 +37,7 @@ impl Paths {
             run: data.join("run"),
             config: data.join("config.toml"),
             mirror: data.join("bridge.db"),
+            socket: data.join("run/bridge.sock"),
             refresh_lock: data.join("run/refresh.lock"),
             data,
         }

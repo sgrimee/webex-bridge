@@ -1,6 +1,6 @@
 //! Atomic SQLite schema migrations.
 
-use super::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3};
+use super::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4};
 use anyhow::{bail, Result};
 use rusqlite::Connection;
 
@@ -32,6 +32,18 @@ fn migrate_v3(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_v4(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction()?;
+    if !has_column(&tx, "rooms", "is_locked")? {
+        tx.execute_batch(
+            "ALTER TABLE rooms ADD COLUMN is_locked INTEGER CHECK (is_locked IN (0,1));",
+        )?;
+    }
+    tx.execute_batch(SCHEMA_V4)?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Apply migrations or reject a database written by newer code.
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -41,14 +53,20 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
             tx.execute_batch(SCHEMA_V1)?;
             tx.commit()?;
             migrate_v2(conn)?;
-            migrate_v3(conn)
+            migrate_v3(conn)?;
+            migrate_v4(conn)
         }
         1 => {
             migrate_v2(conn)?;
-            migrate_v3(conn)
+            migrate_v3(conn)?;
+            migrate_v4(conn)
         }
-        2 => migrate_v3(conn),
-        3 => Ok(()),
+        2 => {
+            migrate_v3(conn)?;
+            migrate_v4(conn)
+        }
+        3 => migrate_v4(conn),
+        4 => Ok(()),
         _ => bail!("Mirror database schema version {version} is unsupported"),
     }
 }
@@ -63,10 +81,12 @@ mod tests {
         migrate(&mut conn).unwrap();
         assert!(has_column(&conn, "room_sync", "observed_last_activity").unwrap());
         assert!(has_column(&conn, "account_identity", "person_id_ct").unwrap());
+        assert!(has_column(&conn, "rooms", "is_locked").unwrap());
+        assert!(has_column(&conn, "teams", "name_ct").unwrap());
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                 .unwrap(),
-            3
+            4
         );
         conn.execute_batch("PRAGMA user_version=99").unwrap();
         assert!(migrate(&mut conn).is_err());
@@ -79,12 +99,28 @@ mod tests {
         conn.execute_batch("ALTER TABLE room_sync ADD COLUMN observed_last_activity TEXT;")
             .unwrap();
         conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(
+            "INSERT INTO rooms(room_id,title_ct,type,team_id,last_activity,is_member,updated_at)
+             VALUES ('old-room',NULL,'group',NULL,NULL,1,'2026-10-08T12:00:00Z');",
+        )
+        .unwrap();
         migrate(&mut conn).unwrap();
         assert!(has_column(&conn, "account_identity", "person_id_ct").unwrap());
+        assert!(has_column(&conn, "rooms", "is_locked").unwrap());
+        assert!(has_column(&conn, "teams", "name_ct").unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT is_locked FROM rooms WHERE room_id='old-room'",
+                [],
+                |row| row.get::<_, Option<bool>>(0),
+            )
+            .unwrap(),
+            None
+        );
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                 .unwrap(),
-            3
+            4
         );
     }
 
@@ -98,7 +134,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                 .unwrap(),
-            3
+            4
         );
     }
 }

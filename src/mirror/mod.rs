@@ -22,7 +22,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::Mutex;
-use webex::{Message, Person, Room};
+use webex::{Message, Person, Room, Team};
 use zeroize::Zeroizing;
 
 const KEY_CHECK: &[u8] = b"webex-bridge-mirror-v1";
@@ -44,8 +44,10 @@ type UiRoomRow = (
     Option<String>,
     Option<String>,
     bool,
+    Option<bool>,
 );
 type UiPersonRow = (Option<Vec<u8>>, Option<Vec<u8>>);
+type UiTeamRow = Option<Vec<u8>>;
 type UiMessageRow = (
     String,
     i64,
@@ -108,6 +110,16 @@ pub struct UiRoom {
     pub team_id: Option<String>,
     pub last_activity: Option<String>,
     pub is_member: bool,
+    /// `None` means this room predates authoritative lock-state mirroring.
+    pub is_locked: Option<bool>,
+}
+
+/// Team metadata released only to an authorized UI session.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiTeam {
+    pub id: String,
+    pub name: Option<String>,
 }
 
 /// Full person metadata released only to an authorized UI session.
@@ -353,13 +365,14 @@ impl Mirror {
             .transpose()?;
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO rooms(room_id,title_ct,type,team_id,last_activity,is_member,updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7)
+            "INSERT INTO rooms(room_id,title_ct,type,team_id,last_activity,is_member,is_locked,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
              ON CONFLICT(room_id) DO UPDATE SET
              title_ct=excluded.title_ct,type=excluded.type,team_id=excluded.team_id,
-             last_activity=excluded.last_activity,is_member=excluded.is_member,updated_at=excluded.updated_at",
+             last_activity=excluded.last_activity,is_member=excluded.is_member,
+             is_locked=excluded.is_locked,updated_at=excluded.updated_at",
             params![room.id, title_ct, room.room_type, room.team_id, room.last_activity,
-                is_member, Utc::now().to_rfc3339()],
+                is_member, room.is_locked, Utc::now().to_rfc3339()],
         )?;
         tx.execute(
             "INSERT OR IGNORE INTO room_sync(room_id) VALUES (?1)",
@@ -454,7 +467,7 @@ impl Mirror {
     /// List all room metadata for an authorized UI session, newest first.
     pub fn ui_rooms(&self) -> Result<Vec<UiRoom>> {
         let mut statement = self.conn.prepare(
-            "SELECT room_id,title_ct,type,team_id,last_activity,is_member FROM rooms
+            "SELECT room_id,title_ct,type,team_id,last_activity,is_member,is_locked FROM rooms
              ORDER BY last_activity DESC,room_id DESC",
         )?;
         let rows = statement.query_map([], |row| {
@@ -465,10 +478,11 @@ impl Mirror {
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, bool>(5)?,
+                row.get::<_, Option<bool>>(6)?,
             ))
         })?;
         rows.map(|row| {
-            let (id, title_ct, room_type, team_id, last_activity, is_member) = row?;
+            let (id, title_ct, room_type, team_id, last_activity, is_member, is_locked) = row?;
             let title = title_ct
                 .map(|blob| {
                     self.crypto
@@ -485,6 +499,7 @@ impl Mirror {
                 team_id,
                 last_activity,
                 is_member,
+                is_locked,
             })
         })
         .collect::<Result<Vec<_>>>()
@@ -495,7 +510,7 @@ impl Mirror {
         let row: Option<UiRoomRow> = self
             .conn
             .query_row(
-                "SELECT title_ct,type,team_id,last_activity,is_member FROM rooms WHERE room_id=?1",
+                "SELECT title_ct,type,team_id,last_activity,is_member,is_locked FROM rooms WHERE room_id=?1",
                 [room_id],
                 |row| {
                     Ok((
@@ -504,27 +519,80 @@ impl Mirror {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                     ))
                 },
             )
             .optional()?;
-        row.map(|(title_ct, room_type, team_id, last_activity, is_member)| {
-            let title = title_ct
+        row.map(
+            |(title_ct, room_type, team_id, last_activity, is_member, is_locked)| {
+                let title = title_ct
+                    .map(|blob| {
+                        self.crypto
+                            .open_prefixed(&blob, &aad("rooms", "title", room_id))
+                            .and_then(|bytes| {
+                                String::from_utf8(bytes).context("Invalid encrypted room title")
+                            })
+                    })
+                    .transpose()?;
+                Ok(UiRoom {
+                    id: room_id.into(),
+                    title,
+                    room_type,
+                    team_id,
+                    last_activity,
+                    is_member,
+                    is_locked,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    /// Upsert encrypted team name for UI display only.
+    pub fn upsert_team(&mut self, team: &Team) -> Result<()> {
+        if team.id.is_empty() {
+            bail!("REST team has no ID");
+        }
+        let name_ct = team
+            .name
+            .as_ref()
+            .map(|name| {
+                self.crypto
+                    .seal_prefixed(name.as_bytes(), &aad("teams", "name", &team.id))
+            })
+            .transpose()?;
+        self.conn.execute(
+            "INSERT INTO teams(team_id,name_ct,updated_at) VALUES (?1,?2,?3)
+             ON CONFLICT(team_id) DO UPDATE SET name_ct=excluded.name_ct,updated_at=excluded.updated_at",
+            params![team.id, name_ct, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Read one team's decrypted identity and name for an authorized UI session.
+    pub fn ui_team(&self, team_id: &str) -> Result<Option<UiTeam>> {
+        let row: Option<UiTeamRow> = self
+            .conn
+            .query_row(
+                "SELECT name_ct FROM teams WHERE team_id=?1",
+                [team_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        row.map(|name_ct| {
+            let name = name_ct
                 .map(|blob| {
                     self.crypto
-                        .open_prefixed(&blob, &aad("rooms", "title", room_id))
+                        .open_prefixed(&blob, &aad("teams", "name", team_id))
                         .and_then(|bytes| {
-                            String::from_utf8(bytes).context("Invalid encrypted room title")
+                            String::from_utf8(bytes).context("Invalid encrypted team name")
                         })
                 })
                 .transpose()?;
-            Ok(UiRoom {
-                id: room_id.into(),
-                title,
-                room_type,
-                team_id,
-                last_activity,
-                is_member,
+            Ok(UiTeam {
+                id: team_id.into(),
+                name,
             })
         })
         .transpose()
@@ -1544,6 +1612,60 @@ mod tests {
         assert!(mirror
             .ui_room_messages("room-1", Some("missing"), 2)
             .is_err());
+    }
+
+    #[test]
+    fn ui_team_name_is_encrypted_and_room_lock_state_stays_nullable() {
+        let mut mirror = Mirror::in_memory([16_u8; 32]).unwrap();
+        let room = Room {
+            id: "room-1".into(),
+            title: Some("Private room title".into()),
+            room_type: "group".into(),
+            is_locked: true,
+            team_id: Some("team-1".into()),
+            last_activity: "2026-10-08T12:00:00Z".into(),
+            creator_id: "person-1".into(),
+            created: "2026-10-08T12:00:00Z".into(),
+        };
+        mirror.upsert_room(&room, true).unwrap();
+        assert_eq!(
+            mirror.ui_room("room-1").unwrap().unwrap().is_locked,
+            Some(true)
+        );
+
+        // A row written before schema v4 carries no authoritative lock state.
+        mirror
+            .conn
+            .execute("UPDATE rooms SET is_locked=NULL WHERE room_id='room-1'", [])
+            .unwrap();
+        assert_eq!(mirror.ui_room("room-1").unwrap().unwrap().is_locked, None);
+
+        mirror
+            .upsert_team(&Team {
+                id: "team-1".into(),
+                name: Some("Private team name".into()),
+                created: "2026-10-08T12:00:00Z".into(),
+                description: Some("Private team description".into()),
+            })
+            .unwrap();
+        assert_eq!(
+            mirror.ui_team("team-1").unwrap(),
+            Some(UiTeam {
+                id: "team-1".into(),
+                name: Some("Private team name".into()),
+            })
+        );
+        let encrypted: Vec<u8> = mirror
+            .conn
+            .query_row(
+                "SELECT name_ct FROM teams WHERE team_id='team-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!encrypted
+            .windows(b"Private team name".len())
+            .any(|window| window == b"Private team name"));
     }
 
     #[test]

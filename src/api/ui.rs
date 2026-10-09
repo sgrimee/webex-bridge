@@ -106,6 +106,14 @@ fn room_dto(room: crate::mirror::UiRoom) -> dto::Room {
         team_id: room.team_id,
         last_activity: room.last_activity,
         is_member: room.is_member,
+        is_locked: room.is_locked,
+    }
+}
+
+fn team_dto(team: crate::mirror::UiTeam) -> dto::Team {
+    dto::Team {
+        id: team.id,
+        name: team.name,
     }
 }
 
@@ -305,6 +313,72 @@ async fn room(
             StatusCode::SERVICE_UNAVAILABLE,
             "bridge_unavailable",
             "Mirror is temporarily unavailable",
+        ),
+    }
+}
+
+async fn team(
+    State(state): State<ApiState>,
+    Extension(peer): Extension<auth::PeerIdentity>,
+    Path(team_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = ui_session(&state, peer, &headers) {
+        return *response;
+    }
+    if !valid_resource_id(&team_id) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Team ID is invalid",
+        );
+    }
+    match state.mirror().with(|db| db.ui_team(&team_id)).await {
+        Ok(Some(team)) => return Json(team_dto(team)).into_response(),
+        Ok(None) => {}
+        Err(_) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bridge_unavailable",
+                "Mirror is temporarily unavailable",
+            )
+        }
+    }
+
+    // A cache miss makes exactly one daemon-owned REST request. The UI never
+    // receives a Webex capability or performs its own unbounded lookup.
+    let Some(rest) = state.rest() else {
+        return json_error(StatusCode::NOT_FOUND, "not_found", "Team was not found");
+    };
+    match rest.team(&team_id).await {
+        Ok(Some(team)) if team.id == team_id => match state
+            .mirror()
+            .with(|db| {
+                db.upsert_team(&team)?;
+                db.ui_team(&team_id)
+            })
+            .await
+        {
+            Ok(Some(team)) => Json(team_dto(team)).into_response(),
+            _ => json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bridge_unavailable",
+                "Mirror is temporarily unavailable",
+            ),
+        },
+        // Webex uses both 404 and access-denied for a team that is not
+        // available to this account. Either is an ordinary title-decoration
+        // miss, so the UI can retain its room-title fallback.
+        Ok(None) => json_error(StatusCode::NOT_FOUND, "not_found", "Team was not found"),
+        Ok(Some(_)) => json_error(
+            StatusCode::BAD_GATEWAY,
+            "webex_unavailable",
+            "Webex returned an unexpected team",
+        ),
+        Err(_) => json_error(
+            StatusCode::BAD_GATEWAY,
+            "webex_unavailable",
+            "Webex team lookup failed",
         ),
     }
 }
@@ -823,6 +897,7 @@ pub fn router() -> Router<ApiState> {
         .route("/v1/me", get(me))
         .route("/v1/rooms", get(rooms))
         .route("/v1/rooms/{room_id}", get(room))
+        .route("/v1/teams/{team_id}", get(team))
         .route("/v1/rooms/{room_id}/membership", delete(leave_room))
         .route("/v1/rooms/{room_id}/messages", get(room_messages))
         .route("/v1/messages", post(create_message))

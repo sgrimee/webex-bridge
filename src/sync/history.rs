@@ -7,7 +7,7 @@ use reqwest::{header, Client, Method, Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::time::sleep;
-use webex::{GlobalId, GlobalIdType, Membership, Message, MessageOut, Person, Room};
+use webex::{GlobalId, GlobalIdType, Membership, Message, MessageOut, Person, Room, Team};
 
 const REST_BASE: &str = "https://webexapis.com/v1/";
 
@@ -295,6 +295,30 @@ impl WebexRest {
         ))
     }
 
+    /// Hydrate one team for an authorized UI request. A 404 or 403 means the
+    /// account cannot name this team; it is a normal room-title fallback, not
+    /// an authentication failure.
+    pub async fn team(&self, id: &str) -> Result<Option<Team>> {
+        let id = GlobalId::new(GlobalIdType::Team, id.to_owned())?;
+        let response = self
+            .client
+            .get(self.endpoint("teams", Some(id.id()))?)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .context("Webex team lookup did not return a response")?;
+        match response.status() {
+            status if status.is_success() => response
+                .json::<Team>()
+                .await
+                .map(Some)
+                .context("Invalid Webex team response"),
+            StatusCode::NOT_FOUND | StatusCode::FORBIDDEN => Ok(None),
+            StatusCode::UNAUTHORIZED => bail!("auth_required: Webex team lookup returned HTTP 401"),
+            status => bail!("Webex team lookup returned HTTP {status}"),
+        }
+    }
+
     /// Read the authenticated user for an authorized paired UI request.
     pub async fn me(&self) -> Result<Person> {
         let response = self
@@ -575,6 +599,40 @@ mod tests {
         let rest =
             WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
         rest.leave_room(room).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn team_lookup_is_single_request_and_access_misses_are_normal() {
+        let team_id =
+            "Y2lzY29zcGFyazovL3VzL1RFQU0vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDEx";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/teams/{team_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": team_id,
+                "name": "Private team name",
+                "created": "2026-10-08T12:00:00Z"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rest =
+            WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
+        assert_eq!(
+            rest.team(team_id).await.unwrap().unwrap().name.as_deref(),
+            Some("Private team name")
+        );
+
+        let denied = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/teams/{team_id}")))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&denied)
+            .await;
+        let rest =
+            WebexRest::for_tests(Url::parse(&format!("{}/v1/", denied.uri())).unwrap()).unwrap();
+        assert_eq!(rest.team(team_id).await.unwrap(), None);
     }
 
     #[tokio::test]

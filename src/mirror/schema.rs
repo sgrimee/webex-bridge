@@ -105,3 +105,14 @@ CREATE TABLE account_identity (
 );
 PRAGMA user_version=3;
 "#;
+
+// Team names are UI free text. Lock state is nullable: rows written before
+// v4 have no authoritative lock observation and must not become `false`.
+pub(crate) const SCHEMA_V4: &str = r#"
+CREATE TABLE IF NOT EXISTS teams (
+    team_id TEXT PRIMARY KEY,
+    name_ct BLOB,
+    updated_at TEXT NOT NULL
+);
+PRAGMA user_version=4;
+"#;

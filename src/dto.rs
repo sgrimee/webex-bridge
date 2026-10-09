@@ -36,6 +36,17 @@ pub struct Room {
     pub team_id: Option<String>,
     pub last_activity: Option<String>,
     pub is_member: bool,
+    /// `None` means the mirror has not received authoritative lock metadata.
+    /// It must not be interpreted as unlocked.
+    pub is_locked: Option<bool>,
+}
+
+/// Team identity and name available to a paired UI only.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Team {
+    pub id: String,
+    pub name: Option<String>,
 }
 
 /// Full person metadata available to a paired UI only.
@@ -75,6 +86,7 @@ mod tests {
             team_id: Some("team-1".into()),
             last_activity: Some("2026-10-09T12:00:00Z".into()),
             is_member: true,
+            is_locked: None,
         };
         assert_eq!(
             serde_json::to_value(room).unwrap(),
@@ -85,7 +97,20 @@ mod tests {
                 "teamId": "team-1",
                 "lastActivity": "2026-10-09T12:00:00Z",
                 "isMember": true,
+                "isLocked": null,
             })
+        );
+    }
+
+    #[test]
+    fn team_wire_names_match_the_v1_ui_contract() {
+        let team = Team {
+            id: "team-1".into(),
+            name: Some("Project team".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(team).unwrap(),
+            serde_json::json!({"id": "team-1", "name": "Project team"})
         );
     }
 }

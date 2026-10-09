@@ -4,7 +4,7 @@ use super::{events::EventStream, path_segment, BridgeClient, Result};
 use hyper::Method;
 use serde::{Deserialize, Serialize};
 
-pub use crate::dto::{Message, Person, Room, Status, SyncStatus};
+pub use crate::dto::{Message, Person, Room, Status, SyncStatus, Team};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -131,6 +131,23 @@ impl UiClient {
             .request(
                 Method::GET,
                 &format!("/v1/rooms/{}", path_segment(room_id)),
+                Some(&self.token),
+                None,
+            )
+            .await?;
+        BridgeClient::json(response).await
+    }
+
+    /// Read one team from the encrypted mirror. On a cache miss, the daemon
+    /// may make one bounded, daemon-owned Webex lookup. `not_found` is normal
+    /// when the account cannot access the team; callers should retain their
+    /// room-title fallback.
+    pub async fn team(&self, team_id: &str) -> Result<Team> {
+        let response = self
+            .bridge
+            .request(
+                Method::GET,
+                &format!("/v1/teams/{}", path_segment(team_id)),
                 Some(&self.token),
                 None,
             )
@@ -289,9 +306,13 @@ mod server_tests {
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use sha2::{Digest, Sha256};
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
     use tokio::sync::watch;
     use tokio_stream::StreamExt;
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
 
     async fn paired_server() -> (tempfile::TempDir, api::ApiServer, BridgeClient, EventBus) {
         let temp = tempfile::tempdir().unwrap();
@@ -300,7 +321,15 @@ mod server_tests {
         let secret = "a-local-ui-secret-that-is-long-enough";
         let hash = URL_SAFE_NO_PAD.encode(Sha256::digest(secret.as_bytes()));
         mirror
-            .with(|db| db.pair_ui_client(&hash, "/test/webex-tui"))
+            .with(|db| {
+                db.pair_ui_client(&hash, "/test/webex-tui")?;
+                db.upsert_team(&webex::Team {
+                    id: "team-1".into(),
+                    name: Some("Project team".into()),
+                    created: "2026-10-08T12:00:00Z".into(),
+                    description: None,
+                })
+            })
             .await
             .unwrap();
         let (_connection_tx, connection_rx) = watch::channel(ConnectionStatus::Connected);
@@ -308,6 +337,30 @@ mod server_tests {
         let events = state.events();
         let server = api::start(&paths, state).await.unwrap();
         (temp, server, BridgeClient::new(paths.socket), events)
+    }
+
+    async fn hydrated_team_server(
+        rest: Arc<crate::sync::history::WebexRest>,
+    ) -> (tempfile::TempDir, api::ApiServer, BridgeClient) {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(temp.path().join("bridge"));
+        let mirror = SharedMirror::new(Mirror::in_memory([45_u8; 32]).unwrap());
+        let secret = "a-local-ui-secret-that-is-long-enough";
+        let hash = URL_SAFE_NO_PAD.encode(Sha256::digest(secret.as_bytes()));
+        mirror
+            .with(|db| db.pair_ui_client(&hash, "/test/webex-tui"))
+            .await
+            .unwrap();
+        let (_connection_tx, connection_rx) = watch::channel(ConnectionStatus::Connected);
+        let (_rest_tx, rest_rx) = watch::channel(Some(rest));
+        let state = ApiState::with_config_and_rest(
+            mirror,
+            connection_rx,
+            Arc::new(crate::config::Config::default()),
+            rest_rx,
+        );
+        let server = api::start(&paths, state).await.unwrap();
+        (temp, server, BridgeClient::new(paths.socket))
     }
 
     async fn cached_identity_server() -> (tempfile::TempDir, api::ApiServer, BridgeClient) {
@@ -374,6 +427,13 @@ mod server_tests {
             .await
             .unwrap();
         assert_eq!(ui.rooms().await.unwrap(), Vec::<Room>::new());
+        assert_eq!(
+            ui.team("team-1").await.unwrap(),
+            Team {
+                id: "team-1".into(),
+                name: Some("Project team".into()),
+            }
+        );
 
         let mut stream = ui.events().await.unwrap();
         events.publish_ui(
@@ -388,6 +448,76 @@ mod server_tests {
             }
         );
         drop(stream);
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn team_cache_miss_hydrates_once_and_inaccessible_team_is_a_fallback() {
+        let team_id =
+            "Y2lzY29zcGFyazovL3VzL1RFQU0vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDEx";
+        let remote = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/teams/{team_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": team_id,
+                "name": "Hydrated team",
+                "created": "2026-10-08T12:00:00Z"
+            })))
+            .expect(1)
+            .mount(&remote)
+            .await;
+        let rest = Arc::new(
+            crate::sync::history::WebexRest::for_tests(
+                reqwest::Url::parse(&format!("{}/v1/", remote.uri())).unwrap(),
+            )
+            .unwrap(),
+        );
+        let (_temp, server, bridge) = hydrated_team_server(rest).await;
+        let ui = bridge
+            .create_ui_session("a-local-ui-secret-that-is-long-enough")
+            .await
+            .unwrap();
+        assert_eq!(
+            ui.team(team_id).await.unwrap(),
+            Team {
+                id: team_id.into(),
+                name: Some("Hydrated team".into()),
+            }
+        );
+        // The second read is mirror-backed; the daemon does not repeat the REST lookup.
+        assert_eq!(
+            ui.team(team_id).await.unwrap().name.as_deref(),
+            Some("Hydrated team")
+        );
+        server.shutdown().await.unwrap();
+
+        let inaccessible = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/teams/{team_id}")))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&inaccessible)
+            .await;
+        let rest = Arc::new(
+            crate::sync::history::WebexRest::for_tests(
+                reqwest::Url::parse(&format!("{}/v1/", inaccessible.uri())).unwrap(),
+            )
+            .unwrap(),
+        );
+        let (_temp, server, bridge) = hydrated_team_server(rest).await;
+        let ui = bridge
+            .create_ui_session("a-local-ui-secret-that-is-long-enough")
+            .await
+            .unwrap();
+        let error = ui.team(team_id).await.unwrap_err();
+        assert!(matches!(
+            error,
+            crate::client::ClientError::Api {
+                status: hyper::StatusCode::NOT_FOUND,
+                code,
+                ..
+            } if code == "not_found"
+        ));
         server.shutdown().await.unwrap();
     }
 

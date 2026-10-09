@@ -12,6 +12,8 @@ use webex::Room;
 /// Counts for a completed latest-page or background batch.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct InitialResult {
+    /// Malformed or incomplete REST entries skipped without advancing cursors.
+    pub skipped: usize,
     /// New canonical message rows.
     pub created: usize,
     /// New edit revisions.
@@ -46,6 +48,7 @@ pub async fn latest_page(
         .context("Room sync row missing")?;
     if state.boundary_created_at.is_some() {
         return Ok(InitialResult {
+            skipped: 0,
             created: 0,
             edited: 0,
             done: state.initial_done,
@@ -53,6 +56,7 @@ pub async fn latest_page(
     }
     let page = rest.messages_page(&room.id, None, page_size).await?;
     let mut counts = InitialResult {
+        skipped: 0,
         created: 0,
         edited: 0,
         done: false,
@@ -60,18 +64,18 @@ pub async fn latest_page(
     let mut newest: Option<(String, String)> = None;
     let mut oldest: Option<String> = None;
     for message in &page {
-        let created = message
-            .created
-            .as_deref()
-            .context("Message has no created time")?;
-        let id = message
-            .id
-            .as_deref()
-            .context("Message has no canonical ID")?;
+        let (Some(created), Some(id)) = (message.created.as_deref(), message.id.as_deref()) else {
+            counts.skipped += 1;
+            continue;
+        };
+        let Ok(created_at) = created_at(message) else {
+            counts.skipped += 1;
+            continue;
+        };
         if newest.is_none() {
             newest = Some((created.to_owned(), id.to_owned()));
         }
-        if created_at(message)? < cutoff {
+        if created_at < cutoff {
             break;
         }
         match mirror.with(|db| db.upsert_message(message)).await? {
@@ -118,6 +122,7 @@ pub async fn backfill(
         .context("Room must be initialized first")?;
     if state.initial_done {
         return Ok(InitialResult {
+            skipped: 0,
             created: 0,
             edited: 0,
             done: true,
@@ -128,6 +133,7 @@ pub async fn backfill(
         .await?
         .context("Backfill cursor missing; retry latest-page sync")?;
     let mut counts = InitialResult {
+        skipped: 0,
         created: 0,
         edited: 0,
         done: false,
@@ -143,7 +149,11 @@ pub async fn backfill(
         let page_len = page.len();
         let mut reached_cutoff = false;
         for message in &page {
-            if created_at(message)? < cutoff {
+            let Ok(created_at) = created_at(message) else {
+                counts.skipped += 1;
+                continue;
+            };
+            if created_at < cutoff {
                 reached_cutoff = true;
                 break;
             }
@@ -152,11 +162,9 @@ pub async fn backfill(
                 Upsert::Edited(_) => counts.edited += 1,
                 Upsert::Unchanged | Upsert::IgnoredDeleted => {}
             }
-            let created = message
-                .created
-                .as_deref()
-                .context("Message has no created time")?;
-            mirror.with(|db| db.record_oldest(room_id, created)).await?;
+            if let Some(created) = message.created.as_deref() {
+                mirror.with(|db| db.record_oldest(room_id, created)).await?;
+            }
         }
         if reached_cutoff || page_len < page_size as usize {
             counts.done = true;

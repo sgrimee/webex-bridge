@@ -61,6 +61,23 @@ async fn main() -> Result<()> {
     result
 }
 
+fn sync_error_kind(error: &anyhow::Error) -> &'static str {
+    let detail = error.to_string();
+    if detail.contains("auth_required") {
+        "auth"
+    } else if detail.contains("HTTP 429") {
+        "rate_limited"
+    } else if detail.contains("HTTP 5") {
+        "server"
+    } else if detail.contains("pagination") {
+        "pagination"
+    } else if detail.contains("timestamp") {
+        "timestamp"
+    } else {
+        "other"
+    }
+}
+
 async fn run_sync(
     mut connected: watch::Receiver<Option<Arc<WebexRest>>>,
     mirror: SharedMirror,
@@ -85,12 +102,15 @@ async fn run_sync(
             result = sync::synchronize_once(&mirror, &rest, &config, dev_room.as_deref()) => {
                 match result {
                     Ok(summary) => eprintln!(
-                        "Webex mirror sync: rooms={} initial={} created={} edited={} deleted={} gaps={} backfilled={}",
+                        "Webex mirror sync: rooms={} initial={} created={} edited={} deleted={} gaps={} backfilled={} failed={}",
                         summary.rooms, summary.initial_rooms, summary.created, summary.edited,
-                        summary.deleted, summary.gaps, summary.backfilled_rooms
+                        summary.deleted, summary.gaps, summary.backfilled_rooms, summary.failed_rooms
                     ),
                     // Never expose response bodies, tokens, room titles or message IDs in daemon logs.
-                    Err(_) => eprintln!("Webex mirror sync failed; reconnect/catch-up will retry"),
+                    Err(error) => eprintln!(
+                        "Webex mirror sync failed ({}); reconnect/catch-up will retry",
+                        sync_error_kind(&error)
+                    ),
                 }
                 // No steady-state polling. Wait until a reconnect publishes a new REST client.
                 connected.changed().await.context("Mercury supervisor stopped")?;

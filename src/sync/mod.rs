@@ -24,12 +24,16 @@ pub struct SyncSummary {
     pub created: usize,
     /// Edit revisions discovered during catch-up/revalidation.
     pub edited: usize,
+    /// Malformed/incomplete REST messages skipped without storing content.
+    pub skipped: usize,
     /// Verified deleted messages whose ciphertext was purged.
     pub deleted: usize,
     /// Explicit unbridgeable time gaps.
     pub gaps: usize,
     /// Rooms whose background backfill finished.
     pub backfilled_rooms: usize,
+    /// Room phases that failed with sanitized metadata and will retry on reconnect.
+    pub failed_rooms: usize,
 }
 
 fn activity(room: &Room) -> Result<DateTime<Utc>> {
@@ -97,10 +101,20 @@ pub async fn synchronize_once(
             .await?
             .context("Room sync row missing")?;
         if state.boundary_created_at.is_none() {
-            let outcome = initial::latest_page(mirror, rest, room, page_size, cutoff).await?;
-            summary.initial_rooms += 1;
-            summary.created += outcome.created;
-            summary.edited += outcome.edited;
+            match initial::latest_page(mirror, rest, room, page_size, cutoff).await {
+                Ok(outcome) => {
+                    summary.initial_rooms += 1;
+                    summary.created += outcome.created;
+                    summary.edited += outcome.edited;
+                    summary.skipped += outcome.skipped;
+                }
+                Err(_) => {
+                    mirror
+                        .with(|db| db.record_sync_failure(&room.id, "initial"))
+                        .await?;
+                    summary.failed_rooms += 1;
+                }
+            }
         }
     }
     // Stage 2: changed rooms recover the newest gaps. Revalidation discovers
@@ -111,13 +125,31 @@ pub async fn synchronize_once(
             .await?
             .context("Room sync row missing")?;
         if state.boundary_created_at.is_some() && catchup::changed_room(room, &state)? {
-            let outcome = catchup::catch_up_room(mirror, rest, room, cutoff, page_size).await?;
-            summary.created += outcome.created;
-            summary.edited += outcome.edited;
-            summary.gaps += usize::from(outcome.gap.is_some());
-            let checked = live::reconcile_room(mirror, rest, &room.id).await?;
-            summary.edited += checked.edited;
-            summary.deleted += checked.deleted;
+            match catchup::catch_up_room(mirror, rest, room, cutoff, page_size).await {
+                Ok(outcome) => {
+                    summary.created += outcome.created;
+                    summary.edited += outcome.edited;
+                    summary.gaps += usize::from(outcome.gap.is_some());
+                    match live::reconcile_room(mirror, rest, &room.id).await {
+                        Ok(checked) => {
+                            summary.edited += checked.edited;
+                            summary.deleted += checked.deleted;
+                        }
+                        Err(_) => {
+                            mirror
+                                .with(|db| db.record_sync_failure(&room.id, "reconcile"))
+                                .await?;
+                            summary.failed_rooms += 1;
+                        }
+                    }
+                }
+                Err(_) => {
+                    mirror
+                        .with(|db| db.record_sync_failure(&room.id, "catchup"))
+                        .await?;
+                    summary.failed_rooms += 1;
+                }
+            }
         }
     }
     // Stage 3: background pages, most recently active rooms first.
@@ -127,10 +159,20 @@ pub async fn synchronize_once(
             .await?
             .context("Room sync row missing")?;
         if !state.initial_done {
-            let outcome = initial::backfill(mirror, rest, &room.id, page_size, cutoff).await?;
-            summary.created += outcome.created;
-            summary.edited += outcome.edited;
-            summary.backfilled_rooms += usize::from(outcome.done);
+            match initial::backfill(mirror, rest, &room.id, page_size, cutoff).await {
+                Ok(outcome) => {
+                    summary.created += outcome.created;
+                    summary.edited += outcome.edited;
+                    summary.skipped += outcome.skipped;
+                    summary.backfilled_rooms += usize::from(outcome.done);
+                }
+                Err(_) => {
+                    mirror
+                        .with(|db| db.record_sync_failure(&room.id, "backfill"))
+                        .await?;
+                    summary.failed_rooms += 1;
+                }
+            }
         }
     }
     if let Some(retention) = config.webex.retention_max_age.as_deref() {

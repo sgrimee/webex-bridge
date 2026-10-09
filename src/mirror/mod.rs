@@ -107,6 +107,8 @@ pub struct MirrorStats {
     pub initial_done: i64,
     /// Rooms with a recorded recovery gap.
     pub gaps: i64,
+    /// Room phases with a sanitized failure that retry on reconnect.
+    pub failures: i64,
 }
 
 /// A local encrypted mirror; callers serialize writes through one owner.
@@ -192,6 +194,11 @@ impl Mirror {
             )?,
             gaps: self.conn.query_row(
                 "SELECT count(*) FROM room_sync WHERE last_result LIKE 'gap:%'",
+                [],
+                |row| row.get(0),
+            )?,
+            failures: self.conn.query_row(
+                "SELECT count(*) FROM room_sync WHERE last_result LIKE '%_error'",
                 [],
                 |row| row.get(0),
             )?,
@@ -607,6 +614,21 @@ impl Mirror {
         )? != 1
         {
             bail!("Cannot record a gap for unknown room");
+        }
+        Ok(())
+    }
+
+    /// Record a sanitized sync phase failure for status/retry; no remote response content.
+    pub fn record_sync_failure(&mut self, room_id: &str, phase: &str) -> Result<()> {
+        if !matches!(phase, "initial" | "catchup" | "backfill" | "reconcile") {
+            bail!("Unknown sync failure phase");
+        }
+        if self.conn.execute(
+            "UPDATE room_sync SET last_result=?2,last_catchup_at=?3 WHERE room_id=?1",
+            params![room_id, format!("{phase}_error"), Utc::now().to_rfc3339()],
+        )? != 1
+        {
+            bail!("Cannot record failure for unknown room");
         }
         Ok(())
     }

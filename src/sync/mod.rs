@@ -158,7 +158,9 @@ pub async fn synchronize_once(
             .with(|db| db.room_sync(&room.id))
             .await?
             .context("Room sync row missing")?;
-        if !state.initial_done {
+        // A failed latest-page request has no durable oldest cursor. Do not
+        // misclassify that retryable initial failure as a backfill failure.
+        if !state.initial_done && state.boundary_created_at.is_some() {
             match initial::backfill(mirror, rest, &room.id, page_size, cutoff).await {
                 Ok(outcome) => {
                     summary.created += outcome.created;
@@ -188,7 +190,7 @@ mod tests {
     use crate::{config::DevConfig, mirror::Mirror};
     use reqwest::Url;
     use wiremock::{
-        matchers::{method, path},
+        matchers::{method, path, query_param},
         Mock, MockServer, ResponseTemplate,
     };
 
@@ -247,6 +249,131 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("private test body")
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_room_is_not_paged_again() {
+        let server = MockServer::start().await;
+        let ready_room =
+            "Y2lzY29zcGFyazovL3VzL1JPT00vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDk5";
+        let new_room =
+            "Y2lzY29zcGFyazovL3VzL1JPT00vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBhMDAx";
+        let message_id =
+            "Y2lzY29zcGFyazovL3VzL01FU1NBR0UvMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBjMDAz";
+        let now = Utc::now().to_rfc3339();
+        let ready = room(ready_room, &now);
+        let newly_joined = room(new_room, &now);
+        Mock::given(method("GET"))
+            .and(path("/v1/rooms"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [ready.clone(), newly_joined.clone()]
+            })))
+            .mount(&server)
+            .await;
+        // If the unchanged room were paged, no mock would match and the sync
+        // would fail. The new room alone must fetch its first page.
+        Mock::given(method("GET"))
+            .and(path("/v1/messages"))
+            .and(query_param("roomId", new_room))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [{"id": message_id, "roomId": new_room, "created": now, "text": "private fixture"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rest =
+            WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
+        let mut db = Mirror::in_memory([78_u8; 32]).unwrap();
+        db.upsert_room(&ready, true).unwrap();
+        db.record_boundary(ready_room, &now, "already-mirrored")
+            .unwrap();
+        db.record_oldest(ready_room, &now).unwrap();
+        db.mark_initial_done(ready_room).unwrap();
+        db.mark_room_observed(ready_room, &now).unwrap();
+        let mirror = SharedMirror::new(db);
+
+        let summary = synchronize_once(&mirror, &rest, &Config::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(summary.rooms, 2);
+        assert_eq!(summary.initial_rooms, 1);
+        assert_eq!(summary.created, 1);
+        assert!(
+            mirror
+                .with(|db| db.room_sync(ready_room))
+                .await
+                .unwrap()
+                .unwrap()
+                .initial_done
+        );
+        assert!(
+            mirror
+                .with(|db| db.room_sync(new_room))
+                .await
+                .unwrap()
+                .unwrap()
+                .initial_done
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_initial_room_is_preserved_while_later_rooms_sync() {
+        let server = MockServer::start().await;
+        let failed_room =
+            "Y2lzY29zcGFyazovL3VzL1JPT00vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDk5";
+        let succeeding_room =
+            "Y2lzY29zcGFyazovL3VzL1JPT00vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBhMDAx";
+        let message_id =
+            "Y2lzY29zcGFyazovL3VzL01FU1NBR0UvMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBjMDAz";
+        let now = Utc::now().to_rfc3339();
+        Mock::given(method("GET"))
+            .and(path("/v1/rooms"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [room(failed_room, &now), room(succeeding_room, &now)]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/messages"))
+            .and(query_param("roomId", failed_room))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/messages"))
+            .and(query_param("roomId", succeeding_room))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [{"id": message_id, "roomId": succeeding_room, "created": now, "text": "private fixture"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rest =
+            WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
+        let mirror = SharedMirror::new(Mirror::in_memory([79_u8; 32]).unwrap());
+
+        let summary = synchronize_once(&mirror, &rest, &Config::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(summary.rooms, 2);
+        assert_eq!(summary.failed_rooms, 1);
+        assert_eq!(summary.created, 1);
+        let failed = mirror
+            .with(|db| db.room_sync(failed_room))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!failed.initial_done);
+        assert_eq!(failed.last_result.as_deref(), Some("initial_error"));
+        assert!(
+            mirror
+                .with(|db| db.room_sync(succeeding_room))
+                .await
+                .unwrap()
+                .unwrap()
+                .initial_done
         );
     }
 }

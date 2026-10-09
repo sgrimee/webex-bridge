@@ -2,11 +2,14 @@
 
 Local Webex connection owner, encrypted mirror and scoped API for UI and agent clients.
 
-**Status:** Step 1 transport feasibility in progress. The `webex-bridge` CLI has
-Keychain-backed PKCE login, read-only room/identity lookup, a metadata-only
-Mercury probe, and explicit development-only forced refresh. The daemon,
-encrypted mirror, scoped local API and message sends are **not implemented**;
-`webex-bridged` deliberately refuses to start. Do not run it as a service yet.
+**Status:** Step 2 encrypted mirror and sync is in progress. The
+`webex-bridge` CLI has Keychain-backed PKCE login, read-only room/identity
+lookup, a metadata-only Mercury probe, explicit development-only forced
+refresh, and mirror progress status. `webex-bridged` owns the Mercury
+connection and maintains the encrypted SQLite mirror; `--dev-room` restricts
+validation to an allowlisted room, while normal mode mirrors all rooms. The
+scoped local API and message sends remain unimplemented, so do not run the
+daemon as a service yet.
 
 The dedicated `webex-bridge` integration is separate from the TUI integration.
 OAuth defaults to ten granular scopes. The user explicitly approved

@@ -18,6 +18,7 @@ use rand::RngCore;
 use serde_json::{json, Value};
 use std::{
     convert::Infallible,
+    future::Future,
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -26,7 +27,7 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-use tokio::sync::broadcast;
+use tokio::{sync::broadcast, time::Sleep};
 use tokio_stream::{
     wrappers::{errors::BroadcastStreamRecvError, BroadcastStream},
     StreamExt,
@@ -231,19 +232,29 @@ fn subscriber(
 struct CloseAfterTerminal<S> {
     inner: S,
     closing: Arc<AtomicU64>,
+    /// UI-only session deadline. Agent SSE behavior remains unchanged.
+    expiry: Option<Pin<Box<Sleep>>>,
 }
 
 impl<S: Unpin> Unpin for CloseAfterTerminal<S> {}
 
 impl<S> tokio_stream::Stream for CloseAfterTerminal<S>
 where
-    S: tokio_stream::Stream + Unpin,
+    S: tokio_stream::Stream<Item = Result<SseEvent, Infallible>> + Unpin,
 {
-    type Item = S::Item;
+    type Item = Result<SseEvent, Infallible>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.closing.load(Ordering::SeqCst) == 2 {
             return Poll::Ready(None);
+        }
+        if let Some(expiry) = self.expiry.as_mut() {
+            if expiry.as_mut().poll(context).is_ready() {
+                self.closing.store(2, Ordering::SeqCst);
+                return Poll::Ready(Some(Ok(SseEvent::default()
+                    .event(SESSION_EXPIRED_EVENT)
+                    .data(r#"{"reason":"session_expired"}"#))));
+            }
         }
         match Pin::new(&mut self.inner).poll_next(context) {
             Poll::Ready(Some(item)) => {
@@ -271,6 +282,18 @@ async fn stream(
     let receiver = events.subscribe();
     let ready = events.continuity();
     let ui_subscriber = matches!(subscriber, Subscriber::Ui);
+    let expiry = if ui_subscriber {
+        sessions
+            .expires_at(&token, auth::Scope::Ui, peer)
+            .ok()
+            .map(|deadline| {
+                Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
+                    deadline,
+                )))
+            })
+    } else {
+        None
+    };
     let stream_is_ui = ui_subscriber;
     let closing = Arc::new(AtomicU64::new(0));
     let closing_events = Arc::clone(&closing);
@@ -327,6 +350,7 @@ async fn stream(
     let events = CloseAfterTerminal {
         inner: events,
         closing,
+        expiry,
     };
     let initial = if ui_subscriber {
         vec![Ok::<SseEvent, Infallible>(

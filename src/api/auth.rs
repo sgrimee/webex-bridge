@@ -210,6 +210,24 @@ impl Sessions {
         Ok(())
     }
 
+    /// Return the expiry for one verified session. SSE uses this to close an
+    /// idle UI subscription at lease expiry rather than relying on a later bus
+    /// event or keepalive write to trigger revalidation.
+    pub fn expires_at(
+        &self,
+        token: &str,
+        required_scope: Scope,
+        peer: PeerIdentity,
+    ) -> std::result::Result<Instant, SessionError> {
+        self.authorize(Some(token), required_scope, peer)?;
+        let state = self.inner.lock().expect("session mutex poisoned");
+        state
+            .sessions
+            .get(token)
+            .map(|session| session.expires_at)
+            .ok_or(SessionError::Missing)
+    }
+
     /// Return the routes that this verified agent token currently owns.
     ///
     /// The caller supplies the kernel-derived peer identity on every request,

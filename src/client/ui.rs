@@ -1303,17 +1303,20 @@ mod server_tests {
 
     #[tokio::test]
     async fn expired_ui_event_session_gets_terminal_event_then_closes() {
-        let (_temp, server, bridge, token, events) = expiring_ui_server().await;
+        let (_temp, server, bridge, token, _events) = expiring_ui_server().await;
         let mut stream = crate::client::events::EventStream::connect(bridge, &token)
             .await
             .unwrap();
         let ready = stream.next().await.unwrap().unwrap();
         assert_eq!(ready.name, crate::client::events::CONTINUITY_READY_EVENT);
         tokio::time::sleep(Duration::from_millis(120)).await;
-        events.publish_ui("room.resync", serde_json::json!({"roomId":"room-1"}));
-        let expired = stream.next().await.unwrap().unwrap();
+        // No daemon event is published here: a quiet SSE must still expire.
+        let expired = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("quiet expiry should wake the stream")
+            .unwrap()
+            .unwrap();
         assert!(expired.is_session_expired());
-        events.publish_ui("room.resync", serde_json::json!({"roomId":"room-1"}));
         assert!(tokio::time::timeout(Duration::from_secs(1), stream.next())
             .await
             .expect("expired stream should close")

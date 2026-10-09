@@ -1,6 +1,6 @@
 //! Mercury connection owner. Refresh rebuilds client and stream; failures back off.
 
-use crate::{auth, config::Config, paths::Paths, sync::history::WebexRest};
+use crate::{auth, config::Config, diagnostics, paths::Paths, sync::history::WebexRest};
 use anyhow::{bail, Context, Result};
 use rand::Rng;
 use std::{future::Future, sync::Arc, time::Duration};
@@ -149,10 +149,14 @@ where
     let mut term = signal(SignalKind::terminate())?;
     let mut backoff = Duration::from_secs(1);
     loop {
+        diagnostics::debug(format!(
+            "supervisor.connecting retry_backoff_secs={}",
+            backoff.as_secs()
+        ));
         let tokens = match auth::fresh_token(paths).await {
             Ok(tokens) => tokens,
             Err(error) if error.is::<reqwest::Error>() => {
-                eprintln!("Webex bridge: token refresh unavailable; retrying after backoff");
+                diagnostics::warn("supervisor.token_refresh_unavailable; retrying_after_backoff");
                 tokio::select! {
                     _ = term.recv() => return Ok(()),
                     _ = tokio::signal::ctrl_c() => return Ok(()),
@@ -163,6 +167,10 @@ where
             }
             Err(error) => return Err(error).context("auth_required or token refresh failed"),
         };
+        diagnostics::debug(format!(
+            "supervisor.token_ready refresh_in_secs={}",
+            tokens.refresh_at().saturating_sub(now()?)
+        ));
         let name = device_name();
         let initialized = tokio::select! {
             _ = term.recv() => return Ok(()),
@@ -170,7 +178,7 @@ where
             result = timeout(Duration::from_secs(30), Webex::new_with_device_name(&name, &tokens.access_token)) => result,
         };
         let Ok(client) = initialized else {
-            eprintln!("Webex bridge: initialization timed out; retrying after backoff");
+            diagnostics::warn("supervisor.initialization_timed_out; retrying_after_backoff");
             tokio::select! {
                 _ = term.recv() => return Ok(()),
                 _ = tokio::signal::ctrl_c() => return Ok(()),
@@ -193,7 +201,7 @@ where
                         .send(Some(Arc::clone(&rest)))
                         .map_err(|_| anyhow::anyhow!("Daemon sync receiver closed"))?;
                 }
-                println!("Webex bridge: connected");
+                diagnostics::info("supervisor.connected");
                 let mut forced = false;
                 let force_deadline = force_once.map(|delay| tokio::time::Instant::now() + delay);
                 loop {
@@ -223,7 +231,7 @@ where
                                     // Never log a response body or event data via a Display impl.
                                     // One malformed or concurrently deleted event must not drop
                                     // the healthy Mercury stream; catch-up heals its state.
-                                    eprintln!("Webex event hydration failed; catch-up is required");
+                                    diagnostics::warn("supervisor.event_hydration_failed; catchup_required");
                                 }
                             }
                             Err(error) if authentication_status(&error).is_some() => {
@@ -231,7 +239,10 @@ where
                                 bail!("auth_required: Mercury stream returned HTTP {status}; no scope change made");
                             }
                             Err(error) => {
-                                eprintln!("Webex Mercury stream ended ({})", stream_error_kind(&error));
+                                diagnostics::warn(format!(
+                                    "supervisor.stream_ended category={}",
+                                    stream_error_kind(&error)
+                                ));
                                 break;
                             }
                         }
@@ -239,9 +250,9 @@ where
                 }
                 // Rebuild the immutable token-bearing Webex client and stream.
                 if forced {
-                    println!("Webex bridge: token refresh starting");
+                    diagnostics::info("supervisor.token_refresh_starting");
                     auth::refresh_now(paths).await?;
-                    println!("Webex bridge: token refreshed; rebuilding stream");
+                    diagnostics::info("supervisor.token_refreshed; rebuilding_stream");
                     continue;
                 }
                 if now()? >= tokens.refresh_at() {
@@ -257,7 +268,10 @@ where
         if let Some(sender) = &connected {
             let _ = sender.send(None);
         }
-        eprintln!("Webex bridge: disconnected; retrying after backoff");
+        diagnostics::warn(format!(
+            "supervisor.disconnected; retrying_after_backoff_secs={}",
+            backoff.as_secs()
+        ));
         tokio::select! {
             _ = term.recv() => return Ok(()),
             _ = tokio::signal::ctrl_c() => return Ok(()),

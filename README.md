@@ -41,5 +41,48 @@ message revisions; leaving it unset keeps all history. All write paths must
 enforce `[dev] write_allowlist` in later steps. See [the local implementation plan](../docs/webex-agent-channel-plan.md)
 and [`docs/events.md`](docs/events.md) for observations.
 
+## Daemon diagnostics and macOS development Keychain access
+
+`bridged.log` is deliberately metadata-only: it never includes Webex payloads,
+room/message IDs, tokens, secrets, or decrypted mirror data. The daemon now
+emits timestamped lifecycle events at normal level (startup, mirror open,
+connect/reconnect, refresh, and sync counts/duration). For additional safe
+progress events, run it with `--debug` or set `WEBEX_BRIDGE_LOG=debug`:
+
+```sh
+./target/debug/webex-bridged --debug
+# or, after the initial setup below:
+WEBEX_BRIDGE_LOG=debug ./scripts/run-bridged-dev
+```
+
+Do **not** disable the Keychain or cache Webex secrets in a file for development.
+A normal daemon startup reads two distinct Keychain items: the OAuth state and
+the encrypted-mirror key. On a newly trusted executable macOS may therefore
+ask once per item. Choosing **Always Allow** should prevent prompts on later
+starts *only while the executable keeps the same code requirement*.
+
+Cargo gives each rebuilt `target/debug/webex-bridged` an ad-hoc signature, whose
+code hash changes after each build; macOS therefore treats it as a new caller
+and requests access again. Use the development launcher after creating an
+Apple Development or local Code Signing certificate in Keychain Access/Xcode:
+
+```sh
+./scripts/run-bridged-dev --debug
+```
+
+It builds the daemon and re-signs it with a persistent identity and stable
+identifier before starting it. On its first run, choose **Always Allow** for
+each Keychain item; subsequent rebuilds/restarts should not prompt. If several
+signing identities are present, select one explicitly:
+
+```sh
+WEBEX_BRIDGE_CODESIGN_IDENTITY='Apple Development: Your Name (TEAMID)' \
+  ./scripts/run-bridged-dev --debug
+```
+
+The launcher intentionally refuses to fall back to an ad-hoc signature: that
+would reintroduce the repeated prompts. A password-file/plaintext development
+mode is not provided.
+
 During development this crate depends on the sibling `../webex-rust` checkout.
 No PRs or remote dependency changes are required for local work.

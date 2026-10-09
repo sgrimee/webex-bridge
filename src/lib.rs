@@ -3,6 +3,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod diagnostics;
 pub mod hydrate;
 pub mod paths;
 pub mod rooms;

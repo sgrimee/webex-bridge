@@ -2,10 +2,11 @@
 //! Local HTTP API and message sends are deliberately not enabled in Step 2.
 
 use anyhow::{Context, Result};
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 use tokio::sync::watch;
 use webex_bridge::{
     config::Config,
+    diagnostics,
     mirror::{Mirror, SharedMirror},
     paths::Paths,
     supervisor,
@@ -14,17 +15,24 @@ use webex_bridge::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let dev_room = match std::env::args().collect::<Vec<_>>().as_slice() {
-        [_] => None,
-        [_, flag, room] if flag == "--dev-room" => Some(room.clone()),
-        _ => anyhow::bail!("Usage: webex-bridged [--dev-room ROOM_ID]"),
-    };
+    let (dev_room, debug) = parse_args()?;
+    if debug {
+        diagnostics::enable_debug();
+    }
+    diagnostics::info("daemon.starting");
     let paths = Paths::discover()?;
     let config = Config::load(&paths)?;
+    diagnostics::debug(format!(
+        "daemon.config_loaded routes={} dev_mode={} dev_room_requested={}",
+        config.routes.len(),
+        config.dev.is_some(),
+        dev_room.is_some()
+    ));
     if let Some(room) = dev_room.as_deref() {
         config.check_write_room(room)?;
     }
     let mirror = SharedMirror::new(Mirror::open(&paths)?);
+    diagnostics::info("daemon.mirror_opened");
     let (connected_tx, connected_rx) = watch::channel::<Option<Arc<WebexRest>>>(None);
     let background_mirror = mirror.clone();
     let live_dev_room = dev_room.clone();
@@ -35,6 +43,7 @@ async fn main() -> Result<()> {
         Arc::clone(&background_config),
         dev_room,
     ));
+    diagnostics::debug("daemon.sync_task_started");
     let live_mirror = mirror.clone();
     let result = supervisor::run_daemon(
         &paths,
@@ -58,7 +67,31 @@ async fn main() -> Result<()> {
     .await;
     sync_task.abort();
     let _ = sync_task.await;
+    if result.is_ok() {
+        diagnostics::info("daemon.stopped");
+    }
     result
+}
+
+fn parse_args() -> Result<(Option<String>, bool)> {
+    let mut dev_room = None;
+    let mut debug = false;
+    let mut args = std::env::args().skip(1);
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--debug" => debug = true,
+            "--dev-room" => {
+                let room = args
+                    .next()
+                    .context("Usage: webex-bridged [--debug] [--dev-room ROOM_ID]")?;
+                if dev_room.replace(room).is_some() {
+                    anyhow::bail!("--dev-room may be specified only once");
+                }
+            }
+            _ => anyhow::bail!("Usage: webex-bridged [--debug] [--dev-room ROOM_ID]"),
+        }
+    }
+    Ok((dev_room, debug))
 }
 
 fn sync_error_kind(error: &anyhow::Error) -> &'static str {
@@ -85,6 +118,7 @@ async fn run_sync(
     dev_room: Option<String>,
 ) -> Result<()> {
     loop {
+        diagnostics::debug("sync.waiting_for_connection");
         while connected.borrow().is_none() {
             connected
                 .changed()
@@ -95,22 +129,25 @@ async fn run_sync(
             .borrow_and_update()
             .clone()
             .context("Missing Webex REST client")?;
+        let started = Instant::now();
+        diagnostics::debug("sync.started");
         tokio::select! {
             changed = connected.changed() => {
                 changed.context("Mercury supervisor stopped")?;
             }
             result = sync::synchronize_once(&mirror, &rest, &config, dev_room.as_deref()) => {
                 match result {
-                    Ok(summary) => eprintln!(
-                        "Webex mirror sync: rooms={} initial={} created={} edited={} deleted={} gaps={} backfilled={} failed={}",
-                        summary.rooms, summary.initial_rooms, summary.created, summary.edited,
-                        summary.deleted, summary.gaps, summary.backfilled_rooms, summary.failed_rooms
-                    ),
+                    Ok(summary) => diagnostics::info(format!(
+                        "sync.completed elapsed_ms={} rooms={} initial={} created={} edited={} deleted={} gaps={} backfilled={} failed={}",
+                        started.elapsed().as_millis(), summary.rooms, summary.initial_rooms,
+                        summary.created, summary.edited, summary.deleted, summary.gaps,
+                        summary.backfilled_rooms, summary.failed_rooms
+                    )),
                     // Never expose response bodies, tokens, room titles or message IDs in daemon logs.
-                    Err(error) => eprintln!(
-                        "Webex mirror sync failed ({}); reconnect/catch-up will retry",
-                        sync_error_kind(&error)
-                    ),
+                    Err(error) => diagnostics::warn(format!(
+                        "sync.failed elapsed_ms={} category={}; reconnect_or_catchup_will_retry",
+                        started.elapsed().as_millis(), sync_error_kind(&error)
+                    )),
                 }
                 // No steady-state polling. Wait until a reconnect publishes a new REST client.
                 connected.changed().await.context("Mercury supervisor stopped")?;

@@ -3,6 +3,7 @@
 
 use crate::{
     config::{Config, OAuthScope},
+    diagnostics,
     paths::Paths,
     secrets,
 };
@@ -222,11 +223,13 @@ pub async fn fresh_token(paths: &Paths) -> Result<TokenSet> {
     }
     let current = now()?;
     if current < tokens.refresh_at() {
+        diagnostics::debug("auth.cached_token_accepted");
         return Ok(tokens);
     }
     if current >= tokens.refresh_expires_at {
         bail!("Webex refresh token expired; run webex-bridge login");
     }
+    diagnostics::info("auth.token_refresh_required");
     refresh_locked(tokens).await
 }
 
@@ -242,6 +245,7 @@ pub async fn refresh_now(paths: &Paths) -> Result<TokenSet> {
     if now()? >= tokens.refresh_expires_at {
         bail!("Webex refresh token expired; run webex-bridge login");
     }
+    diagnostics::info("auth.token_refresh_forced");
     refresh_locked(tokens).await
 }
 
@@ -256,6 +260,7 @@ async fn refresh_locked(tokens: TokenSet) -> Result<TokenSet> {
     .await?;
     let refreshed = token_from_reply(reply, Some(&tokens), tokens.scope_mode)?;
     save(&refreshed)?;
+    diagnostics::info("auth.token_refreshed");
     Ok(refreshed)
 }
 

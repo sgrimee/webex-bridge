@@ -6,6 +6,7 @@
 //! that data-protection backend requires Keychain access-group entitlements.
 //! The two modes never silently fall back to each other.
 
+use crate::diagnostics;
 use anyhow::{Context, Result};
 use keyring::{Entry, Error as KeyringError};
 
@@ -20,6 +21,8 @@ fn legacy_entry(account: &str) -> Result<Entry> {
 }
 
 fn legacy_get(account: &str) -> Result<Option<String>> {
+    // Account labels are fixed in this crate; the secret value is never logged.
+    diagnostics::debug(format!("keychain.read service=oauth account={account}"));
     match legacy_entry(account)?.get_password() {
         Ok(value) => Ok(Some(value)),
         Err(KeyringError::NoEntry) => Ok(None),
@@ -100,6 +103,8 @@ pub fn get(account: &str) -> Result<Option<String>> {
 
 /// Store a secret in the user's Keychain, never in a file.
 pub fn set(account: &str, value: &str) -> Result<()> {
+    // Account labels are fixed in this crate; the secret value is never logged.
+    diagnostics::debug(format!("keychain.write service=oauth account={account}"));
     #[cfg(all(target_os = "macos", feature = "biometric-keychain"))]
     {
         macos::set(account, value)?;
@@ -117,6 +122,7 @@ pub fn set(account: &str, value: &str) -> Result<()> {
 /// Load the 256-bit mirror key from the login Keychain (not a file or config).
 /// The daemon needs it during unattended sync, including after token refresh.
 pub fn get_mirror_key() -> Result<Option<String>> {
+    diagnostics::debug("keychain.read service=mirror_key account=key");
     let entry =
         Entry::new(MIRROR_KEY_SERVICE, "key").context("Mirror Keychain entry unavailable")?;
     match entry.get_password() {
@@ -128,6 +134,7 @@ pub fn get_mirror_key() -> Result<Option<String>> {
 
 /// Store a newly generated mirror key in the login Keychain.
 pub fn set_mirror_key(value: &str) -> Result<()> {
+    diagnostics::debug("keychain.write service=mirror_key account=key");
     Entry::new(MIRROR_KEY_SERVICE, "key")
         .context("Mirror Keychain entry unavailable")?
         .set_password(value)

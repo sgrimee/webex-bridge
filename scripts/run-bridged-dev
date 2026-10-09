@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Build, apply a stable development signature, then run the bridge daemon.
+#
+# Keychain's “Always Allow” is bound to the caller's code requirement. Cargo
+# replaces target/debug/webex-bridged on every rebuild, so its ad-hoc signature
+# (and therefore its requirement) changes each time. A persistent Code Signing
+# identity keeps the requirement stable across rebuilds without weakening the
+# Keychain or copying secrets outside it.
+set -euo pipefail
+
+repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repo_root"
+
+identity=${WEBEX_BRIDGE_CODESIGN_IDENTITY:-}
+if [[ -z "$identity" ]]; then
+    identity=$(security find-identity -v -p codesigning 2>/dev/null \
+        | awk -F '"' 'NF >= 2 { print $2; exit }')
+fi
+
+if [[ -z "$identity" ]]; then
+    cat >&2 <<'EOF'
+webex-bridged development signing requires a persistent Code Signing identity.
+
+Create an “Apple Development” (or local Code Signing) certificate in Keychain
+Access/Xcode, then run this script again. Alternatively specify an existing
+identity explicitly:
+
+  WEBEX_BRIDGE_CODESIGN_IDENTITY='Apple Development: Your Name (TEAMID)' \
+    ./scripts/run-bridged-dev --debug
+
+This is intentionally not replaced by an ad-hoc signature: ad-hoc signatures
+change after each Cargo rebuild and cause Keychain to prompt again.
+EOF
+    exit 1
+fi
+
+cargo build --bin webex-bridged
+codesign --force --sign "$identity" \
+    --identifier com.sgrimee.webex-bridged \
+    --timestamp=none \
+    target/debug/webex-bridged
+exec target/debug/webex-bridged "$@"

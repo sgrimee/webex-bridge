@@ -98,6 +98,13 @@ fn valid_resource_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 1024 && !value.chars().any(char::is_control)
 }
 
+fn continuity_dto(continuity: crate::api::events::Continuity) -> dto::Continuity {
+    dto::Continuity {
+        instance_id: continuity.instance_id,
+        watermark: continuity.watermark,
+    }
+}
+
 fn room_dto(room: crate::mirror::UiRoom) -> dto::Room {
     dto::Room {
         id: room.id,
@@ -324,6 +331,17 @@ async fn me(
             ),
         },
     }
+}
+
+async fn continuity(
+    State(state): State<ApiState>,
+    Extension(peer): Extension<auth::PeerIdentity>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = ui_session(&state, peer, &headers) {
+        return *response;
+    }
+    Json(continuity_dto(state.events().continuity())).into_response()
 }
 
 async fn rooms(
@@ -1391,6 +1409,7 @@ pub fn router() -> Router<ApiState> {
         .route("/v1/ui/pair", post(pair))
         .route("/v1/ui/sessions", post(create_session))
         .route("/v1/me", get(me))
+        .route("/v1/ui/continuity", get(continuity))
         .route("/v1/rooms", get(rooms))
         .route("/v1/rooms/{room_id}", get(room))
         .route("/v1/teams/{team_id}", get(team))

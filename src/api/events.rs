@@ -13,8 +13,19 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use rand::RngCore;
 use serde_json::{json, Value};
-use std::{convert::Infallible, time::Duration};
+use std::{
+    convert::Infallible,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    task::{Context, Poll},
+    time::Duration,
+};
 use tokio::sync::broadcast;
 use tokio_stream::{
     wrappers::{errors::BroadcastStreamRecvError, BroadcastStream},
@@ -24,6 +35,8 @@ use tokio_stream::{
 const EVENT_QUEUE_CAPACITY: usize = 256;
 const RESYNC_REQUIRED_EVENT: &str = "resync.required";
 const EVENT_LAG_REASON: &str = "event_lag";
+const CONTINUITY_READY_EVENT: &str = "continuity.ready";
+const SESSION_EXPIRED_EVENT: &str = "session.expired";
 
 #[derive(Clone, Debug)]
 enum Audience {
@@ -73,12 +86,29 @@ impl Subscriber {
 #[derive(Clone)]
 pub struct EventBus {
     sender: broadcast::Sender<PublishedEvent>,
+    instance_id: Arc<str>,
+    watermark: Arc<AtomicU64>,
+}
+
+/// A UI-only daemon identity plus monotonic change watermark. It lets a
+/// subscriber buffer events after subscribing, fetch snapshots, then apply
+/// only events newer than the snapshot boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Continuity {
+    pub instance_id: String,
+    pub watermark: u64,
 }
 
 impl Default for EventBus {
     fn default() -> Self {
         let (sender, _) = broadcast::channel(EVENT_QUEUE_CAPACITY);
-        Self { sender }
+        let mut bytes = [0_u8; 16];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        Self {
+            sender,
+            instance_id: Arc::from(URL_SAFE_NO_PAD.encode(bytes)),
+            watermark: Arc::new(AtomicU64::new(0)),
+        }
     }
 }
 
@@ -97,8 +127,30 @@ impl EventBus {
     }
 
     /// Notify paired UIs of a metadata-only mirror or connection change.
-    pub fn publish_ui(&self, name: &'static str, data: Value) {
+    /// Each UI event receives the daemon instance and an increasing watermark;
+    /// agent events deliberately do not inherit this UI continuity contract.
+    pub fn publish_ui(&self, name: &'static str, mut data: Value) {
+        let watermark = self.watermark.fetch_add(1, Ordering::SeqCst) + 1;
+        let continuity = json!({
+            "instanceId": self.instance_id.as_ref(),
+            "watermark": watermark,
+        });
+        if let Some(object) = data.as_object_mut() {
+            object.insert("continuity".into(), continuity);
+        } else {
+            data = json!({ "continuity": continuity });
+        }
         self.publish(Audience::Ui, name, data);
+    }
+
+    /// Current UI snapshot boundary. This does not disclose mirror content and
+    /// is intentionally unavailable through unauthenticated status/agent APIs.
+    #[must_use]
+    pub fn continuity(&self) -> Continuity {
+        Continuity {
+            instance_id: self.instance_id.to_string(),
+            watermark: self.watermark.load(Ordering::SeqCst),
+        }
     }
 
     /// Notify the current holder of exactly one configured agent route.
@@ -174,6 +226,37 @@ fn subscriber(
     }
 }
 
+/// Yield a terminal session-expired SSE event once, then close on the next
+/// poll without waiting for another daemon event or keepalive interval.
+struct CloseAfterTerminal<S> {
+    inner: S,
+    closing: Arc<AtomicU64>,
+}
+
+impl<S: Unpin> Unpin for CloseAfterTerminal<S> {}
+
+impl<S> tokio_stream::Stream for CloseAfterTerminal<S>
+where
+    S: tokio_stream::Stream + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.closing.load(Ordering::SeqCst) == 2 {
+            return Poll::Ready(None);
+        }
+        match Pin::new(&mut self.inner).poll_next(context) {
+            Poll::Ready(Some(item)) => {
+                if self.closing.load(Ordering::SeqCst) == 1 {
+                    self.closing.store(2, Ordering::SeqCst);
+                }
+                Poll::Ready(Some(item))
+            }
+            other => other,
+        }
+    }
+}
+
 async fn stream(
     State(state): State<ApiState>,
     Extension(peer): Extension<auth::PeerIdentity>,
@@ -184,14 +267,36 @@ async fn stream(
         Err(response) => return *response,
     };
     let sessions = state.sessions();
-    let receiver = state.events().subscribe();
-    let stream = BroadcastStream::new(receiver).filter_map(move |received| {
+    let events = state.events();
+    let receiver = events.subscribe();
+    let ready = events.continuity();
+    let ui_subscriber = matches!(subscriber, Subscriber::Ui);
+    let stream_is_ui = ui_subscriber;
+    let closing = Arc::new(AtomicU64::new(0));
+    let closing_events = Arc::clone(&closing);
+    let events = BroadcastStream::new(receiver).filter_map(move |received| {
         // A lag signal is itself scoped output, so it receives the same
-        // per-item lease and peer revalidation as normal events.
+        // per-item lease and peer revalidation as normal events. A terminal
+        // expiry event is emitted once; the next poll closes the stream.
         if sessions
             .authorize(Some(&token), subscriber.required_scope(), peer)
             .is_err()
         {
+            // B8 continuity is UI-only. Preserve the existing agent stream
+            // behavior; it carries no instance/watermark or expiry signal.
+            if !stream_is_ui {
+                return None;
+            }
+            if closing_events
+                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Some(Ok::<SseEvent, Infallible>(
+                    SseEvent::default()
+                        .event(SESSION_EXPIRED_EVENT)
+                        .data(r#"{"reason":"session_expired"}"#),
+                ));
+            }
             return None;
         }
         match received {
@@ -201,13 +306,42 @@ async fn stream(
             // The broadcast channel intentionally has no replay. Make loss
             // explicit for both scopes so their hosts reload their authorized
             // state rather than silently applying a partial event sequence.
-            Err(BroadcastStreamRecvError::Lagged(_)) => Some(Ok(SseEvent::default()
-                .event(RESYNC_REQUIRED_EVENT)
-                .data(format!(r#"{{"reason":"{EVENT_LAG_REASON}"}}"#)))),
+            Err(BroadcastStreamRecvError::Lagged(_)) => {
+                let data = if stream_is_ui {
+                    let continuity = events.continuity();
+                    serde_json::json!({
+                        "reason": EVENT_LAG_REASON,
+                        "instanceId": continuity.instance_id,
+                        "watermark": continuity.watermark,
+                    })
+                } else {
+                    serde_json::json!({ "reason": EVENT_LAG_REASON })
+                };
+                Some(Ok(SseEvent::default()
+                    .event(RESYNC_REQUIRED_EVENT)
+                    .data(data.to_string())))
+            }
             Ok(_) => None,
         }
     });
-    Sse::new(stream)
+    let events = CloseAfterTerminal {
+        inner: events,
+        closing,
+    };
+    let initial = if ui_subscriber {
+        vec![Ok::<SseEvent, Infallible>(
+            SseEvent::default().event(CONTINUITY_READY_EVENT).data(
+                serde_json::json!({
+                    "instanceId": ready.instance_id,
+                    "watermark": ready.watermark,
+                })
+                .to_string(),
+            ),
+        )]
+    } else {
+        Vec::new()
+    };
+    Sse::new(tokio_stream::iter(initial).chain(events))
         .keep_alive(
             axum::response::sse::KeepAlive::new()
                 .interval(Duration::from_secs(15))

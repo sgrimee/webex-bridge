@@ -26,6 +26,15 @@ pub struct SyncStatus {
     pub failures: i64,
 }
 
+/// UI-only daemon identity and monotonic mirror-change boundary. Subscribe to
+/// SSE first, then obtain this boundary before reading snapshots.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Continuity {
+    pub instance_id: String,
+    pub watermark: u64,
+}
+
 /// Full room metadata available to a paired UI only.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

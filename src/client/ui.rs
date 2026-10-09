@@ -5,8 +5,8 @@ use hyper::Method;
 use serde::{Deserialize, Serialize};
 
 pub use crate::dto::{
-    Message, MessageBody, MessageBodyInput, MessagePage, MessageRead, Person, PersonRead, Room,
-    Status, SyncStatus, Team, ThreadChildren, ThreadParent,
+    Continuity, Message, MessageBody, MessageBodyInput, MessagePage, MessageRead, Person,
+    PersonRead, Room, Status, SyncStatus, Team, ThreadChildren, ThreadParent,
 };
 
 #[derive(Deserialize)]
@@ -110,6 +110,17 @@ impl UiClient {
         let response = self
             .bridge
             .request(Method::GET, "/v1/me", Some(&self.token), None)
+            .await?;
+        BridgeClient::json(response).await
+    }
+
+    /// Read the UI-only daemon instance and snapshot boundary. Subscribe to
+    /// events first, buffer them, then use this watermark while refreshing the
+    /// mirror to avoid subscribe-before-snapshot loss.
+    pub async fn continuity(&self) -> Result<Continuity> {
+        let response = self
+            .bridge
+            .request(Method::GET, "/v1/ui/continuity", Some(&self.token), None)
             .await?;
         BridgeClient::json(response).await
     }
@@ -654,6 +665,31 @@ mod server_tests {
         (temp, server, BridgeClient::new(paths.socket), token, events)
     }
 
+    async fn expiring_ui_server() -> (
+        tempfile::TempDir,
+        api::ApiServer,
+        BridgeClient,
+        String,
+        EventBus,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(temp.path().join("bridge"));
+        let mirror = SharedMirror::new(Mirror::in_memory([48_u8; 32]).unwrap());
+        let (_connection_tx, connection_rx) = watch::channel(ConnectionStatus::Connected);
+        let state = ApiState::new(mirror, connection_rx);
+        let token = state.sessions().issue(
+            crate::api::auth::Scope::Ui,
+            crate::api::auth::PeerIdentity {
+                uid: crate::api::auth::daemon_uid(),
+                pid: Some(std::process::id()),
+            },
+            Duration::from_millis(100),
+        );
+        let events = state.events();
+        let server = api::start(&paths, state).await.unwrap();
+        (temp, server, BridgeClient::new(paths.socket), token, events)
+    }
+
     #[tokio::test]
     async fn typed_client_uses_the_protected_uds_api_and_parses_events() {
         let (_temp, server, bridge, events) = paired_server().await;
@@ -673,17 +709,24 @@ mod server_tests {
         );
 
         let mut stream = ui.events().await.unwrap();
+        let ready = stream.next().await.unwrap().unwrap();
+        assert_eq!(ready.name, crate::client::events::CONTINUITY_READY_EVENT);
+        let ready_continuity = ready.continuity().unwrap();
+        let snapshot = ui.continuity().await.unwrap();
+        assert_eq!(snapshot.instance_id, ready_continuity.instance_id);
+        assert!(snapshot.watermark >= ready_continuity.watermark);
         events.publish_ui(
             "connection.status",
             serde_json::json!({"connection":"connected"}),
         );
+        let event = stream.next().await.unwrap().unwrap();
+        assert_eq!(event.name, "connection.status");
+        assert_eq!(event.data["connection"], "connected");
         assert_eq!(
-            stream.next().await.unwrap().unwrap(),
-            crate::client::events::BridgeEvent {
-                name: "connection.status".into(),
-                data: serde_json::json!({"connection":"connected"}),
-            }
+            event.continuity().unwrap().instance_id,
+            snapshot.instance_id
         );
+        assert!(event.continuity().unwrap().watermark > snapshot.watermark);
         drop(stream);
         server.shutdown().await.unwrap();
     }
@@ -1131,6 +1174,7 @@ mod server_tests {
         let (_temp, server, bridge, token, _events) = agent_server().await;
         for path in [
             "/v1/me",
+            "/v1/ui/continuity",
             "/v1/teams/team-1",
             "/v1/messages/missing-parent",
             "/v1/messages/missing-parent/thread",
@@ -1158,6 +1202,26 @@ mod server_tests {
     }
 
     #[tokio::test]
+    async fn expired_ui_event_session_gets_terminal_event_then_closes() {
+        let (_temp, server, bridge, token, events) = expiring_ui_server().await;
+        let mut stream = crate::client::events::EventStream::connect(bridge, &token)
+            .await
+            .unwrap();
+        let ready = stream.next().await.unwrap().unwrap();
+        assert_eq!(ready.name, crate::client::events::CONTINUITY_READY_EVENT);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        events.publish_ui("room.resync", serde_json::json!({"roomId":"room-1"}));
+        let expired = stream.next().await.unwrap().unwrap();
+        assert!(expired.is_session_expired());
+        events.publish_ui("room.resync", serde_json::json!({"roomId":"room-1"}));
+        assert!(tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("expired stream should close")
+            .is_none());
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn broadcast_lag_requires_a_metadata_only_ui_resync() {
         let (_temp, server, bridge, events) = paired_server().await;
         let ui = bridge
@@ -1165,6 +1229,7 @@ mod server_tests {
             .await
             .unwrap();
         let mut stream = ui.events().await.unwrap();
+        let _ready = stream.next().await.unwrap().unwrap();
 
         // Do not poll the subscription while overflowing the daemon's bounded
         // fanout. The next item must make loss explicit, not silently skip it.
@@ -1178,7 +1243,10 @@ mod server_tests {
             .expect("lag signal should parse");
         assert!(event.requires_resync());
         assert_eq!(event.name, crate::client::events::RESYNC_REQUIRED_EVENT);
-        assert_eq!(event.data, serde_json::json!({"reason":"event_lag"}));
+        assert_eq!(event.data["reason"], "event_lag");
+        assert!(event.data["instanceId"].is_string());
+        assert!(event.data["watermark"].is_u64());
+        assert!(event.continuity().is_some());
 
         drop(stream);
         server.shutdown().await.unwrap();

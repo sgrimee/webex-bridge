@@ -18,6 +18,10 @@ const MAX_EVENT_BYTES: usize = 64 * 1024;
 /// There is no replay cursor. Callers must reload their authoritative scoped
 /// state before relying on subsequent events.
 pub const RESYNC_REQUIRED_EVENT: &str = "resync.required";
+/// Initial UI-only daemon identity/watermark emitted immediately after an SSE subscription.
+pub const CONTINUITY_READY_EVENT: &str = "continuity.ready";
+/// Terminal UI stream event emitted when the session lease has elapsed.
+pub const SESSION_EXPIRED_EVENT: &str = "session.expired";
 
 /// One scope-filtered event from `GET /v1/events`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,6 +38,25 @@ impl BridgeEvent {
     #[must_use]
     pub fn requires_resync(&self) -> bool {
         self.name == RESYNC_REQUIRED_EVENT
+    }
+
+    /// Whether the daemon has terminated this subscription because its
+    /// process-bound UI session elapsed. Recreate the session and stream.
+    #[must_use]
+    pub fn is_session_expired(&self) -> bool {
+        self.name == SESSION_EXPIRED_EVENT
+    }
+
+    /// UI continuity marker carried by normal UI events, lag signals and the
+    /// initial ready event. Agent events intentionally have no such marker.
+    #[must_use]
+    pub fn continuity(&self) -> Option<crate::dto::Continuity> {
+        let value = if self.name == CONTINUITY_READY_EVENT {
+            &self.data
+        } else {
+            self.data.get("continuity").unwrap_or(&self.data)
+        };
+        serde_json::from_value(value.clone()).ok()
     }
 }
 

@@ -148,6 +148,13 @@ struct RoomMessagesQuery {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ThreadChildrenQuery {
+    before: Option<String>,
+    max: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateMessageRequest {
     room_id: String,
     parent_id: Option<String>,
@@ -496,39 +503,68 @@ async fn room_messages(
             )
         }
     };
-    // A short local page after a cursor means the UI is approaching the edge
-    // of the initial/background mirror. Hydrate exactly one older page on
-    // demand, then serve it from the encrypted mirror. A Webex failure leaves
-    // the already available local page usable offline.
+    // A short local page does not prove that Webex history is exhausted. Only
+    // a successful, bounded remote page after a local cursor can establish
+    // completeness for that cursor; callers otherwise receive an opaque
+    // continuation cursor plus an explicit partial reason.
+    let mut complete = false;
+    let mut partial_reason = if state.rest().is_some() {
+        "not_mirrored"
+    } else {
+        "offline"
+    };
     if messages.len() < max as usize {
         if let (Some(before), Some(rest)) = (query.before.as_deref(), state.rest()) {
-            if let Ok(page) = rest.messages_page(&room_id, Some(before), max).await {
-                let page = page
-                    .into_iter()
-                    .filter(|message| message.room_id.as_deref() == Some(room_id.as_str()))
-                    .collect::<Vec<_>>();
-                if !page.is_empty()
-                    && state
-                        .mirror()
-                        .with(|db| {
-                            for message in &page {
-                                db.upsert_message(message)?;
-                            }
-                            db.ui_room_messages(&room_id, query.before.as_deref(), max)
-                        })
-                        .await
-                        .map(|hydrated| messages = hydrated)
-                        .is_ok()
-                {
-                    state.events().publish_ui(
-                        "sync.progress",
-                        serde_json::json!({ "roomId": room_id, "lazyHistory": true }),
-                    );
+            match rest.messages_page(&room_id, Some(before), max).await {
+                Ok(page) => {
+                    let valid_page = page
+                        .iter()
+                        .all(|message| message.room_id.as_deref() == Some(room_id.as_str()));
+                    if valid_page
+                        && state
+                            .mirror()
+                            .with(|db| {
+                                for message in &page {
+                                    db.upsert_message(message)?;
+                                }
+                                db.ui_room_messages(&room_id, query.before.as_deref(), max)
+                            })
+                            .await
+                            .map(|hydrated| messages = hydrated)
+                            .is_ok()
+                    {
+                        if !page.is_empty() {
+                            state.events().publish_ui(
+                                "sync.progress",
+                                serde_json::json!({ "roomId": room_id, "lazyHistory": true }),
+                            );
+                        }
+                        if page.len() < max as usize && messages.len() < max as usize {
+                            complete = true;
+                        } else {
+                            partial_reason = "page_limit";
+                        }
+                    } else {
+                        partial_reason = "resource_mismatch";
+                    }
                 }
+                Err(_) => partial_reason = "remote_unavailable",
             }
         }
     }
-    Json(serde_json::json!({ "messages": messages.into_iter().map(message_dto).collect::<Vec<_>>() })).into_response()
+    if !complete && messages.len() == max as usize && state.rest().is_some() {
+        partial_reason = "page_limit";
+    }
+    let next_before = (!complete)
+        .then(|| messages.last().map(|message| message.id.clone()))
+        .flatten();
+    Json(dto::MessagePage {
+        messages: messages.into_iter().map(message_dto).collect(),
+        next_before,
+        complete,
+        partial_reason: (!complete).then(|| partial_reason.into()),
+    })
+    .into_response()
 }
 
 async fn create_message(
@@ -736,6 +772,224 @@ async fn delete_message(
     }
 }
 
+enum ResolvedThreadParent {
+    Known(crate::mirror::UiMessage),
+    Missing,
+    Unavailable,
+}
+
+fn thread_parent_dto(parent: &ResolvedThreadParent, message_id: &str) -> dto::ThreadParent {
+    match parent {
+        ResolvedThreadParent::Known(message) => dto::ThreadParent {
+            id: message.id.clone(),
+            state: message.status.clone(),
+            message: Some(message_dto(message.clone())),
+        },
+        ResolvedThreadParent::Missing => dto::ThreadParent {
+            id: message_id.into(),
+            state: "missing".into(),
+            message: None,
+        },
+        ResolvedThreadParent::Unavailable => dto::ThreadParent {
+            id: message_id.into(),
+            state: "unavailable".into(),
+            message: None,
+        },
+    }
+}
+
+async fn resolve_thread_parent(
+    state: &ApiState,
+    message_id: &str,
+) -> Result<ResolvedThreadParent, Response> {
+    match state.mirror().with(|db| db.ui_message(message_id)).await {
+        Ok(Some(message)) => return Ok(ResolvedThreadParent::Known(message)),
+        Ok(None) => {}
+        Err(_) => {
+            return Err(json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bridge_unavailable",
+                "Mirror is temporarily unavailable",
+            ))
+        }
+    }
+    let Some(rest) = state.rest() else {
+        return Ok(ResolvedThreadParent::Unavailable);
+    };
+    match rest.message(message_id).await {
+        Ok(Some(message)) if message.id.as_deref() == Some(message_id) => match state
+            .mirror()
+            .with(|db| {
+                db.upsert_message(&message)?;
+                db.ui_message(message_id)
+            })
+            .await
+        {
+            Ok(Some(message)) => Ok(ResolvedThreadParent::Known(message)),
+            _ => Err(json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bridge_unavailable",
+                "Mirror is temporarily unavailable",
+            )),
+        },
+        Ok(None) => Ok(ResolvedThreadParent::Missing),
+        Ok(Some(_)) | Err(_) => Ok(ResolvedThreadParent::Unavailable),
+    }
+}
+
+fn thread_page(
+    parent: dto::ThreadParent,
+    children: Vec<crate::mirror::UiMessage>,
+    max: u32,
+    complete: bool,
+    partial_reason: &str,
+) -> dto::ThreadChildren {
+    let next_before = (!complete && children.len() == max as usize)
+        .then(|| children.last().map(|message| message.id.clone()))
+        .flatten();
+    dto::ThreadChildren {
+        parent,
+        children: children.into_iter().map(message_dto).collect(),
+        next_before,
+        complete,
+        partial_reason: (!complete).then(|| partial_reason.into()),
+    }
+}
+
+async fn thread_parent(
+    State(state): State<ApiState>,
+    Extension(peer): Extension<auth::PeerIdentity>,
+    Path(message_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = ui_session(&state, peer, &headers) {
+        return *response;
+    }
+    if !valid_resource_id(&message_id) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Message ID is invalid",
+        );
+    }
+    match resolve_thread_parent(&state, &message_id).await {
+        Ok(parent) => Json(thread_parent_dto(&parent, &message_id)).into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn thread_children(
+    State(state): State<ApiState>,
+    Extension(peer): Extension<auth::PeerIdentity>,
+    Path(message_id): Path<String>,
+    Query(query): Query<ThreadChildrenQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = ui_session(&state, peer, &headers) {
+        return *response;
+    }
+    if !valid_resource_id(&message_id)
+        || query
+            .before
+            .as_deref()
+            .is_some_and(|value| !valid_resource_id(value))
+    {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Message cursor is invalid",
+        );
+    }
+    let max = query.max.unwrap_or(50);
+    let mut children = match state
+        .mirror()
+        .with(|db| db.ui_message_children(&message_id, query.before.as_deref(), max))
+        .await
+    {
+        Ok(children) => children,
+        Err(error)
+            if error.to_string().contains("cursor") || error.to_string().contains("page size") =>
+        {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Message pagination is invalid",
+            )
+        }
+        Err(_) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bridge_unavailable",
+                "Mirror is temporarily unavailable",
+            )
+        }
+    };
+    let parent = match resolve_thread_parent(&state, &message_id).await {
+        Ok(parent) => parent,
+        Err(response) => return response,
+    };
+    let mut complete = false;
+    let mut partial_reason = match &parent {
+        ResolvedThreadParent::Missing => "parent_missing",
+        ResolvedThreadParent::Unavailable => "parent_unavailable",
+        ResolvedThreadParent::Known(_) if state.rest().is_some() => "not_mirrored",
+        ResolvedThreadParent::Known(_) => "offline",
+    };
+    if children.len() < max as usize {
+        if let (ResolvedThreadParent::Known(parent_message), Some(rest)) = (&parent, state.rest()) {
+            match rest
+                .children_page(
+                    &parent_message.room_id,
+                    &message_id,
+                    query.before.as_deref(),
+                    max,
+                )
+                .await
+            {
+                Ok(page) => {
+                    let valid_page = page.iter().all(|message| {
+                        message.room_id.as_deref() == Some(parent_message.room_id.as_str())
+                            && message.parent_id.as_deref() == Some(message_id.as_str())
+                    });
+                    if valid_page
+                        && state
+                            .mirror()
+                            .with(|db| {
+                                for message in &page {
+                                    db.upsert_message(message)?;
+                                }
+                                db.ui_message_children(&message_id, query.before.as_deref(), max)
+                            })
+                            .await
+                            .map(|hydrated| children = hydrated)
+                            .is_ok()
+                    {
+                        if page.len() < max as usize && children.len() < max as usize {
+                            complete = true;
+                        } else {
+                            partial_reason = "page_limit";
+                        }
+                    } else {
+                        partial_reason = "resource_mismatch";
+                    }
+                }
+                Err(_) => partial_reason = "remote_unavailable",
+            }
+        }
+    }
+    if !complete && children.len() == max as usize && state.rest().is_some() {
+        partial_reason = "page_limit";
+    }
+    Json(thread_page(
+        thread_parent_dto(&parent, &message_id),
+        children,
+        max,
+        complete,
+        partial_reason,
+    ))
+    .into_response()
+}
+
 async fn message(
     State(state): State<ApiState>,
     Extension(peer): Extension<auth::PeerIdentity>,
@@ -901,6 +1155,8 @@ pub fn router() -> Router<ApiState> {
         .route("/v1/rooms/{room_id}/membership", delete(leave_room))
         .route("/v1/rooms/{room_id}/messages", get(room_messages))
         .route("/v1/messages", post(create_message))
+        .route("/v1/messages/{message_id}/thread", get(thread_parent))
+        .route("/v1/messages/{message_id}/children", get(thread_children))
         .route(
             "/v1/messages/{message_id}",
             get(message).put(edit_message).delete(delete_message),

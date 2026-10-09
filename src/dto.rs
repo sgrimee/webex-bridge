@@ -73,6 +73,44 @@ pub struct Message {
     pub markdown: Option<String>,
 }
 
+/// One reverse-chronological room-history page. `next_before` is an opaque
+/// message ID for a subsequent request. A false `complete` means the mirror
+/// may contain only a prefix of the remote room history.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagePage {
+    pub messages: Vec<Message>,
+    pub next_before: Option<String>,
+    pub complete: bool,
+    /// Stable reason for a false `complete`, or `None` when complete.
+    pub partial_reason: Option<String>,
+}
+
+/// A canonical thread parent or an explicit placeholder when it cannot be
+/// read from the mirror/Webex. `state` is one of `active`, `deleted`,
+/// `missing`, or `unavailable`; only the first two carry `message`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadParent {
+    pub id: String,
+    pub state: String,
+    pub message: Option<Message>,
+}
+
+/// One reverse-chronological thread-reply page. `next_before` is an opaque
+/// reply ID for a subsequent request. A false `complete` means the caller must
+/// not infer that a short page exhausts the remote thread.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadChildren {
+    pub parent: ThreadParent,
+    pub children: Vec<Message>,
+    pub next_before: Option<String>,
+    pub complete: bool,
+    /// Stable reason for a false `complete`, or `None` when complete.
+    pub partial_reason: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +136,50 @@ mod tests {
                 "lastActivity": "2026-10-09T12:00:00Z",
                 "isMember": true,
                 "isLocked": null,
+            })
+        );
+    }
+
+    #[test]
+    fn message_page_wire_contract_keeps_partial_history_explicit() {
+        let page = MessagePage {
+            messages: Vec::new(),
+            next_before: None,
+            complete: false,
+            partial_reason: Some("not_mirrored".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(page).unwrap(),
+            serde_json::json!({
+                "messages": [],
+                "nextBefore": null,
+                "complete": false,
+                "partialReason": "not_mirrored"
+            })
+        );
+    }
+
+    #[test]
+    fn thread_children_wire_contract_keeps_placeholders_and_completeness_explicit() {
+        let page = ThreadChildren {
+            parent: ThreadParent {
+                id: "parent-1".into(),
+                state: "unavailable".into(),
+                message: None,
+            },
+            children: Vec::new(),
+            next_before: None,
+            complete: false,
+            partial_reason: Some("parent_unavailable".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(page).unwrap(),
+            serde_json::json!({
+                "parent": {"id": "parent-1", "state": "unavailable", "message": null},
+                "children": [],
+                "nextBefore": null,
+                "complete": false,
+                "partialReason": "parent_unavailable"
             })
         );
     }

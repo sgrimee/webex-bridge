@@ -4,18 +4,14 @@ use super::{events::EventStream, path_segment, BridgeClient, Result};
 use hyper::Method;
 use serde::{Deserialize, Serialize};
 
-pub use crate::dto::{Message, Person, Room, Status, SyncStatus, Team};
+pub use crate::dto::{
+    Message, MessagePage, Person, Room, Status, SyncStatus, Team, ThreadChildren, ThreadParent,
+};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RoomsResponse {
     rooms: Vec<Room>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct MessagesResponse {
-    messages: Vec<Message>,
 }
 
 #[derive(Serialize)]
@@ -170,14 +166,14 @@ impl UiClient {
         BridgeClient::empty(response).await
     }
 
-    /// Read one reverse-chronological local page. When the daemon is online,
-    /// it may hydrate one older page before returning this result.
-    pub async fn room_messages(
+    /// Read one reverse-chronological room-history page with an honest
+    /// completeness signal. `next_before` stays opaque to the UI.
+    pub async fn room_messages_page(
         &self,
         room_id: &str,
         before: Option<&str>,
         max: Option<u32>,
-    ) -> Result<Vec<Message>> {
+    ) -> Result<MessagePage> {
         let mut path = format!("/v1/rooms/{}/messages", path_segment(room_id));
         let mut query = Vec::new();
         if let Some(before) = before {
@@ -194,9 +190,66 @@ impl UiClient {
             .bridge
             .request(Method::GET, &path, Some(&self.token), None)
             .await?;
-        Ok(BridgeClient::json::<MessagesResponse>(response)
+        BridgeClient::json(response).await
+    }
+
+    /// Compatibility convenience for callers that do not yet consume page
+    /// cursors/completeness. New UI projection code should use
+    /// [`Self::room_messages_page`].
+    pub async fn room_messages(
+        &self,
+        room_id: &str,
+        before: Option<&str>,
+        max: Option<u32>,
+    ) -> Result<Vec<Message>> {
+        Ok(self
+            .room_messages_page(room_id, before, max)
             .await?
             .messages)
+    }
+
+    /// Resolve one canonical thread parent. A cache miss may hydrate exactly
+    /// that parent through the daemon; `missing` and `unavailable` are normal
+    /// explicit placeholders rather than reasons to discard mirrored replies.
+    pub async fn thread_parent(&self, message_id: &str) -> Result<ThreadParent> {
+        let response = self
+            .bridge
+            .request(
+                Method::GET,
+                &format!("/v1/messages/{}/thread", path_segment(message_id)),
+                Some(&self.token),
+                None,
+            )
+            .await?;
+        BridgeClient::json(response).await
+    }
+
+    /// Read one bounded reverse-chronological reply page. `next_before` is an
+    /// opaque reply cursor; a false `complete` means a short local page does
+    /// not prove the thread is exhausted.
+    pub async fn thread_children(
+        &self,
+        parent_id: &str,
+        before: Option<&str>,
+        max: Option<u32>,
+    ) -> Result<ThreadChildren> {
+        let mut path = format!("/v1/messages/{}/children", path_segment(parent_id));
+        let mut query = Vec::new();
+        if let Some(before) = before {
+            query.push(format!("before={}", path_segment(before)));
+        }
+        if let Some(max) = max {
+            query.push(format!("max={max}"));
+        }
+        if !query.is_empty() {
+            path.push('?');
+            path.push_str(&query.join("&"));
+        }
+        let response = self
+            .bridge
+            .request(Method::GET, &path, Some(&self.token), None)
+            .await?;
+        BridgeClient::json(response).await
     }
 
     /// Read one canonical message or deletion tombstone.
@@ -310,7 +363,7 @@ mod server_tests {
     use tokio::sync::watch;
     use tokio_stream::StreamExt;
     use wiremock::{
-        matchers::{method, path},
+        matchers::{method, path, query_param},
         Mock, MockServer, ResponseTemplate,
     };
 
@@ -339,7 +392,7 @@ mod server_tests {
         (temp, server, BridgeClient::new(paths.socket), events)
     }
 
-    async fn hydrated_team_server(
+    async fn hydrated_rest_server(
         rest: Arc<crate::sync::history::WebexRest>,
     ) -> (tempfile::TempDir, api::ApiServer, BridgeClient) {
         let temp = tempfile::tempdir().unwrap();
@@ -360,6 +413,51 @@ mod server_tests {
             rest_rx,
         );
         let server = api::start(&paths, state).await.unwrap();
+        (temp, server, BridgeClient::new(paths.socket))
+    }
+
+    async fn offline_thread_server() -> (tempfile::TempDir, api::ApiServer, BridgeClient) {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(temp.path().join("bridge"));
+        let mirror = SharedMirror::new(Mirror::in_memory([46_u8; 32]).unwrap());
+        let secret = "a-local-ui-secret-that-is-long-enough";
+        let hash = URL_SAFE_NO_PAD.encode(Sha256::digest(secret.as_bytes()));
+        mirror
+            .with(|db| {
+                db.pair_ui_client(&hash, "/test/webex-tui")?;
+                db.upsert_message(&webex::Message {
+                    id: Some("deleted-parent".into()),
+                    room_id: Some("room-1".into()),
+                    created: Some("2026-10-08T12:00:00Z".into()),
+                    text: Some("private deleted parent".into()),
+                    ..webex::Message::default()
+                })?;
+                db.mark_deleted("room-1", "deleted-parent")?;
+                for (id, parent_id, created) in [
+                    ("orphan-reply", "missing-parent", "2026-10-08T12:01:00Z"),
+                    (
+                        "deleted-parent-reply",
+                        "deleted-parent",
+                        "2026-10-08T12:02:00Z",
+                    ),
+                ] {
+                    db.upsert_message(&webex::Message {
+                        id: Some(id.into()),
+                        room_id: Some("room-1".into()),
+                        parent_id: Some(parent_id.into()),
+                        created: Some(created.into()),
+                        text: Some("private reply".into()),
+                        ..webex::Message::default()
+                    })?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (_connection_tx, connection_rx) = watch::channel(ConnectionStatus::Disconnected);
+        let server = api::start(&paths, ApiState::new(mirror, connection_rx))
+            .await
+            .unwrap();
         (temp, server, BridgeClient::new(paths.socket))
     }
 
@@ -452,6 +550,150 @@ mod server_tests {
     }
 
     #[tokio::test]
+    async fn thread_parent_and_children_hydrate_once_with_explicit_page_state() {
+        let room_id =
+            "Y2lzY29zcGFyazovL3VzL1JPT00vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBhMDAx";
+        let parent_id =
+            "Y2lzY29zcGFyazovL3VzL01FU1NBR0UvMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBjMDAz";
+        let child_id =
+            "Y2lzY29zcGFyazovL3VzL01FU1NBR0UvMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBjMDA0";
+        let remote = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/messages/{parent_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": parent_id,
+                "roomId": room_id,
+                "created": "2026-10-08T12:00:00Z",
+                "text": "private parent"
+            })))
+            .expect(1)
+            .mount(&remote)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/messages"))
+            .and(query_param("roomId", room_id))
+            .and(query_param("parentId", parent_id))
+            .and(query_param("max", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [{
+                    "id": child_id,
+                    "roomId": room_id,
+                    "parentId": parent_id,
+                    "created": "2026-10-08T12:01:00Z",
+                    "text": "private child"
+                }]
+            })))
+            .expect(1)
+            .mount(&remote)
+            .await;
+        let rest = Arc::new(
+            crate::sync::history::WebexRest::for_tests(
+                reqwest::Url::parse(&format!("{}/v1/", remote.uri())).unwrap(),
+            )
+            .unwrap(),
+        );
+        let (_temp, server, bridge) = hydrated_rest_server(rest).await;
+        let ui = bridge
+            .create_ui_session("a-local-ui-secret-that-is-long-enough")
+            .await
+            .unwrap();
+        let parent = ui.thread_parent(parent_id).await.unwrap();
+        assert_eq!(parent.state, "active");
+        assert_eq!(parent.message.as_ref().unwrap().room_id, room_id);
+        let page = ui.thread_children(parent_id, None, Some(2)).await.unwrap();
+        assert_eq!(page.parent.state, "active");
+        assert_eq!(
+            page.parent.message.as_ref().unwrap().room_id,
+            room_id,
+            "the parent retains canonical room ownership"
+        );
+        assert_eq!(page.children[0].id, child_id);
+        assert_eq!(page.children[0].room_id, room_id);
+        assert!(page.complete);
+        assert_eq!(page.next_before, None);
+        assert_eq!(page.partial_reason, None);
+        // The second point read is mirror-backed; the REST parent fixture permits one call.
+        assert_eq!(ui.thread_parent(parent_id).await.unwrap().state, "active");
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn thread_parent_reports_a_remote_missing_placeholder() {
+        let parent_id =
+            "Y2lzY29zcGFyazovL3VzL01FU1NBR0UvMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBjMDAz";
+        let remote = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/messages/{parent_id}")))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&remote)
+            .await;
+        let rest = Arc::new(
+            crate::sync::history::WebexRest::for_tests(
+                reqwest::Url::parse(&format!("{}/v1/", remote.uri())).unwrap(),
+            )
+            .unwrap(),
+        );
+        let (_temp, server, bridge) = hydrated_rest_server(rest).await;
+        let ui = bridge
+            .create_ui_session("a-local-ui-secret-that-is-long-enough")
+            .await
+            .unwrap();
+        assert_eq!(
+            ui.thread_parent(parent_id).await.unwrap(),
+            ThreadParent {
+                id: parent_id.into(),
+                state: "missing".into(),
+                message: None,
+            }
+        );
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn offline_missing_parent_remains_a_placeholder_without_hiding_replies() {
+        let (_temp, server, bridge) = offline_thread_server().await;
+        let ui = bridge
+            .create_ui_session("a-local-ui-secret-that-is-long-enough")
+            .await
+            .unwrap();
+        let page = ui
+            .thread_children("missing-parent", None, Some(10))
+            .await
+            .unwrap();
+        assert_eq!(page.parent.state, "unavailable");
+        assert!(page.parent.message.is_none());
+        assert_eq!(page.children.len(), 1);
+        assert_eq!(page.children[0].id, "orphan-reply");
+        assert!(!page.complete);
+        assert_eq!(page.partial_reason.as_deref(), Some("parent_unavailable"));
+        let history = ui
+            .room_messages_page("room-1", None, Some(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            history
+                .messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["deleted-parent-reply", "orphan-reply"]
+        );
+        assert!(!history.complete);
+        assert_eq!(history.partial_reason.as_deref(), Some("offline"));
+        assert_eq!(history.next_before.as_deref(), Some("orphan-reply"));
+        let deleted = ui
+            .thread_children("deleted-parent", None, Some(10))
+            .await
+            .unwrap();
+        assert_eq!(deleted.parent.state, "deleted");
+        assert_eq!(deleted.children[0].id, "deleted-parent-reply");
+        assert!(!deleted.complete);
+        assert_eq!(deleted.partial_reason.as_deref(), Some("offline"));
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn team_cache_miss_hydrates_once_and_inaccessible_team_is_a_fallback() {
         let team_id =
             "Y2lzY29zcGFyazovL3VzL1RFQU0vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDEx";
@@ -472,7 +714,7 @@ mod server_tests {
             )
             .unwrap(),
         );
-        let (_temp, server, bridge) = hydrated_team_server(rest).await;
+        let (_temp, server, bridge) = hydrated_rest_server(rest).await;
         let ui = bridge
             .create_ui_session("a-local-ui-secret-that-is-long-enough")
             .await
@@ -504,7 +746,7 @@ mod server_tests {
             )
             .unwrap(),
         );
-        let (_temp, server, bridge) = hydrated_team_server(rest).await;
+        let (_temp, server, bridge) = hydrated_rest_server(rest).await;
         let ui = bridge
             .create_ui_session("a-local-ui-secret-that-is-long-enough")
             .await
@@ -556,6 +798,33 @@ mod server_tests {
                 ..
             } if code == "identity_not_ready"
         ));
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_scope_cannot_reach_ui_thread_reads_or_hydration() {
+        let (_temp, server, bridge, token, _events) = agent_server().await;
+        for path in [
+            "/v1/me",
+            "/v1/teams/team-1",
+            "/v1/messages/missing-parent/children",
+        ] {
+            let response = bridge
+                .request(Method::GET, path, Some(&token), None)
+                .await
+                .unwrap();
+            let error = BridgeClient::json::<serde_json::Value>(response)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                crate::client::ClientError::Api {
+                    status: hyper::StatusCode::FORBIDDEN,
+                    code,
+                    ..
+                } if code == "forbidden_scope"
+            ));
+        }
         server.shutdown().await.unwrap();
     }
 

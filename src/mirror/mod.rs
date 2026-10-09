@@ -930,6 +930,68 @@ impl Mirror {
             .collect()
     }
 
+    /// List one reverse-chronological page of active replies to one canonical
+    /// parent. A cursor must itself be an active reply to that same parent;
+    /// the caller cannot use a room-history cursor to scan another thread.
+    pub fn ui_message_children(
+        &self,
+        parent_id: &str,
+        before_message_id: Option<&str>,
+        max: u32,
+    ) -> Result<Vec<UiMessage>> {
+        if !(1..=100).contains(&max) {
+            bail!("Mirror message page size must be 1..=100");
+        }
+        let before = before_message_id
+            .map(|message_id| {
+                self.conn
+                    .query_row(
+                        "SELECT created_at,message_id FROM messages
+                         WHERE message_id=?1 AND parent_id=?2 AND status='active'
+                         ORDER BY revision DESC LIMIT 1",
+                        params![message_id, parent_id],
+                        |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()?
+                    .context("Message cursor is not a reply in this thread")
+            })
+            .transpose()?;
+        let mut statement = if before.is_some() {
+            self.conn.prepare(
+                "SELECT message_id FROM messages AS m
+                 WHERE parent_id=?1 AND status='active'
+                   AND revision=(SELECT MAX(revision) FROM messages WHERE message_id=m.message_id)
+                   AND (created_at < ?2 OR (created_at = ?2 AND message_id < ?3))
+                 ORDER BY created_at DESC,message_id DESC LIMIT ?4",
+            )?
+        } else {
+            self.conn.prepare(
+                "SELECT message_id FROM messages AS m
+                 WHERE parent_id=?1 AND status='active'
+                   AND revision=(SELECT MAX(revision) FROM messages WHERE message_id=m.message_id)
+                 ORDER BY created_at DESC,message_id DESC LIMIT ?2",
+            )?
+        };
+        let ids = if let Some((created_at, id)) = before {
+            let created_at = created_at.context("Message cursor has no creation time")?;
+            statement
+                .query_map(params![parent_id, created_at, id, max], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            statement
+                .query_map(params![parent_id, max], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        ids.into_iter()
+            .map(|id| {
+                self.ui_message_row(&id, None)?
+                    .context("Canonical mirror reply disappeared during read")
+            })
+            .collect()
+    }
+
     fn ui_message_row(
         &self,
         message_id: &str,
@@ -1611,6 +1673,38 @@ mod tests {
         );
         assert!(mirror
             .ui_room_messages("room-1", Some("missing"), 2)
+            .is_err());
+    }
+
+    #[test]
+    fn ui_thread_children_are_parent_scoped_and_cursor_validated() {
+        let mut mirror = Mirror::in_memory([17_u8; 32]).unwrap();
+        mirror
+            .upsert_message(&message("parent", "root", None))
+            .unwrap();
+        for (id, created) in [
+            ("reply-1", "2026-10-08T12:01:00Z"),
+            ("reply-2", "2026-10-08T12:02:00Z"),
+            ("other", "2026-10-08T12:03:00Z"),
+        ] {
+            let mut reply = message(id, id, None);
+            reply.created = Some(created.into());
+            reply.parent_id = (id != "other").then(|| "parent".into());
+            mirror.upsert_message(&reply).unwrap();
+        }
+        let replies = mirror.ui_message_children("parent", None, 1).unwrap();
+        assert_eq!(replies[0].id, "reply-2");
+        assert_eq!(
+            mirror
+                .ui_message_children("parent", Some("reply-2"), 10)
+                .unwrap()
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["reply-1"]
+        );
+        assert!(mirror
+            .ui_message_children("parent", Some("other"), 10)
             .is_err());
     }
 

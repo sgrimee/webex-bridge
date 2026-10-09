@@ -168,6 +168,44 @@ impl WebexRest {
             .collect()
     }
 
+    /// List one bounded reverse-chronological page of replies to a canonical
+    /// parent in its verified room. This is deliberately a parent-scoped query,
+    /// not a room-history scan.
+    pub async fn children_page(
+        &self,
+        room_id: &str,
+        parent_id: &str,
+        before_message: Option<&str>,
+        max: u32,
+    ) -> Result<Vec<Message>> {
+        let _ = GlobalId::new(GlobalIdType::Room, room_id.to_owned())?;
+        let _ = GlobalId::new(GlobalIdType::Message, parent_id.to_owned())?;
+        if !(1..=100).contains(&max) {
+            bail!("Webex message page size must be 1..=100");
+        }
+        let mut url = self.endpoint("messages", None)?;
+        url.query_pairs_mut()
+            .append_pair("roomId", room_id)
+            .append_pair("parentId", parent_id)
+            .append_pair("max", &max.to_string());
+        if let Some(before) = before_message {
+            let _ = GlobalId::new(GlobalIdType::Message, before.to_owned())?;
+            url.query_pairs_mut().append_pair("beforeMessage", before);
+        }
+        let response = self
+            .get(url)
+            .await?
+            .context("Webex thread reply list returned 404")?;
+        let page = response
+            .json::<Page<serde_json::Value>>()
+            .await
+            .context("Invalid Webex thread reply response")?;
+        page.items
+            .into_iter()
+            .map(Self::decode_mirror_message)
+            .collect()
+    }
+
     async fn write_message<B: Serialize>(
         &self,
         method: Method,
@@ -443,7 +481,7 @@ mod tests {
         Arc,
     };
     use wiremock::{
-        matchers::{method, path},
+        matchers::{method, path, query_param},
         Mock, MockServer, ResponseTemplate,
     };
 
@@ -599,6 +637,38 @@ mod tests {
         let rest =
             WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
         rest.leave_room(room).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn children_page_is_parent_scoped_and_bounded() {
+        let server = MockServer::start().await;
+        let room = "Y2lzY29zcGFyazovL3VzL1JPT00vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBhMDAx";
+        let parent =
+            "Y2lzY29zcGFyazovL3VzL01FU1NBR0UvMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBjMDAz";
+        let child =
+            "Y2lzY29zcGFyazovL3VzL01FU1NBR0UvMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBjMDA0";
+        Mock::given(method("GET"))
+            .and(path("/v1/messages"))
+            .and(query_param("roomId", room))
+            .and(query_param("parentId", parent))
+            .and(query_param("max", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [{
+                    "id": child,
+                    "roomId": room,
+                    "parentId": parent,
+                    "created": "2026-10-08T12:01:00Z",
+                    "text": "private reply"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rest =
+            WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
+        let page = rest.children_page(room, parent, None, 2).await.unwrap();
+        assert_eq!(page[0].id.as_deref(), Some(child));
+        assert_eq!(page[0].parent_id.as_deref(), Some(parent));
     }
 
     #[tokio::test]

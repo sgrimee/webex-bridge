@@ -9,7 +9,7 @@ description = "Local Webex mirror and scoped agent channel"
 [features]
 default = ["server"]
 server = []
-client = []
+client = ["dep:http-body-util", "dep:hyperlocal", "hyper-util/client-legacy"]
 # Requires a properly signed macOS app with Keychain access-group entitlement.
 # Unsigned CLI/daemon builds use the login Keychain instead.
 biometric-keychain = ["dep:security-framework"]
@@ -25,6 +25,8 @@ fs2 = "0.4"
 gethostname = "1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+http-body-util = { version = "0.1", optional = true }
+hyperlocal = { version = "0.9", optional = true }
 keyring = { version = "3.6.3", features = ["apple-native"] }
 libc = "0.2"
 oauth2 = { version = "5", default-features = false, features = ["reqwest", "rustls-tls"] }

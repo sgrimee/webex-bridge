@@ -332,6 +332,7 @@ mod tests {
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use sha2::{Digest, Sha256};
+    use std::time::Duration;
     use tokio::sync::watch;
     use tokio_stream::StreamExt;
 
@@ -357,6 +358,35 @@ mod tests {
         (temp, server, BridgeClient::new(paths.socket), events)
     }
 
+    async fn agent_server() -> (
+        tempfile::TempDir,
+        api::ApiServer,
+        BridgeClient,
+        String,
+        EventBus,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(temp.path().join("bridge"));
+        let mirror = SharedMirror::new(Mirror::in_memory([43_u8; 32]).unwrap());
+        let (_connection_tx, connection_rx) = watch::channel(ConnectionStatus::Connected);
+        let state = ApiState::new(mirror, connection_rx);
+        let token = state
+            .sessions()
+            .issue_agent(
+                crate::api::auth::PeerIdentity {
+                    uid: crate::api::auth::daemon_uid(),
+                    pid: Some(std::process::id()),
+                },
+                "test-agent".into(),
+                vec!["route-a".into()],
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        let events = state.events();
+        let server = api::start(&paths, state).await.unwrap();
+        (temp, server, BridgeClient::new(paths.socket), token, events)
+    }
+
     #[tokio::test]
     async fn typed_client_uses_the_protected_uds_api_and_parses_events() {
         let (_temp, server, bridge, events) = paired_server().await;
@@ -380,6 +410,59 @@ mod tests {
                 data: serde_json::json!({"connection":"connected"}),
             }
         );
+        drop(stream);
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn broadcast_lag_requires_a_metadata_only_ui_resync() {
+        let (_temp, server, bridge, events) = paired_server().await;
+        let ui = bridge
+            .create_ui_session("a-local-ui-secret-that-is-long-enough")
+            .await
+            .unwrap();
+        let mut stream = ui.events().await.unwrap();
+
+        // Do not poll the subscription while overflowing the daemon's bounded
+        // fanout. The next item must make loss explicit, not silently skip it.
+        for sequence in 0..300 {
+            events.publish_ui("message.updated", serde_json::json!({"sequence": sequence}));
+        }
+        let event = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("lag signal should arrive")
+            .expect("stream should stay open")
+            .expect("lag signal should parse");
+        assert!(event.requires_resync());
+        assert_eq!(event.name, crate::client::events::RESYNC_REQUIRED_EVENT);
+        assert_eq!(event.data, serde_json::json!({"reason":"event_lag"}));
+
+        drop(stream);
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn broadcast_lag_requires_a_metadata_only_agent_resync() {
+        let (_temp, server, bridge, token, events) = agent_server().await;
+        let mut stream = crate::client::events::EventStream::connect(bridge, &token)
+            .await
+            .unwrap();
+
+        for sequence in 0..300 {
+            events.publish_agent_route(
+                "route-a",
+                "inbox.new",
+                serde_json::json!({"sequence": sequence}),
+            );
+        }
+        let event = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("lag signal should arrive")
+            .expect("stream should stay open")
+            .expect("lag signal should parse");
+        assert!(event.requires_resync());
+        assert_eq!(event.data, serde_json::json!({"reason":"event_lag"}));
+
         drop(stream);
         server.shutdown().await.unwrap();
     }

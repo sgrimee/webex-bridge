@@ -13,6 +13,12 @@ use tokio_stream::Stream;
 
 const MAX_EVENT_BYTES: usize = 64 * 1024;
 
+/// Event name sent when the daemon's bounded fanout dropped one or more events.
+///
+/// There is no replay cursor. Callers must reload their authoritative scoped
+/// state before relying on subsequent events.
+pub const RESYNC_REQUIRED_EVENT: &str = "resync.required";
+
 /// One scope-filtered event from `GET /v1/events`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BridgeEvent {
@@ -20,6 +26,15 @@ pub struct BridgeEvent {
     pub name: String,
     /// Metadata-only JSON payload. Message text is never present in this stream.
     pub data: Value,
+}
+
+impl BridgeEvent {
+    /// Whether this event requires a full scoped-state refresh before applying
+    /// later events. The daemon cannot replay its bounded SSE fanout.
+    #[must_use]
+    pub fn requires_resync(&self) -> bool {
+        self.name == RESYNC_REQUIRED_EVENT
+    }
 }
 
 /// A live, parsed SSE response. Dropping it closes only this subscription.

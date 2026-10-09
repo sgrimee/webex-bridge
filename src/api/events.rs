@@ -16,9 +16,14 @@ use axum::{
 use serde_json::{json, Value};
 use std::{convert::Infallible, time::Duration};
 use tokio::sync::broadcast;
-use tokio_stream::{wrappers::BroadcastStream, StreamExt};
+use tokio_stream::{
+    wrappers::{errors::BroadcastStreamRecvError, BroadcastStream},
+    StreamExt,
+};
 
 const EVENT_QUEUE_CAPACITY: usize = 256;
+const RESYNC_REQUIRED_EVENT: &str = "resync.required";
+const EVENT_LAG_REASON: &str = "event_lag";
 
 #[derive(Clone, Debug)]
 enum Audience {
@@ -50,6 +55,15 @@ impl Audience {
                 route_ids.iter().any(|owned| owned == route_id)
             }
             _ => false,
+        }
+    }
+}
+
+impl Subscriber {
+    const fn required_scope(&self) -> auth::Scope {
+        match self {
+            Self::Ui => auth::Scope::Ui,
+            Self::Agent { .. } => auth::Scope::Agent,
         }
     }
 }
@@ -172,24 +186,26 @@ async fn stream(
     let sessions = state.sessions();
     let receiver = state.events().subscribe();
     let stream = BroadcastStream::new(receiver).filter_map(move |received| {
-        let event = received.ok()?;
+        // A lag signal is itself scoped output, so it receives the same
+        // per-item lease and peer revalidation as normal events.
         if sessions
-            .authorize(
-                Some(&token),
-                match subscriber {
-                    Subscriber::Ui => auth::Scope::Ui,
-                    Subscriber::Agent { .. } => auth::Scope::Agent,
-                },
-                peer,
-            )
+            .authorize(Some(&token), subscriber.required_scope(), peer)
             .is_err()
-            || !event.audience.permits(&subscriber)
         {
             return None;
         }
-        Some(Ok::<SseEvent, Infallible>(
-            SseEvent::default().event(event.name).data(event.data),
-        ))
+        match received {
+            Ok(event) if event.audience.permits(&subscriber) => Some(Ok::<SseEvent, Infallible>(
+                SseEvent::default().event(event.name).data(event.data),
+            )),
+            // The broadcast channel intentionally has no replay. Make loss
+            // explicit for both scopes so their hosts reload their authorized
+            // state rather than silently applying a partial event sequence.
+            Err(BroadcastStreamRecvError::Lagged(_)) => Some(Ok(SseEvent::default()
+                .event(RESYNC_REQUIRED_EVENT)
+                .data(format!(r#"{{"reason":"{EVENT_LAG_REASON}"}}"#)))),
+            Ok(_) => None,
+        }
     });
     Sse::new(stream)
         .keep_alive(

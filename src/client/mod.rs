@@ -57,6 +57,24 @@ impl fmt::Display for ClientError {
 
 impl std::error::Error for ClientError {}
 
+impl ClientError {
+    /// Whether the daemon accepted a write but cannot confirm local delivery.
+    ///
+    /// Callers must refresh the local mirror instead of retrying the write:
+    /// the remote Webex operation may already have succeeded.
+    #[must_use]
+    pub fn is_delivery_unknown(&self) -> bool {
+        matches!(
+            self,
+            Self::Api {
+                status: StatusCode::ACCEPTED,
+                code,
+                ..
+            } if code == "delivery_unknown"
+        )
+    }
+}
+
 pub(crate) type Result<T> = std::result::Result<T, ClientError>;
 
 #[derive(serde::Deserialize)]
@@ -126,6 +144,47 @@ impl BridgeClient {
             .map_err(|error| ClientError::Transport(error.into()))
     }
 
+    fn api_error(status: StatusCode, body: &[u8]) -> ClientError {
+        let error = serde_json::from_slice::<ErrorResponse>(body).unwrap_or(ErrorResponse {
+            code: "bridge_error".into(),
+            message: "Bridge returned an invalid error response".into(),
+        });
+        ClientError::Api {
+            status,
+            code: error.code,
+            message: error.message,
+        }
+    }
+
+    fn delivery_unknown(status: StatusCode, body: &[u8]) -> Option<ClientError> {
+        (status == StatusCode::ACCEPTED)
+            .then(|| Self::api_error(status, body))
+            .filter(ClientError::is_delivery_unknown)
+    }
+
+    fn decode_json<T: DeserializeOwned>(status: StatusCode, body: &[u8]) -> Result<T> {
+        if let Some(error) = Self::delivery_unknown(status, body) {
+            return Err(error);
+        }
+        if !status.is_success() {
+            return Err(Self::api_error(status, body));
+        }
+        serde_json::from_slice(body)
+            .context("Cannot decode bridge JSON")
+            .map_err(ClientError::InvalidResponse)
+    }
+
+    fn decode_empty(status: StatusCode, body: &[u8]) -> Result<()> {
+        if let Some(error) = Self::delivery_unknown(status, body) {
+            return Err(error);
+        }
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(Self::api_error(status, body))
+        }
+    }
+
     pub(crate) async fn json<T: DeserializeOwned>(response: Response<Incoming>) -> Result<T> {
         let status = response.status();
         let body = response
@@ -134,20 +193,7 @@ impl BridgeClient {
             .await
             .map_err(|error| ClientError::Transport(error.into()))?
             .to_bytes();
-        if !status.is_success() {
-            let error = serde_json::from_slice::<ErrorResponse>(&body).unwrap_or(ErrorResponse {
-                code: "bridge_error".into(),
-                message: "Bridge returned an invalid error response".into(),
-            });
-            return Err(ClientError::Api {
-                status,
-                code: error.code,
-                message: error.message,
-            });
-        }
-        serde_json::from_slice(&body)
-            .context("Cannot decode bridge JSON")
-            .map_err(ClientError::InvalidResponse)
+        Self::decode_json(status, &body)
     }
 
     pub(crate) async fn empty(response: Response<Incoming>) -> Result<()> {
@@ -158,18 +204,7 @@ impl BridgeClient {
             .await
             .map_err(|error| ClientError::Transport(error.into()))?
             .to_bytes();
-        if status.is_success() {
-            return Ok(());
-        }
-        let error = serde_json::from_slice::<ErrorResponse>(&body).unwrap_or(ErrorResponse {
-            code: "bridge_error".into(),
-            message: "Bridge returned an invalid error response".into(),
-        });
-        Err(ClientError::Api {
-            status,
-            code: error.code,
-            message: error.message,
-        })
+        Self::decode_empty(status, &body)
     }
 
     pub(crate) fn json_body<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
@@ -192,4 +227,43 @@ pub(crate) fn path_segment(value: &str) -> String {
         }
     }
     encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DELIVERY_UNKNOWN: &[u8] =
+        br#"{"code":"delivery_unknown","message":"The write may have succeeded"}"#;
+
+    #[test]
+    fn accepted_delivery_unknown_is_an_api_error_for_json_and_empty_responses() {
+        let json_error =
+            BridgeClient::decode_json::<serde_json::Value>(StatusCode::ACCEPTED, DELIVERY_UNKNOWN)
+                .unwrap_err();
+        let empty_error =
+            BridgeClient::decode_empty(StatusCode::ACCEPTED, DELIVERY_UNKNOWN).unwrap_err();
+
+        for error in [&json_error, &empty_error] {
+            assert!(error.is_delivery_unknown());
+            assert!(matches!(
+                error,
+                ClientError::Api {
+                    status: StatusCode::ACCEPTED,
+                    code,
+                    message,
+                } if code == "delivery_unknown" && message == "The write may have succeeded"
+            ));
+        }
+    }
+
+    #[test]
+    fn only_the_explicit_accepted_delivery_unknown_response_is_special() {
+        let error = BridgeClient::decode_json::<serde_json::Value>(
+            StatusCode::BAD_GATEWAY,
+            DELIVERY_UNKNOWN,
+        )
+        .unwrap_err();
+        assert!(!error.is_delivery_unknown());
+    }
 }

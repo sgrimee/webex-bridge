@@ -453,6 +453,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_bearer_cannot_bootstrap_ui_pairing_or_sessions() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(temp.path().join("bridge"));
+        let mirror = SharedMirror::new(Mirror::in_memory([98_u8; 32]).unwrap());
+        let (_connection_tx, connection_rx) = watch::channel(ConnectionStatus::Connected);
+        let mut config = Config::default();
+        config.routes.push(Route {
+            id: "agents-social".into(),
+            room_id: "room-id-is-not-returned".into(),
+            agent_name: "sam/coder".into(),
+            allowed_senders: Vec::new(),
+            receive: Receive::Addressed,
+            workspace: "/workspace".into(),
+        });
+        let server = start(
+            &paths,
+            ApiState::with_config(mirror, connection_rx, Arc::new(config)),
+        )
+        .await
+        .unwrap();
+
+        // Obtain a real, process-bound agent token via UDS. The following UI
+        // bootstrap calls must be rejected before their native-dialog or
+        // paired-secret code could be reached.
+        let agent_body = r#"{"host":"pi","sessionId":"test-session","cwd":"/workspace","agentName":"sam/coder"}"#;
+        let agent_session = request(
+            &paths.socket,
+            format!(
+                "POST /v1/agent/sessions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{agent_body}",
+                agent_body.len()
+            ),
+        )
+        .await;
+        assert!(agent_session.starts_with("HTTP/1.1 200"));
+        let token = serde_json::from_str::<serde_json::Value>(
+            agent_session.split("\r\n\r\n").nth(1).unwrap(),
+        )
+        .unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let pair_body = format!(r#"{{"secretHash":"{}"}}"#, "a".repeat(43));
+        let pair = request(
+            &paths.socket,
+            format!(
+                "POST /v1/ui/pair HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{pair_body}",
+                pair_body.len()
+            ),
+        )
+        .await;
+        assert!(pair.starts_with("HTTP/1.1 403"));
+        assert!(pair.contains("\"code\":\"forbidden_scope\""));
+        assert!(!pair.contains("pairing_denied"));
+
+        // There is deliberately no paired secret. `forbidden_scope`, rather
+        // than `auth_required`, proves the agent bearer was rejected before
+        // paired-secret lookup.
+        let session_body = format!(r#"{{"secret":"{}"}}"#, "s".repeat(32));
+        let session = request(
+            &paths.socket,
+            format!(
+                "POST /v1/ui/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{session_body}",
+                session_body.len()
+            ),
+        )
+        .await;
+        assert!(session.starts_with("HTTP/1.1 403"));
+        assert!(session.contains("\"code\":\"forbidden_scope\""));
+        assert!(!session.contains("auth_required"));
+
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn agent_inbox_keeps_text_hidden_until_the_local_acceptance() {
         let temp = tempfile::tempdir().unwrap();
         let paths = Paths::under(temp.path().join("bridge"));

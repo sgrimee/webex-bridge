@@ -59,6 +59,45 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .filter(|token| !token.is_empty())
 }
 
+/// UI bootstrap remains intentionally unauthenticated so a local UI can pair
+/// or establish its first session. A valid agent bearer is the sole exception:
+/// it must never be silently ignored and then reach pairing/secret processing.
+fn reject_agent_bootstrap_bearer(
+    state: &ApiState,
+    peer: auth::PeerIdentity,
+    headers: &HeaderMap,
+) -> Result<(), Box<Response>> {
+    let Some(token) = bearer(headers) else {
+        return Ok(());
+    };
+    match state
+        .sessions()
+        .authorize(Some(token), auth::Scope::Agent, peer)
+    {
+        Ok(()) => Err(Box::new(json_error(
+            StatusCode::FORBIDDEN,
+            "forbidden_scope",
+            "Agent sessions cannot access UI bootstrap endpoints",
+        ))),
+        // A known agent token replayed by another same-UID local process is
+        // still agent-scoped, and must not be allowed to fall through to UI
+        // pairing or paired-secret validation.
+        Err(auth::SessionError::Peer) => Err(Box::new(json_error(
+            StatusCode::FORBIDDEN,
+            "forbidden_scope",
+            "Agent sessions cannot access UI bootstrap endpoints",
+        ))),
+        // Missing, expired, malformed, and UI-scoped bearers retain the
+        // deliberately unauthenticated local bootstrap behavior.
+        Err(
+            auth::SessionError::Missing
+            | auth::SessionError::Expired
+            | auth::SessionError::Scope
+            | auth::SessionError::SessionId,
+        ) => Ok(()),
+    }
+}
+
 fn ui_session(
     state: &ApiState,
     peer: auth::PeerIdentity,
@@ -1304,8 +1343,12 @@ async fn person(
 async fn pair(
     State(state): State<ApiState>,
     Extension(peer): Extension<auth::PeerIdentity>,
+    headers: HeaderMap,
     Json(request): Json<PairRequest>,
 ) -> Response {
+    if let Err(response) = reject_agent_bootstrap_bearer(&state, peer, &headers) {
+        return *response;
+    }
     if !(43..=128).contains(&request.secret_hash.len())
         || !request
             .secret_hash
@@ -1362,8 +1405,12 @@ async fn pair(
 async fn create_session(
     State(state): State<ApiState>,
     Extension(peer): Extension<auth::PeerIdentity>,
+    headers: HeaderMap,
     Json(request): Json<CreateSessionRequest>,
 ) -> Response {
+    if let Err(response) = reject_agent_bootstrap_bearer(&state, peer, &headers) {
+        return *response;
+    }
     if !(32..=1024).contains(&request.secret.len()) {
         return json_error(
             StatusCode::BAD_REQUEST,

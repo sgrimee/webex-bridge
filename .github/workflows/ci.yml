@@ -27,3 +27,6 @@ jobs:
         working-directory: workspace/webex-bridge
       - run: cargo test
         working-directory: workspace/webex-bridge
+      - name: Check client-only TUI contract and dependency graph
+        run: ./scripts/check-client-only
+        working-directory: workspace/webex-bridge

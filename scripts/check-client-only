@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Verify the bridge-only TUI client compiles without the daemon dependency graph.
+# This command is intentionally offline-safe: it only resolves/compiles cached,
+# lockfile-pinned sources and never starts a daemon or contacts Webex.
+set -euo pipefail
+
+repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repo_root"
+
+client_features=(--locked --offline --no-default-features --features client)
+cargo check "${client_features[@]}" --lib
+cargo test "${client_features[@]}" --test client_contract
+
+# `-e normal` excludes test/build-only dependencies, and `--prefix none` makes
+# every resolved package name a stable line prefix for the exact checks below.
+graph=$(cargo tree "${client_features[@]}" -e normal --prefix none)
+for forbidden in \
+    axum \
+    base64 \
+    chacha20poly1305 \
+    chrono \
+    fs2 \
+    gethostname \
+    keyring \
+    oauth2 \
+    rand \
+    reqwest \
+    rpassword \
+    rusqlite \
+    security-framework \
+    sha2 \
+    tokio-tungstenite \
+    toml \
+    tower \
+    webbrowser \
+    webex \
+    zeroize; do
+    if grep -Eq "^${forbidden} v" <<<"$graph"; then
+        printf 'client-only dependency graph unexpectedly contains %s\n' "$forbidden" >&2
+        exit 1
+    fi
+done

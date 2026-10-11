@@ -80,6 +80,11 @@ name = "webex-bridged"
 path = "src/bin/webex-bridged.rs"
 required-features = ["server"]
 
+[[test]]
+name = "client_contract"
+path = "tests/client_contract.rs"
+required-features = ["client"]
+
 [[bin]]
 name = "webex-bridge"
 path = "src/bin/webex-bridge.rs"

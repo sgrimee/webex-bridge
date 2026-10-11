@@ -17,6 +17,10 @@ cargo clippy --all-targets -- -D warnings
 description = "Run the Rust test suite"
 run = "cargo test"
 
+[tasks."client-only"]
+description = "Check the bridge-only TUI client contract and dependency graph"
+run = "./scripts/check-client-only"
+
 [tasks.lint]
 description = "Run Clippy with warnings denied"
 run = "cargo clippy --all-targets -- -D warnings"

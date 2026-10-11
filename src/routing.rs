@@ -465,13 +465,7 @@ impl Mirror {
             None => None,
         };
         let room_title = self.display_room_title(&room_id);
-        self.conn.execute(
-            "INSERT INTO audit(ts,scope,action,ref,detail_redacted) VALUES (?1,'agent','inbox_preview',?2,NULL)",
-            params![
-                Utc::now().to_rfc3339(),
-                format!("{}:{}:{}", key.route_id, key.message_id, key.revision)
-            ],
-        )?;
+        self.audit_preview(&key)?;
         Ok(Some(DeliveryPreview {
             id: key.encode(),
             route_id: key.route_id,
@@ -630,6 +624,31 @@ impl Mirror {
             )
             .optional()?
             .is_some())
+    }
+
+    /// Record a metadata-only preview audit row, at most once per delivery per
+    /// 60 s window, so a UI that re-renders or polls cannot grow the table
+    /// without bound.
+    fn audit_preview(&self, key: &DeliveryKey) -> Result<()> {
+        let reference = format!("{}:{}:{}", key.route_id, key.message_id, key.revision);
+        let now = Utc::now();
+        let recent = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM audit
+                 WHERE scope='agent' AND action='inbox_preview' AND ref=?1 AND ts>?2",
+                params![reference, (now - Duration::minutes(1)).to_rfc3339()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if !recent {
+            self.conn.execute(
+                "INSERT INTO audit(ts,scope,action,ref,detail_redacted) VALUES (?1,'agent','inbox_preview',?2,NULL)",
+                params![now.to_rfc3339(), reference],
+            )?;
+        }
+        Ok(())
     }
 
     fn audit_filtered_once(&self, key: &DeliveryKey, reason: &str) -> Result<()> {
@@ -1011,5 +1030,40 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(accepted.markdown, "sam/coder: revised");
+    }
+
+    #[test]
+    fn preview_audit_is_deduplicated_per_minute() {
+        let config = config();
+        let mut mirror = Mirror::in_memory([13; 32]).unwrap();
+        mirror.sync_routes(&config.routes).unwrap();
+        mirror.upsert_message(&message("sam/coder: hi")).unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
+        let routes = ["r".to_string()];
+        let id = mirror.deliveries(&routes, None).unwrap()[0].id.clone();
+        let count = |mirror: &Mirror| -> i64 {
+            mirror
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM audit WHERE action='inbox_preview'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        for _ in 0..5 {
+            assert!(mirror.preview_delivery(&routes, &id).unwrap().is_some());
+        }
+        assert_eq!(count(&mirror), 1);
+        let earlier = (Utc::now() - Duration::minutes(2)).to_rfc3339();
+        mirror
+            .conn
+            .execute(
+                "UPDATE audit SET ts=?1 WHERE action='inbox_preview'",
+                [earlier],
+            )
+            .unwrap();
+        assert!(mirror.preview_delivery(&routes, &id).unwrap().is_some());
+        assert_eq!(count(&mirror), 2);
     }
 }

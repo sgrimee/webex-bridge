@@ -722,6 +722,23 @@ mod tests {
         assert_eq!(mirror.stats().unwrap().rooms, 0);
         drop(mirror);
         assert!(development_paths.mirror.exists());
+
+        // A second fake provider with a different injected key must not fall
+        // back to Keychain or re-key the existing isolated mirror.
+        let mut different_key = fixture(now);
+        different_key.insert(
+            OsString::from(ALLOWED_VARIABLES[3]),
+            OsString::from(STANDARD.encode([8_u8; 32])),
+        );
+        let different_providers = capture_from_map(&different_key, now, OAuthScope::Granular)
+            .unwrap()
+            .into_providers();
+        assert!(crate::mirror::Mirror::open_with_key_provider(
+            &development_paths,
+            &different_providers.mirror_key,
+        )
+        .is_err());
+
         assert!(!production_root.join("run").exists());
         assert!(!production_root.join("bridge.db").exists());
     }

@@ -12,6 +12,7 @@ use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
+    fs,
     path::{Path, PathBuf},
 };
 use zeroize::Zeroizing;
@@ -113,7 +114,7 @@ pub fn validate_configured_foreground(
     service_invocation: bool,
     unprivileged_same_uid: bool,
     biometric_feature_enabled: bool,
-) -> Result<()> {
+) -> Result<IsolatedRoots> {
     let dev = config
         .dev
         .as_ref()
@@ -201,13 +202,42 @@ fn valid_secret_text(value: &str, limit: usize) -> bool {
             .any(|character| character.is_whitespace() || character.is_control())
 }
 
+/// Canonical, existing directory roots approved for a future development
+/// bootstrap. Callers must use these returned paths rather than the untrusted
+/// spellings that came from arguments.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IsolatedRoots {
+    pub development: PathBuf,
+    pub production: PathBuf,
+}
+
+fn canonical_directory(path: &Path, label: &str) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!("{label} root must be absolute");
+    }
+    // `canonicalize` resolves every path component before comparison. Requiring
+    // an existing directory keeps a later bootstrap from first creating a path
+    // through an attacker-controlled symlink.
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("{label} root must already exist"))?;
+    let metadata = fs::metadata(&canonical)
+        .with_context(|| format!("Cannot inspect canonical {label} root"))?;
+    if !metadata.is_dir() {
+        bail!("{label} root must be a directory");
+    }
+    Ok(canonical)
+}
+
 fn path_overlaps(first: &Path, second: &Path) -> bool {
     first.starts_with(second) || second.starts_with(first)
 }
 
 /// Check all secret-free opt-in/lifecycle/path guards before an environment map
 /// is even inspected. It neither creates directories nor reads Keychain state.
-pub fn validate_guards(request: &GuardRequest<'_>) -> Result<()> {
+///
+/// The returned canonical roots are the only roots a future bootstrap may use.
+pub fn validate_guards(request: &GuardRequest<'_>) -> Result<IsolatedRoots> {
     if request.biometric_feature_enabled {
         bail!("development environment secrets cannot be combined with biometric Keychain mode");
     }
@@ -219,10 +249,9 @@ pub fn validate_guards(request: &GuardRequest<'_>) -> Result<()> {
     if !request.foreground_tty || request.service_invocation || !request.unprivileged_same_uid {
         bail!("development environment secrets require an unprivileged interactive foreground process");
     }
-    if !request.development_root.is_absolute() || !request.production_root.is_absolute() {
-        bail!("development and production roots must be absolute");
-    }
-    if path_overlaps(request.development_root, request.production_root) {
+    let development = canonical_directory(request.development_root, "development")?;
+    let production = canonical_directory(request.production_root, "production")?;
+    if path_overlaps(&development, &production) {
         bail!("development root must be isolated from the production root");
     }
     let room = request
@@ -241,7 +270,10 @@ pub fn validate_guards(request: &GuardRequest<'_>) -> Result<()> {
     {
         bail!("development environment secrets require routes and writes limited to the selected dev room");
     }
-    Ok(())
+    Ok(IsolatedRoots {
+        development,
+        production,
+    })
 }
 
 /// Refuse reserved development-secret variables unless the caller has already
@@ -401,6 +433,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let development = temp.path().join("development");
         let production = temp.path().join("production");
+        fs::create_dir(&development).unwrap();
+        fs::create_dir(&production).unwrap();
         assert!(validate_guards(&guard(&development, &production)).is_ok());
         let mut invalid = guard(&development, &production);
         invalid.cli_opt_in = false;
@@ -414,10 +448,36 @@ mod tests {
     }
 
     #[test]
+    fn canonical_roots_reject_symlinked_production_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let production = temp.path().join("production");
+        let development_alias = temp.path().join("development-alias");
+        fs::create_dir(&production).unwrap();
+        std::os::unix::fs::symlink(&production, &development_alias).unwrap();
+        assert!(validate_guards(&guard(&development_alias, &production)).is_err());
+    }
+
+    #[test]
+    fn accepted_roots_are_returned_canonical_for_future_use() {
+        let temp = tempfile::tempdir().unwrap();
+        let development = temp.path().join("development");
+        let development_alias = temp.path().join("development-alias");
+        let production = temp.path().join("production");
+        fs::create_dir(&development).unwrap();
+        fs::create_dir(&production).unwrap();
+        std::os::unix::fs::symlink(&development, &development_alias).unwrap();
+        let roots = validate_guards(&guard(&development_alias, &production)).unwrap();
+        assert_eq!(roots.development, development.canonicalize().unwrap());
+        assert_eq!(roots.production, production.canonicalize().unwrap());
+    }
+
+    #[test]
     fn foreground_cli_and_config_wiring_stay_secret_free() {
         let temp = tempfile::tempdir().unwrap();
         let development = temp.path().join("development");
         let production = temp.path().join("production");
+        fs::create_dir(&development).unwrap();
+        fs::create_dir(&production).unwrap();
         let options = parse_foreground_options([
             "--dev-env-secrets",
             "--dev-data-dir",

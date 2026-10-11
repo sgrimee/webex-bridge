@@ -1,14 +1,15 @@
 //! Per-user bridge daemon: Mercury live sync, encrypted local mirror and scoped local API.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::{
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::sync::watch;
 use webex_bridge::{
     api::{self, events::EventBus, ApiState, ConnectionStatus},
-    config::Config,
+    config::{Config, DevSecretSource},
     diagnostics,
     mirror::{Mirror, SharedMirror},
     paths::Paths,
@@ -19,18 +20,29 @@ use webex_bridge::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let arguments = parse_args()?;
+    // Loading an existing config is the sole production-path operation before
+    // this gate. It creates no directory and never opens Keychain, the mirror,
+    // socket, or a network connection.
+    let paths = Paths::discover()?;
+    let config = Config::load_existing(&paths)?;
+    preflight_environment_secret_source(
+        &config,
+        &arguments,
+        &paths.data,
+        BootstrapFacts::current(),
+    )?;
     let DevArgs {
         dev_room,
         debug,
         refresh_after,
         refresh_gap,
-    } = parse_args()?;
+        ..
+    } = arguments;
     if debug {
         diagnostics::enable_debug();
     }
     diagnostics::info("daemon.starting");
-    let paths = Paths::discover()?;
-    let config = Config::load(&paths)?;
     diagnostics::debug(format!(
         "daemon.config_loaded routes={} dev_mode={} dev_room_requested={}",
         config.routes.len(),
@@ -153,13 +165,96 @@ async fn main() -> Result<()> {
 
 struct DevArgs {
     dev_room: Option<String>,
+    dev_env_secrets: bool,
+    dev_data_dir: Option<PathBuf>,
     debug: bool,
     refresh_after: Option<Duration>,
     refresh_gap: Option<Duration>,
 }
 
+#[derive(Clone, Copy)]
+struct BootstrapFacts {
+    foreground_tty: bool,
+    service_invocation: bool,
+    unprivileged_same_uid: bool,
+    biometric_feature_enabled: bool,
+}
+
+impl BootstrapFacts {
+    fn current() -> Self {
+        // Environment-secret mode remains unavailable until every provider is
+        // isolated, but collect only non-secret invocation facts so its guard
+        // can never be bypassed if that mode is enabled later.
+        Self {
+            foreground_tty: std::io::IsTerminal::is_terminal(&std::io::stdin())
+                && std::io::IsTerminal::is_terminal(&std::io::stdout()),
+            // A non-interactive invocation is treated as service-managed. This
+            // deliberately fails closed rather than trying to infer launchd.
+            service_invocation: !(std::io::IsTerminal::is_terminal(&std::io::stdin())
+                && std::io::IsTerminal::is_terminal(&std::io::stdout())),
+            unprivileged_same_uid: unsafe {
+                libc::getuid() == libc::geteuid() && libc::geteuid() != 0
+            },
+            biometric_feature_enabled: cfg!(feature = "biometric-keychain"),
+        }
+    }
+}
+
+/// Refuse the development backend until it has an isolated auth/token/mirror
+/// implementation. This gate runs before production directories, Keychain,
+/// mirror, service, socket, or network code. It intentionally never captures
+/// environment values in an incomplete build.
+fn preflight_environment_secret_source(
+    config: &Config,
+    arguments: &DevArgs,
+    production_root: &std::path::Path,
+    facts: BootstrapFacts,
+) -> Result<()> {
+    let secret_source = config
+        .dev
+        .as_ref()
+        .map_or(DevSecretSource::Keychain, |dev| dev.secret_source);
+    if secret_source != DevSecretSource::EnvironmentDev {
+        if arguments.dev_env_secrets || arguments.dev_data_dir.is_some() {
+            bail!("development environment bootstrap flags require [dev].secret_source = 'environment_dev'");
+        }
+        return Ok(());
+    }
+
+    #[cfg(feature = "dev-env-secrets")]
+    {
+        use webex_bridge::dev_env_secrets::{validate_configured_foreground, ForegroundOptions};
+
+        let options = ForegroundOptions {
+            enabled: arguments.dev_env_secrets,
+            development_root: arguments.dev_data_dir.clone(),
+            development_room: arguments.dev_room.clone(),
+        };
+        // Validate feature + config + CLI, foreground/service/UID, canonical
+        // roots, and room/route isolation before considering any secret input.
+        let _roots = validate_configured_foreground(
+            config,
+            &options,
+            production_root,
+            facts.foreground_tty,
+            facts.service_invocation,
+            facts.unprivileged_same_uid,
+            facts.biometric_feature_enabled,
+        )?;
+        bail!("[dev].secret_source = 'environment_dev' is not available: refusing to fall back to production Keychain, mirror, or paths until isolated auth and mirror providers are installed");
+    }
+
+    #[cfg(not(feature = "dev-env-secrets"))]
+    {
+        let _ = (arguments, production_root, facts);
+        bail!("[dev].secret_source = 'environment_dev' requires a dev-env-secrets build; refusing production fallback");
+    }
+}
+
 fn parse_args() -> Result<DevArgs> {
     let mut dev_room = None;
+    let mut dev_env_secrets = false;
+    let mut dev_data_dir = None;
     let mut debug = false;
     let mut refresh_after = None;
     let mut refresh_gap = None;
@@ -167,6 +262,17 @@ fn parse_args() -> Result<DevArgs> {
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--debug" => debug = true,
+            "--dev-env-secrets" if !dev_env_secrets => dev_env_secrets = true,
+            "--dev-data-dir" if dev_data_dir.is_none() => {
+                let path = args
+                    .next()
+                    .context("--dev-data-dir requires an absolute directory")?;
+                let path = PathBuf::from(path);
+                if !path.is_absolute() {
+                    bail!("--dev-data-dir requires an absolute directory");
+                }
+                dev_data_dir = Some(path);
+            }
             "--dev-room" => {
                 let room = args
                     .next()
@@ -200,6 +306,8 @@ fn parse_args() -> Result<DevArgs> {
     }
     Ok(DevArgs {
         dev_room,
+        dev_env_secrets,
+        dev_data_dir,
         debug,
         refresh_after,
         refresh_gap,
@@ -257,6 +365,122 @@ fn publish_deliveries(events: &EventBus, deliveries: &[Delivery]) {
                 "revision": delivery.revision,
             }),
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod bootstrap_tests {
+    use super::*;
+    use std::{fs, os::unix::fs::PermissionsExt};
+    use webex_bridge::{
+        config::{DevConfig, Route},
+        paths::Paths,
+    };
+
+    fn environment_config() -> Config {
+        Config {
+            dev: Some(DevConfig {
+                write_allowlist: vec!["test-room".into()],
+                secret_source: DevSecretSource::EnvironmentDev,
+            }),
+            routes: vec![Route {
+                id: "test-route".into(),
+                room_id: "test-room".into(),
+                agent_name: "test-agent".into(),
+                allowed_senders: Vec::new(),
+                receive: Default::default(),
+                workspace: "/tmp".into(),
+            }],
+            ..Config::default()
+        }
+    }
+
+    fn arguments(development_root: PathBuf) -> DevArgs {
+        DevArgs {
+            dev_room: Some("test-room".into()),
+            dev_env_secrets: true,
+            dev_data_dir: Some(development_root),
+            debug: false,
+            refresh_after: None,
+            refresh_gap: None,
+        }
+    }
+
+    fn guarded_facts() -> BootstrapFacts {
+        BootstrapFacts {
+            foreground_tty: true,
+            service_invocation: false,
+            unprivileged_same_uid: true,
+            biometric_feature_enabled: false,
+        }
+    }
+
+    #[test]
+    fn environment_source_never_initializes_production_runtime_paths() {
+        let temporary = tempfile::tempdir().unwrap();
+        let production = temporary.path().join("production");
+        let development = temporary.path().join("development");
+        fs::create_dir(&production).unwrap();
+        fs::create_dir(&development).unwrap();
+        let paths = Paths::under(production.clone());
+        let serialized = toml::to_string_pretty(&environment_config()).unwrap();
+        fs::write(&paths.config, serialized).unwrap();
+        fs::set_permissions(&paths.config, fs::Permissions::from_mode(0o600)).unwrap();
+
+        // `load_existing` is intentionally non-creating. This is the same
+        // config read the daemon makes before it decides which backend applies.
+        let loaded = Config::load_existing(&paths).unwrap();
+        assert!(preflight_environment_secret_source(
+            &loaded,
+            &arguments(development),
+            &production,
+            guarded_facts(),
+        )
+        .is_err());
+        assert!(!paths.run.exists());
+        assert!(!paths.mirror.exists());
+        assert!(!paths.socket.exists());
+    }
+
+    #[test]
+    fn environment_source_requires_bootstrap_flags_before_any_fallback() {
+        let temporary = tempfile::tempdir().unwrap();
+        let production = temporary.path().join("production");
+        fs::create_dir(&production).unwrap();
+        let arguments = DevArgs {
+            dev_room: None,
+            dev_env_secrets: false,
+            dev_data_dir: None,
+            debug: false,
+            refresh_after: None,
+            refresh_gap: None,
+        };
+        assert!(preflight_environment_secret_source(
+            &environment_config(),
+            &arguments,
+            &production,
+            guarded_facts(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn production_source_refuses_development_bootstrap_flags() {
+        let temporary = tempfile::tempdir().unwrap();
+        let production = temporary.path().join("production");
+        let development = temporary.path().join("development");
+        fs::create_dir(&production).unwrap();
+        fs::create_dir(&development).unwrap();
+        let mut config = Config::default();
+        config.dev.as_mut().unwrap().secret_source = DevSecretSource::Keychain;
+        assert!(preflight_environment_secret_source(
+            &config,
+            &arguments(development),
+            &production,
+            guarded_facts(),
+        )
+        .is_err());
     }
 }
 

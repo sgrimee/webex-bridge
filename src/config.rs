@@ -171,6 +171,15 @@ impl Config {
     /// Read a 0600 config; refuse to run without one or with unknown settings.
     pub fn load(paths: &Paths) -> Result<Self> {
         paths.ensure_dirs()?;
+        Self::load_existing(paths)
+    }
+
+    /// Read an already-existing 0600 configuration without creating any path.
+    ///
+    /// Daemon bootstrap uses this before deciding whether a requested secret
+    /// source is permitted, so an unsupported development configuration cannot
+    /// create or otherwise initialize the production data root first.
+    pub fn load_existing(paths: &Paths) -> Result<Self> {
         check_mode(&paths.config, 0o600)?;
         let data = fs::read_to_string(&paths.config)?;
         toml::from_str(&data).context("Invalid webex-bridge config.toml")

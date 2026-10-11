@@ -430,6 +430,12 @@ async fn outbox_status(
     }
 }
 
+/// One fixed 404 body for every unavailable preview, so cases are
+/// indistinguishable to the caller.
+fn preview_not_found() -> Response {
+    json_error(StatusCode::NOT_FOUND, "not_found", "Delivery was not found")
+}
+
 /// Local-display preview: same route/scope checks as accept, same sanitized
 /// text, but no state change. Every failure is an indistinguishable 404 so a
 /// session cannot probe other routes or decision states.
@@ -453,8 +459,11 @@ async fn preview_inbox(
             diagnostics::debug("agent.inbox_preview");
             Json(preview).into_response()
         }
-        Ok(None) | Err(_) => {
-            json_error(StatusCode::NOT_FOUND, "not_found", "Delivery was not found")
+        Ok(None) => preview_not_found(),
+        Err(_) => {
+            // Constant and content-free; the client still sees a plain 404.
+            diagnostics::debug("agent.inbox_preview_failed");
+            preview_not_found()
         }
     }
 }

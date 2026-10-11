@@ -6,6 +6,7 @@
 
 use crate::{
     config::{Config, Receive, Route},
+    diagnostics,
     mirror::Mirror,
 };
 use anyhow::{bail, Context, Result};
@@ -405,7 +406,7 @@ impl Mirror {
             delivery.room_title = match titles.get(&room_id) {
                 Some(title) => title.clone(),
                 None => {
-                    let title = self.display_room_title(&room_id)?;
+                    let title = self.display_room_title(&room_id);
                     titles.insert(room_id, title.clone());
                     title
                 }
@@ -414,7 +415,7 @@ impl Mirror {
                 delivery.sender_name = match names.get(&sender_id) {
                     Some(name) => name.clone(),
                     None => {
-                        let name = self.display_sender_name(&sender_id)?;
+                        let name = self.display_sender_name(&sender_id);
                         names.insert(sender_id, name.clone());
                         name
                     }
@@ -456,10 +457,10 @@ impl Mirror {
             return Ok(None);
         };
         let sender_name = match released.sender_id.as_deref() {
-            Some(sender_id) => self.display_sender_name(sender_id)?,
+            Some(sender_id) => self.display_sender_name(sender_id),
             None => None,
         };
-        let room_title = self.display_room_title(&room_id)?;
+        let room_title = self.display_room_title(&room_id);
         self.conn.execute(
             "INSERT INTO audit(ts,scope,action,ref,detail_redacted) VALUES (?1,'agent','inbox_preview',?2,NULL)",
             params![
@@ -520,16 +521,15 @@ impl Mirror {
         }))
     }
 
-    fn display_room_title(&self, room_id: &str) -> Result<Option<String>> {
-        Ok(self
-            .room_title(room_id)?
-            .map(|title| sanitize_display_line(&title)))
+    /// Best-effort display title: an unreadable title is omitted rather than
+    /// failing the inbox list or a valid preview.
+    fn display_room_title(&self, room_id: &str) -> Option<String> {
+        best_effort_display(self.room_title(room_id))
     }
 
-    fn display_sender_name(&self, sender_id: &str) -> Result<Option<String>> {
-        Ok(self
-            .person_display_name(sender_id)?
-            .map(|name| sanitize_display_line(&name)))
+    /// Best-effort sender display name, as [`Self::display_room_title`].
+    fn display_sender_name(&self, sender_id: &str) -> Option<String> {
+        best_effort_display(self.person_display_name(sender_id))
     }
 
     /// Change one claimed delivery's decision. Only acceptance decrypts and
@@ -633,6 +633,17 @@ fn sanitize_terminal_text(input: &str) -> String {
             ) && (!ch.is_control() || matches!(*ch, '\n' | '\r' | '\t'))
         })
         .collect()
+}
+
+fn best_effort_display(value: Result<Option<String>>) -> Option<String> {
+    value
+        .inspect_err(|_| {
+            // Constant, content-free: never the error, IDs or ciphertext.
+            diagnostics::debug("agent.display_metadata_unavailable");
+        })
+        .ok()
+        .flatten()
+        .map(|text| sanitize_display_line(&text))
 }
 
 /// Display metadata (names, titles) is remote free text too: strip terminal
@@ -824,5 +835,40 @@ mod tests {
             .preview_delivery(&routes, "not base64!")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn unreadable_display_metadata_is_omitted_not_fatal() {
+        let config = config();
+        let mut mirror = Mirror::in_memory([10; 32]).unwrap();
+        mirror.sync_routes(&config.routes).unwrap();
+        mirror
+            .upsert_person(&webex::Person {
+                id: "person".into(),
+                display_name: "Pat Sender".into(),
+                ..webex::Person::default()
+            })
+            .unwrap();
+        mirror
+            .upsert_message(&message("sam/coder: still readable"))
+            .unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
+        mirror
+            .conn
+            .execute(
+                "UPDATE people SET display_name_ct=x'00112233445566778899' WHERE person_id='person'",
+                [],
+            )
+            .unwrap();
+        let routes = ["r".to_string()];
+        let listed = mirror.deliveries(&routes, Some("pending")).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].sender_name, None);
+        let preview = mirror
+            .preview_delivery(&routes, &listed[0].id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(preview.sender_name, None);
+        assert_eq!(preview.markdown, "sam/coder: still readable");
     }
 }

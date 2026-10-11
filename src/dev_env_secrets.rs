@@ -78,22 +78,22 @@ pub struct DevelopmentSecrets {
 
 impl DevelopmentSecrets {
     /// Borrow the integration ID for the immediate OAuth client construction.
-    pub(crate) fn client_id(&self) -> &str {
+    pub fn client_id(&self) -> &str {
         &self.client_id
     }
 
     /// Borrow the integration secret for the immediate OAuth client construction.
-    pub(crate) fn client_secret(&self) -> &str {
+    pub fn client_secret(&self) -> &str {
         &self.client_secret
     }
 
     /// Borrow the strictly validated token JSON for one in-memory token store.
-    pub(crate) fn token_set_json(&self) -> &str {
+    pub fn token_set_json(&self) -> &str {
         &self.token_set
     }
 
     /// Borrow the fixed 256-bit mirror key for the isolated development mirror.
-    pub(crate) fn mirror_key(&self) -> &[u8; 32] {
+    pub fn mirror_key(&self) -> &[u8; 32] {
         &self.mirror_key
     }
 }
@@ -147,10 +147,7 @@ pub fn validate_guards(request: &GuardRequest<'_>) -> Result<()> {
         .development_room
         .filter(|room| !room.is_empty())
         .context("development environment secrets require an approved dev room")?;
-    if !request
-        .write_allowlist
-        .iter()
-        .any(|allowed| *allowed == room)
+    if !request.write_allowlist.contains(&room)
         || request
             .write_allowlist
             .iter()

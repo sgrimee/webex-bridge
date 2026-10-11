@@ -853,7 +853,7 @@ async fn delete_message(
 }
 
 enum ResolvedThreadParent {
-    Known(crate::mirror::UiMessage),
+    Known(Box<crate::mirror::UiMessage>),
     Missing,
     Unavailable,
 }
@@ -863,7 +863,7 @@ fn thread_parent_dto(parent: &ResolvedThreadParent, message_id: &str) -> dto::Th
         ResolvedThreadParent::Known(message) => dto::ThreadParent {
             id: message.id.clone(),
             state: message.status.clone(),
-            message: Some(message_dto(message.clone())),
+            message: Some(message_dto(message.as_ref().clone())),
         },
         ResolvedThreadParent::Missing => dto::ThreadParent {
             id: message_id.into(),
@@ -883,7 +883,7 @@ async fn resolve_thread_parent(
     message_id: &str,
 ) -> Result<ResolvedThreadParent, Response> {
     match state.mirror().with(|db| db.ui_message(message_id)).await {
-        Ok(Some(message)) => return Ok(ResolvedThreadParent::Known(message)),
+        Ok(Some(message)) => return Ok(ResolvedThreadParent::Known(Box::new(message))),
         Ok(None) => {}
         Err(_) => {
             return Err(json_error(
@@ -905,7 +905,7 @@ async fn resolve_thread_parent(
             })
             .await
         {
-            Ok(Some(message)) => Ok(ResolvedThreadParent::Known(message)),
+            Ok(Some(message)) => Ok(ResolvedThreadParent::Known(Box::new(message))),
             _ => Err(json_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "bridge_unavailable",

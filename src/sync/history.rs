@@ -358,10 +358,10 @@ impl WebexRest {
         if content.is_empty() || content.len() > 7439 || content.contains('\0') {
             return Err(UiWriteError::Rejected);
         }
-        GlobalId::new(GlobalIdType::Room, room_id.to_owned())
+        let _ = GlobalId::new(GlobalIdType::Room, room_id.to_owned())
             .map_err(|_| UiWriteError::Rejected)?;
         if let Some(parent_id) = parent_id {
-            GlobalId::new(GlobalIdType::Message, parent_id.to_owned())
+            let _ = GlobalId::new(GlobalIdType::Message, parent_id.to_owned())
                 .map_err(|_| UiWriteError::Rejected)?;
         }
         let mut outgoing = MessageOut {
@@ -388,9 +388,9 @@ impl WebexRest {
         if content.is_empty() || content.len() > 7439 || content.contains('\0') {
             return Err(UiWriteError::Rejected);
         }
-        GlobalId::new(GlobalIdType::Message, message_id.to_owned())
+        let _ = GlobalId::new(GlobalIdType::Message, message_id.to_owned())
             .map_err(|_| UiWriteError::Rejected)?;
-        GlobalId::new(GlobalIdType::Room, room_id.to_owned())
+        let _ = GlobalId::new(GlobalIdType::Room, room_id.to_owned())
             .map_err(|_| UiWriteError::Rejected)?;
         let body = match kind {
             "plainText" => serde_json::json!({ "roomId": room_id, "text": content }),
@@ -406,7 +406,7 @@ impl WebexRest {
         &self,
         message_id: &str,
     ) -> std::result::Result<(), UiWriteError> {
-        GlobalId::new(GlobalIdType::Message, message_id.to_owned())
+        let _ = GlobalId::new(GlobalIdType::Message, message_id.to_owned())
             .map_err(|_| UiWriteError::Rejected)?;
         let path = self
             .endpoint("messages", Some(message_id))
@@ -550,7 +550,7 @@ impl WebexRest {
     /// delete conservatively. Preflight failures happen before dispatch and are
     /// definite rejections, never delivery-unknown outcomes.
     pub async fn leave_ui_room(&self, room_id: &str) -> std::result::Result<(), UiWriteError> {
-        GlobalId::new(GlobalIdType::Room, room_id.to_owned())
+        let _ = GlobalId::new(GlobalIdType::Room, room_id.to_owned())
             .map_err(|_| UiWriteError::Rejected)?;
         let me = self.me().await.map_err(|_| UiWriteError::Rejected)?;
         let mut url = self

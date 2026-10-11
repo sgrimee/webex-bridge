@@ -17,7 +17,9 @@ metadata-only (plus optional decrypted `senderName`/`roomTitle` display names),
 and remote text enters model context only through an explicit local accept.
 `GET /v1/agent/inbox/{id}/preview` returns the identical sanitized text of a
 still-pending claimed delivery for local human display in the agent host UI,
-without changing its state; anything else is an indistinguishable `404`.
+without changing its state; anything else is an indistinguishable `404`
+(accept/reject keep their `409`/`403` codes). Only a message's latest revision
+is released, and accept also returns `parentId` for threading replies.
 Agent sends are encrypted, route-bound drafts; a one-time approval binds the
 exact text and destination, then makes one non-retrying Webex request. SSE
 revalidates the process-bound token for each metadata-only event and filters

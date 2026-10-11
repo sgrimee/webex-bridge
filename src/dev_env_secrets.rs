@@ -492,7 +492,10 @@ fn fixture(now: u64) -> BTreeMap<OsString, OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::{
+        os::unix::fs::PermissionsExt,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn guard<'a>(development_root: &'a Path, production_root: &'a Path) -> GuardRequest<'a> {
         GuardRequest {
@@ -679,6 +682,48 @@ mod tests {
         assert!(development_paths.mirror.exists());
         assert!(!production_root.join("bridge.db").exists());
         assert!(!production_root.join("run").exists());
+    }
+
+    #[tokio::test]
+    async fn fake_providers_share_only_validated_isolated_paths() {
+        let temporary = tempfile::tempdir().unwrap();
+        let production_root = temporary.path().join("production");
+        let development_root = temporary.path().join("development");
+        fs::create_dir(&production_root).unwrap();
+        fs::create_dir(&development_root).unwrap();
+        fs::set_permissions(&development_root, fs::Permissions::from_mode(0o700)).unwrap();
+
+        // This is the bounded fake bootstrap: guards select canonical isolated
+        // paths; the injected map constructs in-memory auth/key providers; and
+        // no daemon or process-environment access is involved.
+        let roots = validate_guards(&guard(&development_root, &production_root)).unwrap();
+        let development_paths = crate::paths::Paths::under(roots.development);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let providers = capture_from_map(&fixture(now), now, OAuthScope::Granular)
+            .unwrap()
+            .into_providers();
+
+        // A new synthetic token is cached, so this invokes the injected auth
+        // seam (and its isolated refresh lock) without any OAuth request.
+        let tokens = crate::auth::fresh_token_with(&development_paths, &providers.auth)
+            .await
+            .unwrap();
+        assert_eq!(tokens.access_token, "access-token");
+        assert!(development_paths.refresh_lock.exists());
+
+        let mirror = crate::mirror::Mirror::open_with_key_provider(
+            &development_paths,
+            &providers.mirror_key,
+        )
+        .unwrap();
+        assert_eq!(mirror.stats().unwrap().rooms, 0);
+        drop(mirror);
+        assert!(development_paths.mirror.exists());
+        assert!(!production_root.join("run").exists());
+        assert!(!production_root.join("bridge.db").exists());
     }
 
     #[test]

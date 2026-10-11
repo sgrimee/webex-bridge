@@ -246,7 +246,23 @@ fn preflight_environment_secret_source(
 
     #[cfg(not(feature = "dev-env-secrets"))]
     {
-        let _ = (arguments, production_root, facts);
+        // Destructure the feature-gated facts explicitly so this baseline build
+        // continues to type-check every fail-closed guard input without making
+        // the fields appear dead when the development feature is absent.
+        let BootstrapFacts {
+            foreground_tty,
+            service_invocation,
+            unprivileged_same_uid,
+            biometric_feature_enabled,
+        } = facts;
+        let _ = (
+            arguments,
+            production_root,
+            foreground_tty,
+            service_invocation,
+            unprivileged_same_uid,
+            biometric_feature_enabled,
+        );
         bail!("[dev].secret_source = 'environment_dev' requires a dev-env-secrets build; refusing production fallback");
     }
 }

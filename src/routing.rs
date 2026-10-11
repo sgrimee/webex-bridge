@@ -621,8 +621,17 @@ impl Mirror {
     }
 }
 
-/// Remove terminal control introducers before any accepted remote text crosses
-/// the local API boundary. Newlines and tabs remain ordinary message data.
+/// Bidirectional embedding/override (U+202A–U+202E) and isolate
+/// (U+2066–U+2069) controls can visually reorder text ("Trojan Source").
+fn is_bidi_control(ch: char) -> bool {
+    matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Remove terminal control introducers and bidi overrides/isolates before any
+/// released remote text crosses the local API boundary. Newlines and tabs
+/// remain ordinary message data; Unicode line/paragraph separators become
+/// explicit `\n`. Zero-width joiners and LRM/RLM are kept in message text
+/// because emoji sequences and right-to-left scripts legitimately need them.
 fn sanitize_terminal_text(input: &str) -> String {
     input
         .chars()
@@ -630,7 +639,12 @@ fn sanitize_terminal_text(input: &str) -> String {
             !matches!(
                 *ch,
                 '\u{1b}' | '\u{009b}' | '\u{009d}' | '\u{0090}' | '\u{0098}'
-            ) && (!ch.is_control() || matches!(*ch, '\n' | '\r' | '\t'))
+            ) && !is_bidi_control(*ch)
+                && (!ch.is_control() || matches!(*ch, '\n' | '\r' | '\t'))
+        })
+        .map(|ch| match ch {
+            '\u{2028}' | '\u{2029}' => '\n',
+            other => other,
         })
         .collect()
 }
@@ -646,11 +660,14 @@ fn best_effort_display(value: Result<Option<String>>) -> Option<String> {
         .map(|text| sanitize_display_line(&text))
 }
 
-/// Display metadata (names, titles) is remote free text too: strip terminal
-/// controls and collapse line breaks/tabs so it cannot forge extra UI lines.
+/// Display metadata (names, titles) is remote free text shown on one UI line:
+/// strip terminal controls, bidi overrides/isolates and invisible zero-width
+/// characters (U+200B–U+200F, U+2060, U+FEFF), and replace line breaks, tabs
+/// and U+2028/U+2029 with spaces so a name cannot forge or reorder UI text.
 fn sanitize_display_line(input: &str) -> String {
     sanitize_terminal_text(input)
         .chars()
+        .filter(|ch| !matches!(*ch, '\u{200b}'..='\u{200f}' | '\u{2060}' | '\u{feff}'))
         .map(|ch| if ch.is_control() { ' ' } else { ch })
         .collect()
 }
@@ -870,5 +887,56 @@ mod tests {
             .unwrap();
         assert_eq!(preview.sender_name, None);
         assert_eq!(preview.markdown, "sam/coder: still readable");
+    }
+
+    #[test]
+    fn bidi_and_invisible_characters_are_neutralised() {
+        // An RLO in a name could render "Pat\u{202e}gnp.exe" as "Patexe.png".
+        assert_eq!(
+            sanitize_display_line("Pat\u{202e}gnp.exe\u{2066}x\u{2069}"),
+            "Patgnp.exex"
+        );
+        assert_eq!(
+            sanitize_display_line("a\u{200b}b\u{200d}c\u{200e}d\u{2060}e\u{feff}f"),
+            "abcdef"
+        );
+        assert_eq!(
+            sanitize_display_line("a\u{2028}b\u{2029}c\nd\te"),
+            "a b c d e"
+        );
+        // Released text keeps newlines, ZWJ emoji and RTL marks, but drops overrides.
+        assert_eq!(
+            sanitize_terminal_text("x\u{202e}y\u{2067}z\u{2069}\n👩\u{200d}💻\u{200f}\u{2028}w"),
+            "xyz\n👩\u{200d}💻\u{200f}\nw"
+        );
+
+        let config = config();
+        let mut mirror = Mirror::in_memory([11; 32]).unwrap();
+        mirror.sync_routes(&config.routes).unwrap();
+        mirror
+            .upsert_person(&webex::Person {
+                id: "person".into(),
+                display_name: "Pat\u{202e}gnp.exe".into(),
+                ..webex::Person::default()
+            })
+            .unwrap();
+        mirror
+            .upsert_message(&message("sam/coder: see \u{202e}fdp.exe"))
+            .unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
+        let routes = ["r".to_string()];
+        let listed = mirror.deliveries(&routes, Some("pending")).unwrap();
+        assert_eq!(listed[0].sender_name.as_deref(), Some("Patgnp.exe"));
+        let preview = mirror
+            .preview_delivery(&routes, &listed[0].id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(preview.sender_name.as_deref(), Some("Patgnp.exe"));
+        assert_eq!(preview.markdown, "sam/coder: see fdp.exe");
+        let accepted = mirror
+            .decide_delivery(&routes, &listed[0].id, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.markdown, preview.markdown);
     }
 }

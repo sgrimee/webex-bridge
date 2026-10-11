@@ -5,14 +5,14 @@
 //! changes process environment. The future synchronous binary bootstrap owns
 //! those operations and must call these guards before Tokio creates threads.
 
-use crate::config::OAuthScope;
+use crate::config::{Config, DevSecretSource, OAuthScope};
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
-    path::Path,
+    path::{Path, PathBuf},
 };
 use zeroize::Zeroizing;
 
@@ -30,22 +30,13 @@ const MAX_TOKEN_BYTES: usize = 8 * 1024;
 const MAX_ACCESS_LIFETIME: u64 = 30 * 24 * 60 * 60;
 const MAX_REFRESH_LIFETIME: u64 = 365 * 24 * 60 * 60;
 
-/// Secret-free selection from the future `[dev]` configuration field.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SecretSource {
-    /// The production/default Keychain backend.
-    Keychain,
-    /// The explicitly feature-gated foreground development backend.
-    EnvironmentDev,
-}
-
 /// Secret-free invocation facts captured before any secret environment access.
 #[derive(Clone, Debug)]
 pub struct GuardRequest<'a> {
     /// The required explicit daemon CLI flag was supplied.
     pub cli_opt_in: bool,
     /// The selected secret source from validated development configuration.
-    pub secret_source: SecretSource,
+    pub secret_source: DevSecretSource,
     /// The isolated development root requested by the foreground command.
     pub development_root: &'a Path,
     /// The regular production application-data root.
@@ -64,6 +55,97 @@ pub struct GuardRequest<'a> {
     pub unprivileged_same_uid: bool,
     /// Whether the incompatible biometric backend was compiled too.
     pub biometric_feature_enabled: bool,
+}
+
+/// Parsed, secret-free foreground development flags. This is intentionally
+/// separate from the production daemon parser until synchronous bootstrap is
+/// wired before Tokio runtime creation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForegroundOptions {
+    pub enabled: bool,
+    pub development_root: Option<PathBuf>,
+    pub development_room: Option<String>,
+}
+
+/// Parse only the three development bootstrap flags from an injected argument
+/// sequence. Unknown arguments are refused without echoing their value.
+pub fn parse_foreground_options<I, S>(arguments: I) -> Result<ForegroundOptions>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut options = ForegroundOptions {
+        enabled: false,
+        development_root: None,
+        development_room: None,
+    };
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        match argument.as_ref() {
+            "--dev-env-secrets" if !options.enabled => options.enabled = true,
+            "--dev-data-dir" if options.development_root.is_none() => {
+                let value = arguments
+                    .next()
+                    .context("development data directory is required")?;
+                options.development_root = Some(PathBuf::from(value.as_ref()));
+            }
+            "--dev-room" if options.development_room.is_none() => {
+                let value = arguments.next().context("development room is required")?;
+                let value = value.as_ref();
+                if value.is_empty() || value.chars().any(char::is_control) {
+                    bail!("development room is invalid");
+                }
+                options.development_room = Some(value.into());
+            }
+            _ => bail!("invalid development bootstrap arguments"),
+        }
+    }
+    Ok(options)
+}
+
+/// Validate the CLI/config half of development bootstrap with no secret map,
+/// Keychain, socket, mirror, or network access.
+pub fn validate_configured_foreground(
+    config: &Config,
+    options: &ForegroundOptions,
+    production_root: &Path,
+    foreground_tty: bool,
+    service_invocation: bool,
+    unprivileged_same_uid: bool,
+    biometric_feature_enabled: bool,
+) -> Result<()> {
+    let dev = config
+        .dev
+        .as_ref()
+        .context("development environment secrets require a [dev] configuration")?;
+    let root = options
+        .development_root
+        .as_deref()
+        .context("development environment secrets require --dev-data-dir")?;
+    let room = options.development_room.as_deref();
+    let allowlist = dev
+        .write_allowlist
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let routes = config
+        .routes
+        .iter()
+        .map(|route| route.room_id.as_str())
+        .collect::<Vec<_>>();
+    validate_guards(&GuardRequest {
+        cli_opt_in: options.enabled,
+        secret_source: dev.secret_source,
+        development_root: root,
+        production_root,
+        development_room: room,
+        write_allowlist: &allowlist,
+        route_rooms: &routes,
+        foreground_tty,
+        service_invocation,
+        unprivileged_same_uid,
+        biometric_feature_enabled,
+    })
 }
 
 /// A captured, non-`Debug` development secret bundle. No method exposes a
@@ -129,7 +211,7 @@ pub fn validate_guards(request: &GuardRequest<'_>) -> Result<()> {
     if request.biometric_feature_enabled {
         bail!("development environment secrets cannot be combined with biometric Keychain mode");
     }
-    if !request.cli_opt_in || request.secret_source != SecretSource::EnvironmentDev {
+    if !request.cli_opt_in || request.secret_source != DevSecretSource::EnvironmentDev {
         bail!(
             "development environment secrets require matching feature, config, and foreground flag"
         );
@@ -301,7 +383,7 @@ mod tests {
     fn guard<'a>(development_root: &'a Path, production_root: &'a Path) -> GuardRequest<'a> {
         GuardRequest {
             cli_opt_in: true,
-            secret_source: SecretSource::EnvironmentDev,
+            secret_source: DevSecretSource::EnvironmentDev,
             development_root,
             production_root,
             development_room: Some("room-1"),
@@ -324,11 +406,53 @@ mod tests {
         invalid.cli_opt_in = false;
         assert!(validate_guards(&invalid).is_err());
         let mut overlap = guard(&development, &development);
-        overlap.secret_source = SecretSource::EnvironmentDev;
+        overlap.secret_source = DevSecretSource::EnvironmentDev;
         assert!(validate_guards(&overlap).is_err());
         let mut service = guard(&development, &production);
         service.service_invocation = true;
         assert!(validate_guards(&service).is_err());
+    }
+
+    #[test]
+    fn foreground_cli_and_config_wiring_stay_secret_free() {
+        let temp = tempfile::tempdir().unwrap();
+        let development = temp.path().join("development");
+        let production = temp.path().join("production");
+        let options = parse_foreground_options([
+            "--dev-env-secrets",
+            "--dev-data-dir",
+            development.to_str().unwrap(),
+            "--dev-room",
+            "room-1",
+        ])
+        .unwrap();
+        let mut config = Config::default();
+        let dev = config.dev.as_mut().unwrap();
+        dev.write_allowlist = vec!["room-1".into()];
+        dev.secret_source = DevSecretSource::EnvironmentDev;
+        assert!(validate_configured_foreground(
+            &config,
+            &options,
+            &production,
+            true,
+            false,
+            true,
+            false,
+        )
+        .is_ok());
+        assert!(parse_foreground_options(["--dev-env-secrets", "--dev-env-secrets"]).is_err());
+        let mut production_config = config;
+        production_config.dev.as_mut().unwrap().secret_source = DevSecretSource::Keychain;
+        assert!(validate_configured_foreground(
+            &production_config,
+            &options,
+            &production,
+            true,
+            false,
+            true,
+            false,
+        )
+        .is_err());
     }
 
     #[test]

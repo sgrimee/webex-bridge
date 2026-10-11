@@ -105,6 +105,22 @@ impl Default for Limits {
 pub struct DevConfig {
     /// Allowed destination IDs for writes. Empty is deny-all.
     pub write_allowlist: Vec<String>,
+    /// Secret backend selection. Keychain is the production/default path; the
+    /// environment mode is rejected unless the feature and foreground guards
+    /// independently opt into it.
+    #[serde(default)]
+    pub secret_source: DevSecretSource,
+}
+
+/// Secret-free development backend selector. It contains no credential values.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DevSecretSource {
+    /// Default production behavior; never inspect environment variables.
+    #[default]
+    Keychain,
+    /// Feature-gated foreground development source only.
+    EnvironmentDev,
 }
 
 /// Agent delivery mode.
@@ -144,6 +160,7 @@ impl Default for Config {
             limits: Limits::default(),
             dev: Some(DevConfig {
                 write_allowlist: Vec::new(),
+                secret_source: DevSecretSource::Keychain,
             }),
             routes: Vec::new(),
         }
@@ -184,6 +201,7 @@ impl Config {
         let config = Self {
             dev: Some(DevConfig {
                 write_allowlist: vec![room_id.to_owned()],
+                secret_source: DevSecretSource::Keychain,
             }),
             routes: vec![Route {
                 id: "agents-social".into(),
@@ -235,6 +253,16 @@ mod tests {
                 .webex
                 .oauth_scope,
             OAuthScope::SparkAll
+        );
+        assert_eq!(
+            toml::from_str::<Config>(
+                "[dev]\nwrite_allowlist = ['social']\nsecret_source = 'environment_dev'\n"
+            )
+            .unwrap()
+            .dev
+            .unwrap()
+            .secret_source,
+            DevSecretSource::EnvironmentDev
         );
         assert!(toml::from_str::<Config>("[[routes]]\nid = 'r'\nroom_id = 'a'\nagent_name = 'b'\nallowed_senders = []\nworkspace = 'x'\nreceive = 'any'\n").is_err());
     }

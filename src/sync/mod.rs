@@ -302,6 +302,7 @@ mod tests {
         let config = Config {
             dev: Some(DevConfig {
                 write_allowlist: vec![room_id.into()],
+                secret_source: crate::config::DevSecretSource::Keychain,
             }),
             ..Config::default()
         };

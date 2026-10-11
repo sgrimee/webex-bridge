@@ -389,6 +389,7 @@ mod tests {
         Config {
             dev: Some(DevConfig {
                 write_allowlist: vec!["room".into()],
+                secret_source: crate::config::DevSecretSource::Keychain,
             }),
             routes: vec![Route {
                 id: "r".into(),

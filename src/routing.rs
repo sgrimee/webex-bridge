@@ -482,13 +482,16 @@ impl Mirror {
     }
 
     /// Decrypt and sanitize the active body of one delivery revision. This is
-    /// the single release path shared by preview and accept.
+    /// the single release path shared by preview and accept. Only the latest
+    /// mirrored revision is released, so an edit that is not yet re-queued
+    /// already prevents its superseded text from reaching the agent host.
     fn released_message(&self, key: &DeliveryKey) -> Result<Option<ReleasedMessage>> {
         let stored: Option<StoredReleasedMessage> = self
             .conn
             .query_row(
                 "SELECT sender_id,created_at,parent_id,body_ct,body_nonce FROM messages
-                 WHERE message_id=?1 AND revision=?2 AND status='active'",
+                 WHERE message_id=?1 AND revision=?2 AND status='active'
+                   AND revision=(SELECT MAX(revision) FROM messages WHERE message_id=?1)",
                 params![key.message_id, key.revision],
                 |row| {
                     Ok((
@@ -544,6 +547,19 @@ impl Mirror {
         if !route_ids.iter().any(|route_id| route_id == &key.route_id) {
             bail!("Delivery is not claimed by this session");
         }
+        // Resolve releasable text before deciding, so a pending delivery whose
+        // revision became stale or deleted is refused without being consumed.
+        let released = if accept {
+            if !self.delivery_pending(&key)? {
+                return Ok(None);
+            }
+            let Some(released) = self.released_message(&key)? else {
+                return Ok(None);
+            };
+            Some(released)
+        } else {
+            None
+        };
         let target = if accept { "accepted" } else { "rejected" };
         let changed = self.conn.execute(
             "UPDATE deliveries SET state=?4,decided_at=?5
@@ -559,7 +575,13 @@ impl Mirror {
         if changed == 0 {
             return Ok(None);
         }
-        if !accept {
+        let Some(ReleasedMessage {
+            sender_id,
+            created_at,
+            markdown,
+            ..
+        }) = released
+        else {
             return Ok(Some(AcceptedDelivery {
                 id: key.encode(),
                 route_id: key.route_id,
@@ -568,15 +590,6 @@ impl Mirror {
                 revision: key.revision,
                 markdown: String::new(),
             }));
-        }
-        let Some(ReleasedMessage {
-            sender_id,
-            created_at,
-            markdown,
-            ..
-        }) = self.released_message(&key)?
-        else {
-            bail!("Accepted delivery no longer has a body");
         };
         Ok(Some(AcceptedDelivery {
             id: key.encode(),
@@ -586,6 +599,19 @@ impl Mirror {
             revision: key.revision,
             markdown,
         }))
+    }
+
+    fn delivery_pending(&self, key: &DeliveryKey) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM deliveries
+                 WHERE route_id=?1 AND message_id=?2 AND revision=?3 AND state='pending'",
+                params![key.route_id, key.message_id, key.revision],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some())
     }
 
     fn delivery_exists(&self, key: &DeliveryKey) -> Result<bool> {
@@ -938,5 +964,45 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(accepted.markdown, preview.markdown);
+    }
+
+    #[test]
+    fn stale_revision_is_refused_before_requeue_without_being_consumed() {
+        let config = config();
+        let mut mirror = Mirror::in_memory([12; 32]).unwrap();
+        mirror.sync_routes(&config.routes).unwrap();
+        mirror
+            .upsert_message(&message("sam/coder: original"))
+            .unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
+        let routes = ["r".to_string()];
+        let old = mirror.deliveries(&routes, Some("pending")).unwrap()[0]
+            .id
+            .clone();
+        // Edit mirrored, but routing has not yet re-queued it.
+        let mut edited = message("sam/coder: revised");
+        edited.updated = Some("2099-01-01T00:05:00Z".into());
+        mirror.upsert_message(&edited).unwrap();
+        assert!(mirror.preview_delivery(&routes, &old).unwrap().is_none());
+        assert!(mirror
+            .decide_delivery(&routes, &old, true)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            mirror.deliveries(&routes, Some("pending")).unwrap().len(),
+            1,
+            "a refused stale accept must not consume the delivery"
+        );
+        // Re-queue supersedes it; only the new revision is releasable.
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
+        let pending = mirror.deliveries(&routes, Some("pending")).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].revision, 1);
+        assert!(mirror.preview_delivery(&routes, &old).unwrap().is_none());
+        let accepted = mirror
+            .decide_delivery(&routes, &pending[0].id, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.markdown, "sam/coder: revised");
     }
 }

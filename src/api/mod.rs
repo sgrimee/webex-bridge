@@ -452,77 +452,108 @@ mod tests {
         server.shutdown().await.unwrap();
     }
 
+    fn scoped_ui_request(
+        method: &str,
+        path: &str,
+        agent_bearer: &str,
+        body: Option<&str>,
+    ) -> String {
+        let body = body.unwrap_or_default();
+        let content_headers = (!body.is_empty()).then(|| {
+            format!(
+                "Content-Type: application/json\r\nContent-Length: {}\r\n",
+                body.len()
+            )
+        });
+        format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {agent_bearer}\r\n{}Connection: close\r\n\r\n{body}",
+            content_headers.unwrap_or_default(),
+        )
+    }
+
+    fn response_status(response: &str) -> Option<u16> {
+        response
+            .split("\r\n")
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|status| status.parse().ok())
+    }
+
+    fn response_code(response: &str) -> Option<String> {
+        serde_json::from_str::<serde_json::Value>(response.split("\r\n\r\n").nth(1)?)
+            .ok()?
+            .get("code")?
+            .as_str()
+            .map(str::to_owned)
+    }
+
     #[tokio::test]
-    async fn agent_bearer_cannot_bootstrap_ui_pairing_or_sessions() {
+    async fn agent_bearer_is_rejected_by_every_ui_route_before_ui_work() {
         let temp = tempfile::tempdir().unwrap();
         let paths = Paths::under(temp.path().join("bridge"));
         let mirror = SharedMirror::new(Mirror::in_memory([98_u8; 32]).unwrap());
         let (_connection_tx, connection_rx) = watch::channel(ConnectionStatus::Connected);
-        let mut config = Config::default();
-        config.routes.push(Route {
-            id: "agents-social".into(),
-            room_id: "room-id-is-not-returned".into(),
-            agent_name: "sam/coder".into(),
-            allowed_senders: Vec::new(),
-            receive: Receive::Addressed,
-            workspace: "/workspace".into(),
-        });
-        let server = start(
-            &paths,
-            ApiState::with_config(mirror, connection_rx, Arc::new(config)),
-        )
-        .await
-        .unwrap();
+        let state = ApiState::new(mirror, connection_rx);
+        // The UDS client and this issued token have the same kernel identity,
+        // making this a real, process-bound Agent bearer without any route
+        // configuration, user config, pairing, or daemon startup.
+        let agent_bearer = state.sessions().issue(
+            auth::Scope::Agent,
+            auth::PeerIdentity {
+                uid: auth::daemon_uid(),
+                pid: Some(std::process::id()),
+            },
+            std::time::Duration::from_secs(60),
+        );
+        let server = start(&paths, state).await.unwrap();
 
-        // Obtain a real, process-bound agent token via UDS. The following UI
-        // bootstrap calls must be rejected before their native-dialog or
-        // paired-secret code could be reached.
-        let agent_body = r#"{"host":"pi","sessionId":"test-session","cwd":"/workspace","agentName":"sam/coder"}"#;
-        let agent_session = request(
+        // The status endpoint intentionally remains an unauthenticated,
+        // metadata-only liveness check.
+        let status = request(
             &paths.socket,
-            format!(
-                "POST /v1/agent/sessions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{agent_body}",
-                agent_body.len()
-            ),
+            "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".into(),
         )
         .await;
-        assert!(agent_session.starts_with("HTTP/1.1 200"));
-        let token = serde_json::from_str::<serde_json::Value>(
-            agent_session.split("\r\n\r\n").nth(1).unwrap(),
-        )
-        .unwrap()["token"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        assert_eq!(response_status(&status), Some(200));
 
-        let pair_body = format!(r#"{{"secretHash":"{}"}}"#, "a".repeat(43));
-        let pair = request(
-            &paths.socket,
-            format!(
-                "POST /v1/ui/pair HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{pair_body}",
-                pair_body.len()
-            ),
-        )
-        .await;
-        assert!(pair.starts_with("HTTP/1.1 403"));
-        assert!(pair.contains("\"code\":\"forbidden_scope\""));
-        assert!(!pair.contains("pairing_denied"));
-
-        // There is deliberately no paired secret. `forbidden_scope`, rather
-        // than `auth_required`, proves the agent bearer was rejected before
-        // paired-secret lookup.
-        let session_body = format!(r#"{{"secret":"{}"}}"#, "s".repeat(32));
-        let session = request(
-            &paths.socket,
-            format!(
-                "POST /v1/ui/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{session_body}",
-                session_body.len()
-            ),
-        )
-        .await;
-        assert!(session.starts_with("HTTP/1.1 403"));
-        assert!(session.contains("\"code\":\"forbidden_scope\""));
-        assert!(!session.contains("auth_required"));
+        // Empty structural request fields are sufficient for JSON extraction.
+        // Each handler must classify the Agent scope first, before its mirror,
+        // hydrate, paired-secret, or native-dialog logic can inspect them.
+        let ui_routes = [
+            ("POST", "/v1/ui/pair", Some(r#"{"secretHash":""}"#)),
+            ("POST", "/v1/ui/sessions", Some(r#"{"secret":""}"#)),
+            ("GET", "/v1/me", None),
+            ("GET", "/v1/ui/continuity", None),
+            ("GET", "/v1/rooms", None),
+            ("GET", "/v1/rooms/room-id", None),
+            ("GET", "/v1/teams/team-id", None),
+            ("DELETE", "/v1/rooms/room-id/membership", None),
+            ("GET", "/v1/rooms/room-id/messages", None),
+            ("POST", "/v1/messages", Some(r#"{"roomId":""}"#)),
+            ("GET", "/v1/messages/message-id/thread", None),
+            ("GET", "/v1/messages/message-id/children", None),
+            ("GET", "/v1/messages/message-id/read", None),
+            ("GET", "/v1/messages/message-id", None),
+            ("PUT", "/v1/messages/message-id", Some(r#"{"roomId":""}"#)),
+            ("DELETE", "/v1/messages/message-id", None),
+            ("GET", "/v1/people/person-id/read", None),
+            ("GET", "/v1/people/person-id", None),
+        ];
+        for (method, path, body) in ui_routes {
+            let response = request(
+                &paths.socket,
+                scoped_ui_request(method, path, &agent_bearer, body),
+            )
+            .await;
+            // Assert only the HTTP status and fixed sanitized error
+            // classification—never domain data, bearer values, or secrets.
+            assert_eq!(response_status(&response), Some(403), "{method} {path}");
+            assert_eq!(
+                response_code(&response),
+                Some("forbidden_scope".into()),
+                "{method} {path}"
+            );
+        }
 
         server.shutdown().await.unwrap();
     }
@@ -637,49 +668,6 @@ mod tests {
         .await;
         assert!(agent.starts_with("HTTP/1.1 403"));
         assert!(agent.contains("forbidden_scope"));
-        server.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn agent_session_cannot_read_full_mirror_ui_routes() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = Paths::under(temp.path().join("bridge"));
-        let mut config = Config::default();
-        config.routes.push(Route {
-            id: "agents-social".into(),
-            room_id: "room-id-is-not-returned".into(),
-            agent_name: "sam/coder".into(),
-            allowed_senders: Vec::new(),
-            receive: Receive::Addressed,
-            workspace: "/workspace".into(),
-        });
-        let mirror = SharedMirror::new(Mirror::in_memory([97_u8; 32]).unwrap());
-        let (_connection_tx, connection_rx) = watch::channel(ConnectionStatus::Connected);
-        let server = start(
-            &paths,
-            ApiState::with_config(mirror, connection_rx, Arc::new(config)),
-        )
-        .await
-        .unwrap();
-        let body = r#"{"host":"pi","sessionId":"test-session","cwd":"/workspace","agentName":"sam/coder"}"#;
-        let session = request(
-            &paths.socket,
-            format!("POST /v1/agent/sessions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()),
-        )
-        .await;
-        let token =
-            serde_json::from_str::<serde_json::Value>(session.split("\r\n\r\n").nth(1).unwrap())
-                .unwrap()["token"]
-                .as_str()
-                .unwrap()
-                .to_owned();
-        let rooms = request(
-            &paths.socket,
-            format!("GET /v1/rooms HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"),
-        )
-        .await;
-        assert!(rooms.starts_with("HTTP/1.1 403"));
-        assert!(rooms.contains("forbidden_scope"));
         server.shutdown().await.unwrap();
     }
 

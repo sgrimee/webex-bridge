@@ -799,6 +799,206 @@ mod tests {
         server.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn agent_preview_enforces_scope_lease_and_hides_unavailable_cases() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(temp.path().join("bridge"));
+        let mut config = Config::default();
+        config.routes.push(Route {
+            id: "agents-social".into(),
+            room_id: "room-claimed".into(),
+            agent_name: "sam/coder".into(),
+            allowed_senders: vec!["allowed-person".into()],
+            receive: Receive::Addressed,
+            workspace: "/workspace".into(),
+        });
+        const ORDER: [&str; 4] = ["edited", "deleted", "accepted", "held"];
+        let config = Arc::new(config);
+        let message = |id: &str, text: &str| webex::Message {
+            id: Some(id.into()),
+            room_id: Some("room-claimed".into()),
+            person_id: Some("allowed-person".into()),
+            text: Some(text.into()),
+            // Creation order follows ORDER below, so listed IDs match it.
+            created: Some(format!(
+                "2099-01-01T00:00:0{}Z",
+                ORDER.iter().position(|known| *known == id).unwrap()
+            )),
+            ..webex::Message::default()
+        };
+        let mirror = SharedMirror::new(Mirror::in_memory([88_u8; 32]).unwrap());
+        let ids = {
+            let config = config.clone();
+            mirror
+                .with(move |db| {
+                    db.sync_routes(&config.routes)?;
+                    for id in ORDER {
+                        db.upsert_message(&message(id, "sam/coder: private content"))?;
+                    }
+                    assert_eq!(db.queue_deliveries(&config)?, 4);
+                    Ok(db
+                        .deliveries(&["agents-social".into()], None)?
+                        .into_iter()
+                        .map(|delivery| delivery.id)
+                        .collect::<Vec<_>>())
+                })
+                .await
+                .unwrap()
+        };
+        let [edited, deleted, accepted, held] = <[String; 4]>::try_from(ids).unwrap();
+        let (_connection_tx, connection_rx) = watch::channel(ConnectionStatus::Connected);
+        let state = ApiState::with_config(mirror.clone(), connection_rx, config.clone());
+        let sessions = state.sessions();
+        let server = start(&paths, state).await.unwrap();
+        let me = auth::PeerIdentity {
+            uid: auth::daemon_uid(),
+            pid: Some(std::process::id()),
+        };
+        let call = |method: &str, path: String, token: Option<&str>| {
+            let authorization = token
+                .map(|token| format!("Authorization: Bearer {token}\r\n"))
+                .unwrap_or_default();
+            format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n{authorization}Content-Length: 0\r\nConnection: close\r\n\r\n")
+        };
+        let preview_of = |id: &str| format!("/v1/agent/inbox/{id}/preview");
+        let assert_error = |response: &str, status: u16, code: &str, what: &str| {
+            assert_eq!(response_status(response), Some(status), "{what}");
+            assert_eq!(response_code(response), Some(code.into()), "{what}");
+            assert!(!response.contains("private"), "{what}");
+        };
+
+        // (a) A UI token is refused by preview and by both decisions.
+        let ui = sessions.issue(auth::Scope::Ui, me, std::time::Duration::from_secs(60));
+        for (method, action) in [("GET", "preview"), ("POST", "accept"), ("POST", "reject")] {
+            let response = request(
+                &paths.socket,
+                call(
+                    method,
+                    format!("/v1/agent/inbox/{held}/{action}"),
+                    Some(&ui),
+                ),
+            )
+            .await;
+            assert_error(&response, 403, "forbidden_scope", action);
+        }
+        // Missing bearer.
+        let response = request(&paths.socket, call("GET", preview_of(&held), None)).await;
+        assert_error(&response, 401, "auth_required", "missing bearer");
+
+        let body = r#"{"host":"pi","sessionId":"test-session","cwd":"/workspace","agentName":"sam/coder"}"#;
+        let session = request(
+            &paths.socket,
+            format!("POST /v1/agent/sessions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()),
+        )
+        .await;
+        let token = json_body(&session)["token"].as_str().unwrap().to_owned();
+        let accept = request(
+            &paths.socket,
+            call(
+                "POST",
+                format!("/v1/agent/inbox/{accepted}/accept"),
+                Some(&token),
+            ),
+        )
+        .await;
+        assert_eq!(response_status(&accept), Some(200));
+
+        // (c) Superseded (edit + re-queue) and deleted (tombstoned) deliveries.
+        {
+            let config = config.clone();
+            mirror
+                .with(move |db| {
+                    let mut revised = message("edited", "sam/coder: private revision");
+                    revised.updated = Some("2099-01-01T00:05:00Z".into());
+                    db.upsert_message(&revised)?;
+                    assert_eq!(db.queue_deliveries(&config)?, 1);
+                    assert!(db.mark_deleted("room-claimed", "deleted")?);
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+        let other_route = URL_SAFE_NO_PAD.encode("other-route\0held\u{0}0");
+        let unknown = URL_SAFE_NO_PAD.encode("agents-social\0missing\u{0}0");
+        let mut bodies = Vec::new();
+        for (what, id) in [
+            ("superseded", edited.as_str()),
+            ("deleted", deleted.as_str()),
+            ("accepted", accepted.as_str()),
+            ("other route", other_route.as_str()),
+            ("unknown", unknown.as_str()),
+            ("malformed", "not%20an%20id"),
+        ] {
+            let response = request(&paths.socket, call("GET", preview_of(id), Some(&token))).await;
+            assert_error(&response, 404, "not_found", what);
+            bodies.push(response.split("\r\n\r\n").nth(1).unwrap().to_owned());
+        }
+        // (d) Every unavailable case has a byte-identical body.
+        assert!(
+            bodies.windows(2).all(|pair| pair[0] == pair[1]),
+            "{bodies:?}"
+        );
+        let held_preview =
+            request(&paths.socket, call("GET", preview_of(&held), Some(&token))).await;
+        assert_eq!(response_status(&held_preview), Some(200));
+
+        // (b) Released lease, wrong peer and expired lease.
+        let release = request(
+            &paths.socket,
+            call(
+                "DELETE",
+                "/v1/agent/sessions/test-session".into(),
+                Some(&token),
+            ),
+        )
+        .await;
+        assert_eq!(response_status(&release), Some(204));
+        let response = request(&paths.socket, call("GET", preview_of(&held), Some(&token))).await;
+        assert_error(&response, 401, "auth_required", "released lease");
+
+        let routes = vec!["agents-social".to_string()];
+        let other_peer = auth::PeerIdentity {
+            uid: me.uid,
+            pid: Some(std::process::id().wrapping_add(1)),
+        };
+        let stolen = sessions
+            .issue_agent(
+                other_peer,
+                "other-session".into(),
+                routes.clone(),
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        let response = request(&paths.socket, call("GET", preview_of(&held), Some(&stolen))).await;
+        assert_error(&response, 403, "forbidden_peer", "wrong peer");
+        sessions.revoke(&stolen);
+
+        let expired = sessions
+            .issue_agent(
+                me,
+                "expired-session".into(),
+                routes,
+                std::time::Duration::ZERO,
+            )
+            .unwrap();
+        let response = request(
+            &paths.socket,
+            call("GET", preview_of(&held), Some(&expired)),
+        )
+        .await;
+        assert_error(&response, 401, "auth_required", "expired lease");
+
+        // None of the refused requests consumed the held delivery.
+        let pending = mirror
+            .with(|db| db.deliveries(&["agents-social".into()], Some("pending")))
+            .await
+            .unwrap();
+        assert!(pending.iter().any(|delivery| delivery.id == held));
+        server.shutdown().await.unwrap();
+    }
+
     fn json_body(response: &str) -> serde_json::Value {
         serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap()
     }

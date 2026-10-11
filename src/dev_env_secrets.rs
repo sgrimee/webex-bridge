@@ -5,7 +5,12 @@
 //! changes process environment. The future synchronous binary bootstrap owns
 //! those operations and must call these guards before Tokio creates threads.
 
-use crate::config::{Config, DevSecretSource, OAuthScope};
+use crate::{
+    auth::{AuthProvider, TokenSet},
+    config::{Config, DevSecretSource, OAuthScope},
+    mirror::MirrorKeyProvider,
+    secrets::ClientCredentials,
+};
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
@@ -14,6 +19,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs,
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 use zeroize::Zeroizing;
 
@@ -159,7 +165,82 @@ pub struct DevelopmentSecrets {
     mirror_key: Zeroizing<[u8; 32]>,
 }
 
+/// In-memory providers created only from a previously validated development
+/// secret bundle. They are intentionally not wired into daemon startup yet.
+#[allow(dead_code)] // Kept inert until the synchronous bootstrap is fully wired.
+pub(crate) struct DevelopmentProviders {
+    pub(crate) auth: DevelopmentAuthProvider,
+    pub(crate) mirror_key: DevelopmentMirrorKeyProvider,
+}
+
+/// Credential/token provider that has no Keychain or filesystem fallback.
+#[allow(dead_code)] // Constructed only by the intentionally inert provider factory.
+pub(crate) struct DevelopmentAuthProvider {
+    client_id: Zeroizing<String>,
+    client_secret: Zeroizing<String>,
+    token_set: Mutex<Zeroizing<String>>,
+}
+
+impl AuthProvider for DevelopmentAuthProvider {
+    fn credentials(&self) -> Result<ClientCredentials> {
+        Ok(ClientCredentials {
+            id: self.client_id.to_string(),
+            secret: self.client_secret.to_string(),
+        })
+    }
+
+    fn load_tokens(&self) -> Result<Option<TokenSet>> {
+        let token_set = self
+            .token_set
+            .lock()
+            .map_err(|_| anyhow::anyhow!("development token store is unavailable"))?;
+        serde_json::from_str(token_set.as_str())
+            .map(Some)
+            .context("development token store is malformed")
+    }
+
+    fn save_tokens(&self, tokens: &TokenSet) -> Result<()> {
+        let serialized = Zeroizing::new(serde_json::to_string(tokens)?);
+        let mut token_set = self
+            .token_set
+            .lock()
+            .map_err(|_| anyhow::anyhow!("development token store is unavailable"))?;
+        *token_set = serialized;
+        Ok(())
+    }
+}
+
+/// Fixed mirror-key provider for one isolated development process. It never
+/// creates, reads, or updates a Keychain value.
+#[allow(dead_code)] // Constructed only by the intentionally inert provider factory.
+pub(crate) struct DevelopmentMirrorKeyProvider {
+    key: Zeroizing<[u8; 32]>,
+}
+
+impl MirrorKeyProvider for DevelopmentMirrorKeyProvider {
+    fn mirror_key(&self, _existing_db: bool) -> Result<[u8; 32]> {
+        Ok(*self.key)
+    }
+}
+
 impl DevelopmentSecrets {
+    /// Turn this validated secret bundle into in-memory-only providers. A
+    /// future synchronous bootstrap must use only these providers with the
+    /// canonical development root returned by `validate_guards`.
+    #[allow(dead_code)] // Bootstrap wiring is deliberately deferred.
+    pub(crate) fn into_providers(self) -> DevelopmentProviders {
+        DevelopmentProviders {
+            auth: DevelopmentAuthProvider {
+                client_id: self.client_id,
+                client_secret: self.client_secret,
+                token_set: Mutex::new(self.token_set),
+            },
+            mirror_key: DevelopmentMirrorKeyProvider {
+                key: self.mirror_key,
+            },
+        }
+    }
+
     /// Borrow the integration ID for the immediate OAuth client construction.
     pub fn client_id(&self) -> &str {
         &self.client_id
@@ -411,6 +492,7 @@ fn fixture(now: u64) -> BTreeMap<OsString, OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn guard<'a>(development_root: &'a Path, production_root: &'a Path) -> GuardRequest<'a> {
         GuardRequest {
@@ -543,6 +625,60 @@ mod tests {
         assert!(scrubbed
             .keys()
             .all(|name| !name.to_string_lossy().starts_with(PREFIX)));
+    }
+
+    #[test]
+    fn in_memory_providers_rotate_synthetic_tokens_without_keychain() {
+        let providers =
+            capture_from_map(&fixture(1_700_000_000), 1_700_000_000, OAuthScope::Granular)
+                .unwrap()
+                .into_providers();
+        let credentials = providers.auth.credentials().unwrap();
+        assert_eq!(credentials.id, "client-id");
+        assert_eq!(credentials.secret, "client-secret");
+        let before = providers.auth.load_tokens().unwrap().unwrap();
+        assert_eq!(before.access_token, "access-token");
+        let rotated = TokenSet {
+            access_token: "rotated-access-token".into(),
+            refresh_token: "rotated-refresh-token".into(),
+            issued_at: 1_700_000_001,
+            expires_at: 1_700_003_601,
+            refresh_expires_at: 1_700_086_401,
+            scopes_verified: false,
+            scope_mode: OAuthScope::Granular,
+        };
+        providers.auth.save_tokens(&rotated).unwrap();
+        let after = providers.auth.load_tokens().unwrap().unwrap();
+        assert_eq!(after.access_token, "rotated-access-token");
+        assert_eq!(after.refresh_token, "rotated-refresh-token");
+    }
+
+    #[test]
+    fn provider_key_opens_only_an_isolated_development_mirror() {
+        let temporary = tempfile::tempdir().unwrap();
+        let production_root = temporary.path().join("production");
+        let development_root = temporary.path().join("development");
+        fs::create_dir(&production_root).unwrap();
+        fs::create_dir(&development_root).unwrap();
+        fs::set_permissions(&development_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let providers =
+            capture_from_map(&fixture(1_700_000_000), 1_700_000_000, OAuthScope::Granular)
+                .unwrap()
+                .into_providers();
+        let development_paths = crate::paths::Paths::under(development_root.clone());
+        let mirror = crate::mirror::Mirror::open_with_key_provider(
+            &development_paths,
+            &providers.mirror_key,
+        )
+        .unwrap();
+        drop(mirror);
+        // Existing isolated mirrors use the same injected key; no regeneration
+        // or Keychain lookup is permitted on reopen.
+        crate::mirror::Mirror::open_with_key_provider(&development_paths, &providers.mirror_key)
+            .unwrap();
+        assert!(development_paths.mirror.exists());
+        assert!(!production_root.join("bridge.db").exists());
+        assert!(!production_root.join("run").exists());
     }
 
     #[test]

@@ -229,10 +229,35 @@ pub struct Mirror {
     pub(crate) crypto: MirrorCrypto,
 }
 
+/// Internal mirror-key seam. The production implementation uses Keychain;
+/// a future fully guarded development bootstrap supplies its fixed in-memory
+/// key instead. There is no fallback between providers.
+pub(crate) trait MirrorKeyProvider: Send + Sync {
+    fn mirror_key(&self, existing_db: bool) -> Result<[u8; 32]>;
+}
+
+struct KeychainMirrorKeyProvider;
+
+impl MirrorKeyProvider for KeychainMirrorKeyProvider {
+    fn mirror_key(&self, existing_db: bool) -> Result<[u8; 32]> {
+        load_or_create_key(existing_db)
+    }
+}
+
 impl Mirror {
     /// Open/create a 0600 WAL database using a 256-bit key in the user's Keychain.
     /// An existing DB without its key or verification sentinel is never re-keyed silently.
     pub fn open(paths: &Paths) -> Result<Self> {
+        Self::open_with_key_provider(paths, &KeychainMirrorKeyProvider)
+    }
+
+    /// Open a mirror with an explicitly selected key provider. This internal
+    /// seam is for a future development bootstrap that has already validated
+    /// and canonicalized its isolated root; it never consults Keychain itself.
+    pub(crate) fn open_with_key_provider(
+        paths: &Paths,
+        provider: &dyn MirrorKeyProvider,
+    ) -> Result<Self> {
         paths.ensure_dirs()?;
         let existed = match fs::symlink_metadata(&paths.mirror) {
             Ok(_) => {
@@ -242,7 +267,7 @@ impl Mirror {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(error) => return Err(error.into()),
         };
-        let key = load_or_create_key(existed)?;
+        let key = provider.mirror_key(existed)?;
         if !existed {
             OpenOptions::new()
                 .write(true)

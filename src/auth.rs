@@ -139,15 +139,40 @@ fn token_from_reply(
     })
 }
 
-/// Retrieve tokens from Keychain without revealing them in status/log output.
+/// Internal credential/token persistence seam. Production uses the Keychain
+/// provider below; an isolated development bootstrap can supply an in-memory
+/// provider without any Keychain fallback.
+pub(crate) trait AuthProvider: Send + Sync {
+    fn credentials(&self) -> Result<secrets::ClientCredentials>;
+    fn load_tokens(&self) -> Result<Option<TokenSet>>;
+    fn save_tokens(&self, tokens: &TokenSet) -> Result<()>;
+}
+
+struct KeychainAuthProvider;
+
+impl AuthProvider for KeychainAuthProvider {
+    fn credentials(&self) -> Result<secrets::ClientCredentials> {
+        secrets::credentials_cached()
+    }
+
+    fn load_tokens(&self) -> Result<Option<TokenSet>> {
+        secrets::get("tokens")?
+            .map(|json| serde_json::from_str(&json).context("Stored Webex tokens are malformed"))
+            .transpose()
+    }
+
+    fn save_tokens(&self, tokens: &TokenSet) -> Result<()> {
+        secrets::set("tokens", &serde_json::to_string(tokens)?)
+    }
+}
+
+/// Retrieve production tokens from Keychain without revealing them in status/log output.
 pub fn load() -> Result<Option<TokenSet>> {
-    secrets::get("tokens")?
-        .map(|json| serde_json::from_str(&json).context("Stored Webex tokens are malformed"))
-        .transpose()
+    KeychainAuthProvider.load_tokens()
 }
 
 fn save(tokens: &TokenSet) -> Result<()> {
-    secrets::set("tokens", &serde_json::to_string(tokens)?)
+    KeychainAuthProvider.save_tokens(tokens)
 }
 
 /// Browser login. Binds the callback before opening the browser and validates CSRF/PKCE.
@@ -214,10 +239,22 @@ async fn exchange(form: &[(&str, &str)]) -> Result<TokenReply> {
 /// Refresh under an inter-process lock; re-read tokens after acquiring it.
 /// Never refresh after the refresh expiry or silently broaden scopes.
 pub async fn fresh_token(paths: &Paths) -> Result<TokenSet> {
+    fresh_token_with(paths, &KeychainAuthProvider).await
+}
+
+/// Provider-injected variant for a future, fully guarded foreground development
+/// bootstrap. The supplied provider is authoritative: this function never
+/// consults Keychain on its behalf.
+pub(crate) async fn fresh_token_with(
+    paths: &Paths,
+    provider: &dyn AuthProvider,
+) -> Result<TokenSet> {
     let lock = paths.open_refresh_lock()?;
     lock.lock_exclusive().context("Cannot lock token refresh")?;
     // The lock is released when its file handle is dropped, including on error.
-    let tokens = load()?.context("Login required: run webex-bridge login")?;
+    let tokens = provider
+        .load_tokens()?
+        .context("Login required: token provider has no token")?;
     if tokens.scope_mode != selected_scope(paths)? {
         bail!("OAuth scope configuration changed; reauthorize with webex-bridge login before any Webex request");
     }
@@ -230,15 +267,26 @@ pub async fn fresh_token(paths: &Paths) -> Result<TokenSet> {
         bail!("Webex refresh token expired; run webex-bridge login");
     }
     diagnostics::info("auth.token_refresh_required");
-    refresh_locked(tokens).await
+    refresh_locked_with(tokens, provider).await
 }
 
 /// Development-only forced refresh for testing client/stream rebuilds.
 /// The caller must enforce `[dev]` mode and an allowed test room.
 pub async fn refresh_now(paths: &Paths) -> Result<TokenSet> {
+    refresh_now_with(paths, &KeychainAuthProvider).await
+}
+
+/// Provider-injected forced refresh seam for a future isolated development
+/// bootstrap. It retains the same scope and expiry checks as production.
+pub(crate) async fn refresh_now_with(
+    paths: &Paths,
+    provider: &dyn AuthProvider,
+) -> Result<TokenSet> {
     let lock = paths.open_refresh_lock()?;
     lock.lock_exclusive().context("Cannot lock token refresh")?;
-    let tokens = load()?.context("Login required: run webex-bridge login")?;
+    let tokens = provider
+        .load_tokens()?
+        .context("Login required: token provider has no token")?;
     if tokens.scope_mode != selected_scope(paths)? {
         bail!("OAuth scope configuration changed; reauthorize before refreshing");
     }
@@ -246,11 +294,11 @@ pub async fn refresh_now(paths: &Paths) -> Result<TokenSet> {
         bail!("Webex refresh token expired; run webex-bridge login");
     }
     diagnostics::info("auth.token_refresh_forced");
-    refresh_locked(tokens).await
+    refresh_locked_with(tokens, provider).await
 }
 
-async fn refresh_locked(tokens: TokenSet) -> Result<TokenSet> {
-    let credentials = secrets::credentials_cached()?;
+async fn refresh_locked_with(tokens: TokenSet, provider: &dyn AuthProvider) -> Result<TokenSet> {
+    let credentials = provider.credentials()?;
     let reply = exchange(&[
         ("grant_type", "refresh_token"),
         ("refresh_token", &tokens.refresh_token),
@@ -259,7 +307,7 @@ async fn refresh_locked(tokens: TokenSet) -> Result<TokenSet> {
     ])
     .await?;
     let refreshed = token_from_reply(reply, Some(&tokens), tokens.scope_mode)?;
-    save(&refreshed)?;
+    provider.save_tokens(&refreshed)?;
     diagnostics::info("auth.token_refreshed");
     Ok(refreshed)
 }

@@ -84,6 +84,10 @@ pub struct AcceptedDelivery {
     pub created_at: String,
     /// Revision accepted by the local user.
     pub revision: i64,
+    /// Thread parent message ID, when the accepted message is a reply, so the
+    /// agent host can thread its answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
     /// Sanitized untrusted remote text. It is never logged by this crate.
     pub markdown: String,
 }
@@ -578,8 +582,8 @@ impl Mirror {
         let Some(ReleasedMessage {
             sender_id,
             created_at,
+            parent_id,
             markdown,
-            ..
         }) = released
         else {
             return Ok(Some(AcceptedDelivery {
@@ -588,6 +592,7 @@ impl Mirror {
                 sender_id: None,
                 created_at: String::new(),
                 revision: key.revision,
+                parent_id: None,
                 markdown: String::new(),
             }));
         };
@@ -597,6 +602,7 @@ impl Mirror {
             sender_id,
             created_at,
             revision: key.revision,
+            parent_id,
             markdown,
         }))
     }
@@ -847,6 +853,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(accepted.markdown, preview.markdown);
+        assert_eq!(accepted.parent_id.as_deref(), Some("parent-message"));
 
         // Accepted, rejected, other-route, unknown and malformed: all `None`.
         assert!(mirror

@@ -757,6 +757,7 @@ mod tests {
         .await;
         assert_eq!(response_status(&accepted), Some(200));
         assert_eq!(json_body(&accepted)["markdown"], preview["markdown"]);
+        assert_eq!(json_body(&accepted)["parentId"], "thread-parent");
 
         let rejected = request(
             &paths.socket,

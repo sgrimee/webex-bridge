@@ -631,6 +631,178 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_preview_shows_text_locally_without_deciding() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(temp.path().join("bridge"));
+        let mut config = Config::default();
+        for (id, room, agent, workspace) in [
+            ("agents-social", "room-claimed", "sam/coder", "/workspace"),
+            ("other-route", "room-other", "sam/other", "/elsewhere"),
+        ] {
+            config.routes.push(Route {
+                id: id.into(),
+                room_id: room.into(),
+                agent_name: agent.into(),
+                allowed_senders: vec!["allowed-person".into()],
+                receive: Receive::Addressed,
+                workspace: workspace.into(),
+            });
+        }
+        let mirror = SharedMirror::new(Mirror::in_memory([89_u8; 32]).unwrap());
+        let other_delivery = mirror
+            .with(|db| {
+                db.sync_routes(&config.routes)?;
+                db.upsert_room(
+                    &webex::Room {
+                        id: "room-claimed".into(),
+                        title: Some("Agents social".into()),
+                        room_type: "group".into(),
+                        is_locked: false,
+                        team_id: None,
+                        last_activity: "2099-01-01T00:00:00Z".into(),
+                        creator_id: "allowed-person".into(),
+                        created: "2099-01-01T00:00:00Z".into(),
+                    },
+                    true,
+                )?;
+                db.upsert_person(&webex::Person {
+                    id: "allowed-person".into(),
+                    display_name: "Pat Sender".into(),
+                    ..webex::Person::default()
+                })?;
+                for (id, room, text) in [
+                    (
+                        "first",
+                        "room-claimed",
+                        "sam/coder: private preview content",
+                    ),
+                    (
+                        "second",
+                        "room-claimed",
+                        "sam/coder: rejected private content",
+                    ),
+                    ("third", "room-other", "sam/other: other route content"),
+                ] {
+                    db.upsert_message(&webex::Message {
+                        id: Some(id.into()),
+                        room_id: Some(room.into()),
+                        person_id: Some("allowed-person".into()),
+                        text: Some(text.into()),
+                        parent_id: (id == "first").then(|| "thread-parent".into()),
+                        created: Some(format!("2099-01-01T00:00:0{}Z", id.len())),
+                        ..webex::Message::default()
+                    })?;
+                }
+                assert_eq!(db.queue_deliveries(&config)?, 3);
+                Ok(db.deliveries(&["other-route".into()], None)?[0].id.clone())
+            })
+            .await
+            .unwrap();
+        let (_connection_tx, connection_rx) = watch::channel(ConnectionStatus::Connected);
+        let server = start(
+            &paths,
+            ApiState::with_config(mirror.clone(), connection_rx, Arc::new(config)),
+        )
+        .await
+        .unwrap();
+        let body = r#"{"host":"pi","sessionId":"test-session","cwd":"/workspace","agentName":"sam/coder"}"#;
+        let session = request(
+            &paths.socket,
+            format!("POST /v1/agent/sessions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()),
+        )
+        .await;
+        let token = json_body(&session)["token"].as_str().unwrap().to_owned();
+        let get = |path: String| {
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n")
+        };
+        let post = |path: String| {
+            format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        };
+
+        // The list carries decrypted display names but never message text.
+        let inbox = request(&paths.socket, get("/v1/agent/inbox?state=pending".into())).await;
+        assert_eq!(response_status(&inbox), Some(200));
+        assert!(!inbox.contains("private"));
+        let listed = json_body(&inbox)["deliveries"].as_array().unwrap().clone();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0]["senderName"], "Pat Sender");
+        assert_eq!(listed[0]["roomTitle"], "Agents social");
+        let first = listed[0]["id"].as_str().unwrap().to_owned();
+        let second = listed[1]["id"].as_str().unwrap().to_owned();
+
+        let preview = request(
+            &paths.socket,
+            get(format!("/v1/agent/inbox/{first}/preview")),
+        )
+        .await;
+        assert_eq!(response_status(&preview), Some(200));
+        let preview = json_body(&preview);
+        assert_eq!(preview["id"], first.as_str());
+        assert_eq!(preview["routeId"], "agents-social");
+        assert_eq!(preview["revision"], 0);
+        assert_eq!(preview["senderId"], "allowed-person");
+        assert_eq!(preview["senderName"], "Pat Sender");
+        assert_eq!(preview["roomTitle"], "Agents social");
+        assert_eq!(preview["parentId"], "thread-parent");
+        assert_eq!(preview["markdown"], "sam/coder: private preview content");
+        assert!(preview.get("state").is_none());
+
+        // Preview left it pending; acceptance still works and releases the same text.
+        let still = request(&paths.socket, get("/v1/agent/inbox?state=pending".into())).await;
+        assert_eq!(json_body(&still)["deliveries"].as_array().unwrap().len(), 2);
+        let accepted = request(
+            &paths.socket,
+            post(format!("/v1/agent/inbox/{first}/accept")),
+        )
+        .await;
+        assert_eq!(response_status(&accepted), Some(200));
+        assert_eq!(json_body(&accepted)["markdown"], preview["markdown"]);
+
+        let rejected = request(
+            &paths.socket,
+            post(format!("/v1/agent/inbox/{second}/reject")),
+        )
+        .await;
+        assert_eq!(response_status(&rejected), Some(204));
+        for id in [
+            first.as_str(),
+            second.as_str(),
+            other_delivery.as_str(),
+            "dW5rbm93bg",
+            "not%20an%20id",
+        ] {
+            let response =
+                request(&paths.socket, get(format!("/v1/agent/inbox/{id}/preview"))).await;
+            assert_eq!(response_status(&response), Some(404), "{id}");
+            assert_eq!(response_code(&response), Some("not_found".into()), "{id}");
+            assert!(!response.contains("private"), "{id}");
+            assert!(!response.contains("other route"), "{id}");
+        }
+
+        // The durable audit trail records metadata only for the one preview.
+        let audit = mirror
+            .with(|db| {
+                let mut statement = db.conn.prepare(
+                    "SELECT ref,detail_redacted FROM audit WHERE action='inbox_preview'",
+                )?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        assert_eq!(audit, vec![("agents-social:first:0".into(), None)]);
+        server.shutdown().await.unwrap();
+    }
+
+    fn json_body(response: &str) -> serde_json::Value {
+        serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
     async fn ui_session_cannot_access_agent_scope() {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
         use sha2::{Digest, Sha256};

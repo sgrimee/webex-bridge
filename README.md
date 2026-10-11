@@ -13,7 +13,11 @@ daemon exposes a same-user, 0600 HTTP-over-UDS API at `run/bridge.sock`.
 mirror, lazily hydrate one older message page, and directly send, edit, delete
 or leave an allowlisted group room. Agent hosts can create an exclusive,
 process-bound 60-second route lease and use the scoped inbox API: listing is
-metadata-only, and remote text is released only by an explicit local accept.
+metadata-only (plus optional decrypted `senderName`/`roomTitle` display names),
+and remote text enters model context only through an explicit local accept.
+`GET /v1/agent/inbox/{id}/preview` returns the identical sanitized text of a
+still-pending claimed delivery for local human display in the agent host UI,
+without changing its state; anything else is an indistinguishable `404`.
 Agent sends are encrypted, route-bound drafts; a one-time approval binds the
 exact text and destination, then makes one non-retrying Webex request. SSE
 revalidates the process-bound token for each metadata-only event and filters

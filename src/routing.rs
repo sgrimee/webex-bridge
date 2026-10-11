@@ -31,6 +31,42 @@ pub struct Delivery {
     pub revision: i64,
     /// Pending, accepted or rejected; only requested states are returned.
     pub state: String,
+    /// Decrypted sender display name from the people mirror, when known.
+    /// Local display metadata only; never message text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_name: Option<String>,
+    /// Decrypted title of the route's room for local display only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub room_title: Option<String>,
+}
+
+/// Local-display preview of a still-pending delivery. It carries exactly the
+/// text `accept` would release but changes no delivery state, so the agent host
+/// can show it to the human without adding it to model context.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryPreview {
+    /// Stable opaque delivery ID.
+    pub id: String,
+    /// Configured route, not a room ID.
+    pub route_id: String,
+    /// Revision being previewed.
+    pub revision: i64,
+    /// Canonical message creation time.
+    pub created_at: String,
+    /// Canonical sender Webex person ID.
+    pub sender_id: Option<String>,
+    /// Decrypted sender display name, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_name: Option<String>,
+    /// Decrypted room title for local display only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub room_title: Option<String>,
+    /// Thread parent message ID, when the message is a reply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    /// Sanitized untrusted remote text, identical to the accept release.
+    pub markdown: String,
 }
 
 /// Content released only after an explicit local acceptance.
@@ -58,7 +94,21 @@ struct DeliveryKey {
     revision: i64,
 }
 
-type StoredAcceptedMessage = (Option<String>, String, Option<Vec<u8>>, Option<Vec<u8>>);
+/// Decrypted, sanitized release material shared by preview and accept.
+struct ReleasedMessage {
+    sender_id: Option<String>,
+    created_at: String,
+    parent_id: Option<String>,
+    markdown: String,
+}
+
+type StoredReleasedMessage = (
+    Option<String>,
+    String,
+    Option<String>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+);
 
 impl DeliveryKey {
     fn encode(&self) -> String {
@@ -289,6 +339,8 @@ impl Mirror {
                 created_at,
                 revision,
                 state: "pending".into(),
+                sender_name: None,
+                room_title: None,
             });
         }
         Ok(queued)
@@ -309,8 +361,9 @@ impl Mirror {
             .collect::<Vec<_>>()
             .join(",");
         let mut query = format!(
-            "SELECT d.route_id,d.message_id,d.revision,d.state,m.sender_id,m.created_at
+            "SELECT d.route_id,d.message_id,d.revision,d.state,m.sender_id,m.created_at,r.room_id
              FROM deliveries d JOIN messages m ON m.message_id=d.message_id AND m.revision=d.revision
+             JOIN routes r ON r.route_id=d.route_id
              WHERE d.route_id IN ({placeholders})"
         );
         if state.is_some() {
@@ -328,17 +381,155 @@ impl Mirror {
                 message_id: row.get(1)?,
                 revision: row.get(2)?,
             };
-            Ok(Delivery {
-                id: key.encode(),
-                route_id: key.route_id.clone(),
-                revision: key.revision,
-                state: row.get(3)?,
-                sender_id: row.get(4)?,
-                created_at: row.get(5)?,
-            })
+            Ok((
+                Delivery {
+                    id: key.encode(),
+                    route_id: key.route_id.clone(),
+                    revision: key.revision,
+                    state: row.get(3)?,
+                    sender_id: row.get(4)?,
+                    created_at: row.get(5)?,
+                    sender_name: None,
+                    room_title: None,
+                },
+                row.get::<_, String>(6)?,
+            ))
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        // Display metadata is decrypted once per distinct room/sender.
+        let mut titles = HashMap::<String, Option<String>>::new();
+        let mut names = HashMap::<String, Option<String>>::new();
+        let mut deliveries = Vec::with_capacity(rows.len());
+        for (mut delivery, room_id) in rows {
+            delivery.room_title = match titles.get(&room_id) {
+                Some(title) => title.clone(),
+                None => {
+                    let title = self.display_room_title(&room_id)?;
+                    titles.insert(room_id, title.clone());
+                    title
+                }
+            };
+            if let Some(sender_id) = delivery.sender_id.clone() {
+                delivery.sender_name = match names.get(&sender_id) {
+                    Some(name) => name.clone(),
+                    None => {
+                        let name = self.display_sender_name(&sender_id)?;
+                        names.insert(sender_id, name.clone());
+                        name
+                    }
+                };
+            }
+            deliveries.push(delivery);
+        }
+        Ok(deliveries)
+    }
+
+    /// Return the exact sanitized text `accept` would release for one pending
+    /// delivery on a claimed route, without changing its state. Returns `None`
+    /// (indistinguishably) for malformed, unknown, unclaimed or non-pending
+    /// deliveries. Records a metadata-only audit row; never logs content.
+    pub fn preview_delivery(
+        &self,
+        route_ids: &[String],
+        encoded_id: &str,
+    ) -> Result<Option<DeliveryPreview>> {
+        let Ok(key) = DeliveryKey::decode(encoded_id) else {
+            return Ok(None);
+        };
+        if !route_ids.iter().any(|route_id| route_id == &key.route_id) {
+            return Ok(None);
+        }
+        let room_id = self
+            .conn
+            .query_row(
+                "SELECT r.room_id FROM deliveries d JOIN routes r ON r.route_id=d.route_id
+                 WHERE d.route_id=?1 AND d.message_id=?2 AND d.revision=?3 AND d.state='pending'",
+                params![key.route_id, key.message_id, key.revision],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(room_id) = room_id else {
+            return Ok(None);
+        };
+        let Some(released) = self.released_message(&key)? else {
+            return Ok(None);
+        };
+        let sender_name = match released.sender_id.as_deref() {
+            Some(sender_id) => self.display_sender_name(sender_id)?,
+            None => None,
+        };
+        let room_title = self.display_room_title(&room_id)?;
+        self.conn.execute(
+            "INSERT INTO audit(ts,scope,action,ref,detail_redacted) VALUES (?1,'agent','inbox_preview',?2,NULL)",
+            params![
+                Utc::now().to_rfc3339(),
+                format!("{}:{}:{}", key.route_id, key.message_id, key.revision)
+            ],
+        )?;
+        Ok(Some(DeliveryPreview {
+            id: key.encode(),
+            route_id: key.route_id,
+            revision: key.revision,
+            created_at: released.created_at,
+            sender_id: released.sender_id,
+            sender_name,
+            room_title,
+            parent_id: released.parent_id,
+            markdown: released.markdown,
+        }))
+    }
+
+    /// Decrypt and sanitize the active body of one delivery revision. This is
+    /// the single release path shared by preview and accept.
+    fn released_message(&self, key: &DeliveryKey) -> Result<Option<ReleasedMessage>> {
+        let stored: Option<StoredReleasedMessage> = self
+            .conn
+            .query_row(
+                "SELECT sender_id,created_at,parent_id,body_ct,body_nonce FROM messages
+                 WHERE message_id=?1 AND revision=?2 AND status='active'",
+                params![key.message_id, key.revision],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((sender_id, created_at, parent_id, Some(body_ct), Some(body_nonce))) = stored
+        else {
+            return Ok(None);
+        };
+        let body = self.crypto.open(
+            &body_ct,
+            &body_nonce,
+            &super::mirror::message_aad("body", &key.message_id, key.revision),
+        )?;
+        let markdown = sanitize_terminal_text(
+            &String::from_utf8(body).context("Invalid encrypted message body")?,
+        );
+        Ok(Some(ReleasedMessage {
+            sender_id,
+            created_at,
+            parent_id,
+            markdown,
+        }))
+    }
+
+    fn display_room_title(&self, room_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .room_title(room_id)?
+            .map(|title| sanitize_display_line(&title)))
+    }
+
+    fn display_sender_name(&self, sender_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .person_display_name(sender_id)?
+            .map(|name| sanitize_display_line(&name)))
     }
 
     /// Change one claimed delivery's decision. Only acceptance decrypts and
@@ -378,22 +569,15 @@ impl Mirror {
                 markdown: String::new(),
             }));
         }
-        let (sender_id, created_at, body_ct, body_nonce): StoredAcceptedMessage = self.conn.query_row(
-            "SELECT sender_id,created_at,body_ct,body_nonce FROM messages WHERE message_id=?1 AND revision=?2 AND status='active'",
-            params![key.message_id, key.revision],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
-        let (Some(body_ct), Some(body_nonce)) = (body_ct, body_nonce) else {
+        let Some(ReleasedMessage {
+            sender_id,
+            created_at,
+            markdown,
+            ..
+        }) = self.released_message(&key)?
+        else {
             bail!("Accepted delivery no longer has a body");
         };
-        let body = self.crypto.open(
-            &body_ct,
-            &body_nonce,
-            &super::mirror::message_aad("body", &key.message_id, key.revision),
-        )?;
-        let markdown = sanitize_terminal_text(
-            &String::from_utf8(body).context("Invalid encrypted message body")?,
-        );
         Ok(Some(AcceptedDelivery {
             id: key.encode(),
             route_id: key.route_id,
@@ -448,6 +632,15 @@ fn sanitize_terminal_text(input: &str) -> String {
                 '\u{1b}' | '\u{009b}' | '\u{009d}' | '\u{0090}' | '\u{0098}'
             ) && (!ch.is_control() || matches!(*ch, '\n' | '\r' | '\t'))
         })
+        .collect()
+}
+
+/// Display metadata (names, titles) is remote free text too: strip terminal
+/// controls and collapse line breaks/tabs so it cannot forge extra UI lines.
+fn sanitize_display_line(input: &str) -> String {
+    sanitize_terminal_text(input)
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
         .collect()
 }
 
@@ -542,5 +735,94 @@ mod tests {
         assert_eq!(deliveries[0].state, "superseded");
         assert_eq!(deliveries[1].state, "pending");
         assert_eq!(deliveries[1].revision, 1);
+    }
+
+    #[test]
+    fn preview_releases_accept_text_without_changing_state_and_hides_others() {
+        let config = config();
+        let mut mirror = Mirror::in_memory([9; 32]).unwrap();
+        mirror.sync_routes(&config.routes).unwrap();
+        mirror
+            .upsert_room(
+                &webex::Room {
+                    id: "room".into(),
+                    title: Some("Route\nroom\u{1b}[2J".into()),
+                    room_type: "group".into(),
+                    is_locked: false,
+                    team_id: None,
+                    last_activity: "2099-01-01T00:00:00Z".into(),
+                    creator_id: "person".into(),
+                    created: "2099-01-01T00:00:00Z".into(),
+                },
+                true,
+            )
+            .unwrap();
+        mirror
+            .upsert_person(&webex::Person {
+                id: "person".into(),
+                display_name: "Pat Sender".into(),
+                ..webex::Person::default()
+            })
+            .unwrap();
+        let mut reply = message("sam/coder: look\u{1b}[2J here");
+        reply.parent_id = Some("parent-message".into());
+        mirror.upsert_message(&reply).unwrap();
+        let mut second = message("sam/coder: second");
+        second.id = Some("second".into());
+        mirror.upsert_message(&second).unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 2);
+        let pending = mirror.deliveries(&["r".into()], Some("pending")).unwrap();
+        assert_eq!(pending[0].sender_name.as_deref(), Some("Pat Sender"));
+        assert_eq!(pending[0].room_title.as_deref(), Some("Route room[2J"));
+        let routes = ["r".to_string()];
+
+        let preview = mirror
+            .preview_delivery(&routes, &pending[0].id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(preview.markdown, "sam/coder: look[2J here");
+        assert_eq!(preview.parent_id.as_deref(), Some("parent-message"));
+        assert_eq!(preview.sender_name.as_deref(), Some("Pat Sender"));
+        assert_eq!(preview.room_title.as_deref(), Some("Route room[2J"));
+        assert_eq!(
+            mirror.deliveries(&routes, Some("pending")).unwrap().len(),
+            2
+        );
+        let accepted = mirror
+            .decide_delivery(&routes, &pending[0].id, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.markdown, preview.markdown);
+
+        // Accepted, rejected, other-route, unknown and malformed: all `None`.
+        assert!(mirror
+            .preview_delivery(&routes, &pending[0].id)
+            .unwrap()
+            .is_none());
+        mirror
+            .decide_delivery(&routes, &pending[1].id, false)
+            .unwrap();
+        assert!(mirror
+            .preview_delivery(&routes, &pending[1].id)
+            .unwrap()
+            .is_none());
+        assert!(mirror
+            .preview_delivery(&["other".into()], &pending[0].id)
+            .unwrap()
+            .is_none());
+        let unknown = DeliveryKey {
+            route_id: "r".into(),
+            message_id: "missing".into(),
+            revision: 0,
+        }
+        .encode();
+        assert!(mirror
+            .preview_delivery(&routes, &unknown)
+            .unwrap()
+            .is_none());
+        assert!(mirror
+            .preview_delivery(&routes, "not base64!")
+            .unwrap()
+            .is_none());
     }
 }

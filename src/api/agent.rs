@@ -5,6 +5,7 @@
 //! workspace contain the validated local client cwd.
 
 use super::{auth, ApiState};
+use crate::diagnostics;
 use axum::{
     extract::{Extension, Path, Query, State},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
@@ -429,6 +430,35 @@ async fn outbox_status(
     }
 }
 
+/// Local-display preview: same route/scope checks as accept, same sanitized
+/// text, but no state change. Every failure is an indistinguishable 404 so a
+/// session cannot probe other routes or decision states.
+async fn preview_inbox(
+    State(state): State<ApiState>,
+    Extension(peer): Extension<auth::PeerIdentity>,
+    Path(delivery_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let route_ids = match claimed_routes(&state, peer, &headers) {
+        Ok(routes) => routes,
+        Err(error) => return session_error(error),
+    };
+    match state
+        .mirror()
+        .with(|db| db.preview_delivery(&route_ids, &delivery_id))
+        .await
+    {
+        Ok(Some(preview)) => {
+            // Metadata-only: no IDs, names or content reach the daemon log.
+            diagnostics::debug("agent.inbox_preview");
+            Json(preview).into_response()
+        }
+        Ok(None) | Err(_) => {
+            json_error(StatusCode::NOT_FOUND, "not_found", "Delivery was not found")
+        }
+    }
+}
+
 async fn accept_inbox(
     state: State<ApiState>,
     peer: Extension<auth::PeerIdentity>,
@@ -448,13 +478,16 @@ async fn reject_inbox(
 }
 
 /// Routes that establish, renew and release a route-scoped agent lease. Inbox
-/// listing contains metadata only; acceptance is the sole content release.
+/// listing contains metadata only (plus decrypted sender/room display names);
+/// acceptance is the sole release into model context, while preview returns the
+/// same text for local human display without changing delivery state.
 pub fn router() -> Router<ApiState> {
     Router::new()
         .route("/v1/agent/sessions", post(create_session))
         .route("/v1/agent/sessions/{session_id}/heartbeat", post(heartbeat))
         .route("/v1/agent/sessions/{session_id}", delete(release_session))
         .route("/v1/agent/inbox", get(inbox))
+        .route("/v1/agent/inbox/{delivery_id}/preview", get(preview_inbox))
         .route("/v1/agent/inbox/{delivery_id}/accept", post(accept_inbox))
         .route("/v1/agent/inbox/{delivery_id}/reject", post(reject_inbox))
         .route("/v1/agent/outbox", post(create_draft))

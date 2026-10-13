@@ -34,22 +34,22 @@ description = "Build, sign, and run the daemon in the foreground"
 run = "./scripts/run-bridged-dev"
 
 [tasks."service:start"]
-description = "Build/sign, then install and start the macOS LaunchAgent"
+description = "Build/sign, copy the verified binaries into the private bin/, then install and start the LaunchAgent"
 depends = ["build"]
-run = "./target/debug/webex-bridge install-service"
+run = '"${CARGO_TARGET_DIR:-target}/debug/webex-bridge" install-service'
 
 [tasks."service:stop"]
-description = "Stop and remove the macOS LaunchAgent"
-run = "./target/debug/webex-bridge uninstall-service"
+description = "Stop and remove the macOS LaunchAgent and its installed binaries"
+run = '"$HOME/Library/Application Support/webex-bridge/bin/webex-bridge" uninstall-service'
 
 [tasks."service:restart"]
-description = "Build/sign, then replace and restart the macOS LaunchAgent"
+description = "Build/sign, re-copy the verified binaries into the private bin/, then restart the LaunchAgent"
 depends = ["build"]
-run = "./target/debug/webex-bridge install-service"
+run = '"${CARGO_TARGET_DIR:-target}/debug/webex-bridge" install-service'
 
 [tasks."service:status"]
-description = "Show bridge authentication and mirror progress"
-run = "./target/debug/webex-bridge status"
+description = "Show bridge authentication and mirror progress (installed CLI)"
+run = '"$HOME/Library/Application Support/webex-bridge/bin/webex-bridge" status'
 
 [tasks."service:logs"]
 description = "Follow redacted daemon lifecycle logs"

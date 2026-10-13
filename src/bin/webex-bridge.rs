@@ -2,7 +2,10 @@
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use webex_bridge::{
     auth,
     config::Config,
@@ -36,11 +39,11 @@ async fn main() -> Result<()> {
             println!("{}", rooms::own_person_id(&tokens.access_token).await?);
         }
         [command] if command == "install-service" => {
-            service::install(&bridged_binary()?)?;
+            service::install(&build_dir()?, &paths)?;
             println!("webex-bridged service installed and started");
         }
         [command] if command == "uninstall-service" => {
-            service::uninstall()?;
+            service::uninstall(&paths)?;
             println!("webex-bridged service removed");
         }
         [command] if command == "status" => {
@@ -381,20 +384,15 @@ async fn cycle_member(
     Ok(())
 }
 
-fn bridged_binary() -> Result<PathBuf> {
+/// Directory holding the signed `webex-bridge`/`webex-bridged` pair to
+/// install: the directory of this CLI executable.
+fn build_dir() -> Result<PathBuf> {
     let cli = std::env::current_exe().context("Cannot locate webex-bridge executable")?;
-    let candidate = cli
+    cli.canonicalize()
+        .context("Cannot canonicalize webex-bridge path")?
         .parent()
-        .context("webex-bridge executable has no parent directory")?
-        .join("webex-bridged");
-    let metadata = std::fs::metadata(&candidate)
-        .context("webex-bridged binary is unavailable next to webex-bridge")?;
-    if !metadata.is_file() {
-        bail!("webex-bridged path is not a regular file");
-    }
-    candidate
-        .canonicalize()
-        .context("Cannot canonicalize webex-bridged path")
+        .map(Path::to_path_buf)
+        .context("webex-bridge executable has no parent directory")
 }
 
 fn parse_probe_seconds(value: &str, label: &str) -> Result<u64> {

@@ -19,6 +19,9 @@ pub struct Paths {
     pub socket: PathBuf,
     /// Refresh lock, shared by the CLI and daemon.
     pub refresh_lock: PathBuf,
+    /// Private 0700 directory holding the verified, signed executables that
+    /// the LaunchAgent runs (never a build tree).
+    pub bin: PathBuf,
 }
 
 impl Paths {
@@ -39,6 +42,7 @@ impl Paths {
             mirror: data.join("bridge.db"),
             socket: data.join("run/bridge.sock"),
             refresh_lock: data.join("run/refresh.lock"),
+            bin: data.join("bin"),
             data,
         }
     }

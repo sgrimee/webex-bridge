@@ -46,10 +46,27 @@ Local testing:
 ```sh
 mise run check             # fmt check + tests + clippy
 mise run build             # build and sign both local executables
-mise run service:start     # signed build + install/start LaunchAgent
-mise run service:restart   # signed build + replace/restart LaunchAgent
-mise run service:status
-mise run service:stop
+mise run service:start     # signed build, copy into private bin/, install/start LaunchAgent
+mise run service:restart   # signed build, re-copy into private bin/, restart LaunchAgent
+mise run service:status    # installed CLI
+mise run service:stop      # remove LaunchAgent and installed binaries
+```
+
+The LaunchAgent never runs a binary from the build tree. `install-service`
+copies the persistently signed `webex-bridged` and `webex-bridge` into the
+private 0700 directory `~/Library/Application Support/webex-bridge/bin/`,
+re-verifies the signature of each copy (`codesign --verify --strict`, expected
+identifier, no ad-hoc signature) and atomically replaces the installed files;
+the plist points at that copy. Later `cargo build`/`cargo test` runs therefore
+cannot replace or ad-hoc re-sign the running daemon. The build scripts and
+Mise tasks honour `CARGO_TARGET_DIR`.
+
+Upgrading from an install made before this change (whose plist still points
+at `target/debug/webex-bridged`): build outside the checkout so the running
+binary is not overwritten in place, then reinstall once:
+
+```sh
+CARGO_TARGET_DIR=$HOME/tmp/wb-target mise run service:restart
 ```
 
 ```sh
@@ -58,10 +75,11 @@ cargo run --bin webex-bridge -- status
 # Always build and persistently sign the daemon before starting/installing it:
 # an ad-hoc Cargo signature causes repeated Keychain/password prompts.
 ./scripts/sign-bridged-dev
-# Installs/removes the per-user macOS LaunchAgent (persistent service).
-# The installer rejects unsigned or ad-hoc-signed daemon binaries.
-cargo run --bin webex-bridge -- install-service
-cargo run --bin webex-bridge -- uninstall-service
+# Installs/removes the per-user macOS LaunchAgent (persistent service) from the
+# signed build (`cargo run` would rebuild ad hoc and is refused by the
+# installer, which rejects unsigned or ad-hoc-signed source binaries and copies).
+"${CARGO_TARGET_DIR:-target}/debug/webex-bridge" install-service
+"$HOME/Library/Application Support/webex-bridge/bin/webex-bridge" uninstall-service
 # Explicit local diagnostic: emits roomId, title, isMember and result as JSON.
 # It decrypts the room title for stdout only; daemon logs remain metadata-only.
 cargo run --bin webex-bridge -- sync failures

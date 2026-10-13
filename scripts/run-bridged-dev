@@ -10,4 +10,4 @@ repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 
 ./scripts/sign-bridged-dev
-exec target/debug/webex-bridged "$@"
+exec "${CARGO_TARGET_DIR:-target}/debug/webex-bridged" "$@"

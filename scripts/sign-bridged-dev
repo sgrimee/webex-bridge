@@ -26,10 +26,14 @@ fi
 
 # Both local executables access Keychain-backed bridge state. Signing both
 # avoids password prompts when invoking either the CLI or the launchd daemon.
+# Honour CARGO_TARGET_DIR. The installed LaunchAgent runs only the verified
+# copies under ~/Library/Application Support/webex-bridge/bin, so rebuilding
+# here never replaces the running service.
+target_dir=${CARGO_TARGET_DIR:-target}
 cargo build --bins
 for binary in webex-bridge webex-bridged; do
     codesign --force --sign "$identity" \
         --identifier "com.sgrimee.${binary}" \
         --timestamp=none \
-        "target/debug/${binary}"
+        "${target_dir}/debug/${binary}"
 done

@@ -1091,6 +1091,36 @@ mod tests {
     }
 
     #[test]
+    fn an_edited_routed_reply_still_releases_its_parent_id() {
+        let config = config();
+        let mut mirror = Mirror::in_memory([36; 32]).unwrap();
+        mirror.sync_routes(&config.routes).unwrap();
+        let mut reply = message("sam/coder: in a thread");
+        reply.parent_id = Some("thread-root".into());
+        mirror.upsert_message(&reply).unwrap();
+        mirror.queue_deliveries(&config).unwrap();
+        // The edit arrives from REST without parentId.
+        let mut edited = message("sam/coder: in a thread, edited");
+        edited.updated = Some("2099-01-01T00:05:00Z".into());
+        mirror.upsert_message(&edited).unwrap();
+        mirror.queue_deliveries(&config).unwrap();
+        let routes = ["r".to_string()];
+        let pending = mirror.deliveries(&routes, Some("pending")).unwrap();
+        assert_eq!(pending.len(), 1, "only the edited revision is pending");
+        let preview = mirror
+            .preview_delivery(&routes, &pending[0].id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(preview.parent_id.as_deref(), Some("thread-root"));
+        let accepted = mirror
+            .decide_delivery(&routes, &pending[0].id, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.markdown, "sam/coder: in a thread, edited");
+        assert_eq!(accepted.parent_id.as_deref(), Some("thread-root"));
+    }
+
+    #[test]
     fn widening_a_route_never_admits_already_filtered_revisions() {
         let mut config = config();
         let mut mirror = Mirror::in_memory([33; 32]).unwrap();

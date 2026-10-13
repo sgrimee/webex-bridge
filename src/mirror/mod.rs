@@ -952,6 +952,22 @@ impl Mirror {
             }
         }
         let created = previous.is_none();
+        // A thread parent never changes, but Webex omits parentId when it
+        // returns an edited message. Keep the known parent rather than
+        // overwriting it with NULL (body_kind is stored as returned).
+        let parent_id = match (&message.parent_id, &previous) {
+            (Some(parent), _) => Some(parent.clone()),
+            (None, Some(_)) => self
+                .conn
+                .query_row(
+                    "SELECT parent_id FROM messages WHERE message_id=?1 AND parent_id IS NOT NULL
+                     ORDER BY revision DESC LIMIT 1",
+                    [id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?,
+            (None, None) => None,
+        };
         // The revision counter bump and the row INSERT share one transaction.
         let tx = self.conn.transaction()?;
         let revision = take_revision(&tx, previous.as_ref().map(|(rev, ..)| *rev))?;
@@ -982,7 +998,7 @@ impl Mirror {
             "INSERT INTO messages(room_id,message_id,revision,parent_id,sender_id,created_at,updated_at,
                                   status,body_ct,body_nonce,files_meta_ct,body_kind)
              VALUES (?1,?2,?3,?4,?5,?6,?7,'active',?8,?9,?10,?11)",
-            params![room_id,id,revision,message.parent_id,message.person_id,created_at,
+            params![room_id,id,revision,parent_id,message.person_id,created_at,
                 message.updated,body_ct,body_nonce,files_ct,body_kind],
         )?;
         tx.execute(
@@ -1824,6 +1840,40 @@ mod tests {
             updated: updated.map(str::to_owned),
             ..Message::default()
         }
+    }
+
+    #[test]
+    fn an_edit_without_parent_id_keeps_the_known_thread_parent() {
+        let mut mirror = Mirror::in_memory([35_u8; 32]).unwrap();
+        let mut reply = message("reply", "original", None);
+        reply.parent_id = Some("root".into());
+        reply.markdown = Some("**original**".into());
+        assert_eq!(mirror.upsert_message(&reply).unwrap(), Upsert::Created(0));
+        // Webex returns the edited message without parentId or markdown.
+        let mut edited = message("reply", "original edited", Some("2026-10-08T12:05:00Z"));
+        edited.parent_id = None;
+        assert_eq!(mirror.upsert_message(&edited).unwrap(), Upsert::Edited(1));
+        let stored = mirror.ui_message("reply").unwrap().unwrap();
+        assert_eq!(stored.parent_id.as_deref(), Some("root"));
+        assert_eq!(stored.body.unwrap().kind, "plainText", "kind as returned");
+        // A message that never had a parent stays top-level.
+        assert_eq!(
+            mirror
+                .upsert_message(&message("top", "top-level", None))
+                .unwrap(),
+            Upsert::Created(2)
+        );
+        assert_eq!(
+            mirror
+                .upsert_message(&message(
+                    "top",
+                    "top-level edited",
+                    Some("2026-10-08T12:06:00Z")
+                ))
+                .unwrap(),
+            Upsert::Edited(3)
+        );
+        assert_eq!(mirror.ui_message("top").unwrap().unwrap().parent_id, None);
     }
 
     #[test]

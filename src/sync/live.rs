@@ -123,7 +123,15 @@ fn event_room_id(event: &Event, from_delete_target: bool) -> Result<String> {
     Ok(room.id().to_owned())
 }
 
-/// Recheck active messages in a room after a delete signal or reconnect.
+/// How many of a room's newest active messages a reconcile re-checks. A
+/// Mercury delete names only its room, so every check is one REST GET; a full
+/// pass over a large room blocked its caller for minutes. Deletions are
+/// overwhelmingly of recent messages, mirroring catch-up's newest-first page
+/// semantics. Trade-off: deleting a message older than this window is not
+/// detected; it stays in the mirror until a future full or windowed pass.
+pub const RECONCILE_RECENT_MESSAGES: usize = 100;
+
+/// Recheck a room's newest active messages after a delete signal or reconnect.
 /// A room REST check prevents misclassifying loss of membership as mass deletion.
 /// HTTP 404 for a known message is checked twice before irreversible body purge.
 pub async fn reconcile_room(
@@ -131,8 +139,17 @@ pub async fn reconcile_room(
     rest: &WebexRest,
     room_id: &str,
 ) -> Result<ReconcileResult> {
+    reconcile_recent(mirror, rest, room_id, RECONCILE_RECENT_MESSAGES).await
+}
+
+async fn reconcile_recent(
+    mirror: &SharedMirror,
+    rest: &WebexRest,
+    room_id: &str,
+    limit: usize,
+) -> Result<ReconcileResult> {
     let started = std::time::Instant::now();
-    let outcome = reconcile_room_inner(mirror, rest, room_id).await;
+    let outcome = reconcile_room_inner(mirror, rest, room_id, limit).await;
     let elapsed_ms = started.elapsed().as_millis();
     // Counts and timing only: never room/message IDs or bodies.
     match &outcome {
@@ -151,13 +168,16 @@ async fn reconcile_room_inner(
     mirror: &SharedMirror,
     rest: &WebexRest,
     room_id: &str,
+    limit: usize,
 ) -> Result<ReconcileResult> {
     let room = rest
         .room(room_id)
         .await?
         .context("Room unavailable; cannot infer message deletions")?;
     mirror.with(|db| db.upsert_room(&room, true)).await?;
-    let ids = mirror.with(|db| db.active_message_ids(room_id)).await?;
+    let ids = mirror
+        .with(|db| db.recent_active_message_ids(room_id, limit))
+        .await?;
     let mut result = ReconcileResult {
         checked: 0,
         edited: 0,
@@ -301,6 +321,7 @@ pub async fn ingest_event(
 mod tests {
     use super::*;
     use crate::mirror::Mirror;
+    use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
     use reqwest::Url;
     use wiremock::{
         matchers::{method, path},
@@ -581,6 +602,60 @@ mod tests {
                 .as_deref(),
             Some("restored")
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_checks_only_the_newest_active_messages() {
+        let server = MockServer::start().await;
+        let room_id =
+            "Y2lzY29zcGFyazovL3VzL1JPT00vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBhMDAx";
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/rooms/{room_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(room(room_id)))
+            .mount(&server)
+            .await;
+        let ids = (1..=3)
+            .map(|n| {
+                STANDARD_NO_PAD.encode(format!(
+                    "ciscospark://us/MESSAGE/00000000-0000-4000-8000-{n:012}"
+                ))
+            })
+            .collect::<Vec<_>>();
+        // Every message is gone remotely; only the newest two may be checked.
+        for (index, id) in ids.iter().enumerate() {
+            Mock::given(method("GET"))
+                .and(path(format!("/v1/messages/{id}")))
+                .respond_with(ResponseTemplate::new(404))
+                .expect(if index == 0 { 0 } else { 2 })
+                .mount(&server)
+                .await;
+        }
+        let rest =
+            WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
+        let mut mirror = Mirror::in_memory([37_u8; 32]).unwrap();
+        mirror.upsert_room(&room(room_id), true).unwrap();
+        for (index, id) in ids.iter().enumerate() {
+            let mut message = msg(id, room_id, "body", None);
+            message.created = Some(format!("2026-10-08T12:00:0{index}Z"));
+            mirror.upsert_message(&message).unwrap();
+        }
+        let mirror = SharedMirror::new(mirror);
+        let result = reconcile_recent(&mirror, &rest, room_id, 2).await.unwrap();
+        assert_eq!(
+            result,
+            ReconcileResult {
+                checked: 2,
+                edited: 0,
+                deleted: 2
+            }
+        );
+        let oldest = ids[0].clone();
+        assert!(mirror
+            .with(move |db| db.message_body(&oldest))
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(RECONCILE_RECENT_MESSAGES, 100);
     }
 
     #[tokio::test]

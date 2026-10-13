@@ -1706,6 +1706,20 @@ impl Mirror {
         Ok(hashes)
     }
 
+    /// The newest `limit` canonical IDs (by creation time) whose latest
+    /// revision is active in a room: the bounded room-reconcile window.
+    pub fn recent_active_message_ids(&self, room_id: &str, limit: usize) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT m.message_id FROM messages m WHERE m.room_id=?1 AND m.status='active'
+             AND m.revision=(SELECT MAX(revision) FROM messages WHERE message_id=m.message_id)
+             ORDER BY m.created_at DESC, m.message_id DESC LIMIT ?2",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement.query_map(params![room_id, limit], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     /// Canonical IDs whose latest revision is active in a room. Reconcile only on events/outage.
     pub fn active_message_ids(&self, room_id: &str) -> Result<Vec<String>> {
         let mut statement = self.conn.prepare(

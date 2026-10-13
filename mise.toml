@@ -6,16 +6,16 @@ description = "Build both local binaries and sign them for Keychain access"
 run = "./scripts/sign-bridged-dev"
 
 [tasks.check]
-description = "Format-check, test, and lint"
+description = "Format-check, test (incl. client UDS tests), and lint"
 run = """
 cargo fmt --check
-cargo test
-cargo clippy --all-targets -- -D warnings
+cargo test --features client
+cargo clippy --all-targets --features client -- -D warnings
 """
 
 [tasks.test]
-description = "Run the Rust test suite"
-run = "cargo test"
+description = "Run the Rust test suite, including the typed client's UDS tests"
+run = "cargo test --features client"
 
 [tasks."client-only"]
 description = "Check the bridge-only TUI client contract and dependency graph"

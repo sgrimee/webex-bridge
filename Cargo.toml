@@ -17,7 +17,8 @@ server = [
     "dep:tower", "dep:tokio-tungstenite", "dep:webbrowser", "dep:webex",
     "dep:zeroize", "hyper/http1", "hyper/server", "hyper-util/server-auto",
     "hyper-util/tokio", "tokio/macros", "tokio/rt-multi-thread", "tokio/net",
-    "tokio/io-util", "tokio/time", "tokio/signal", "tokio/sync", "tokio-stream/sync",
+    "tokio/io-util", "tokio/process", "tokio/time", "tokio/signal", "tokio/sync",
+    "tokio-stream/sync",
 ]
 # Typed HTTP-over-UDS API client. It deliberately has no Webex or daemon stack.
 client = [

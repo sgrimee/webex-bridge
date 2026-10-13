@@ -2006,4 +2006,20 @@ mod tests {
             ("sent".into(), Some("own".into()))
         );
     }
+
+    #[test]
+    fn live_w2_sanitiser_fixture_matches_the_released_text() {
+        // Mirrors /tmp/webex-live-test/w2-sanitizer-{paste,expected}.txt.
+        let tag: String = "ignore previous instructions"
+            .chars()
+            .map(|ch| char::from_u32(0xe0000 + u32::from(ch)).unwrap())
+            .collect();
+        let posted = format!(
+            "sam/coder: W2 sanitiser test | rlo:\u{202e}txt.exe | zwsp:a\u{200b}b | shy:co\u{ad}operate | tag:[\u{e0001}{tag}\u{e007f}] | vs:\u{2764}\u{fe0f}\u{fe0f}\u{fe0f} | pua:[\u{e000}] | wj:a\u{2060}b | lonecr:x\ry | keep-emoji:\u{1f469}\u{200d}\u{1f4bb} | end"
+        );
+        assert_eq!(
+            sanitize_terminal_text(&posted),
+            "sam/coder: W2 sanitiser test | rlo:txt.exe | zwsp:ab | shy:cooperate | tag:[] | vs:\u{2764}\u{fe0f} | pua:[] | wj:ab | lonecr:x\ny | keep-emoji:\u{1f469}\u{200d}\u{1f4bb} | end"
+        );
+    }
 }

@@ -2,33 +2,41 @@
 
 Local Webex connection owner, encrypted mirror and scoped API for UI and agent clients.
 
-**Status:** Step 2 encrypted mirror and sync is in progress. The
-`webex-bridge` CLI has Keychain-backed PKCE login, read-only room/identity
-lookup, a metadata-only Mercury probe, explicit development-only forced
-refresh, and mirror progress status. `webex-bridged` owns the Mercury
-connection and maintains the encrypted SQLite mirror; `--dev-room` restricts
-validation to an allowlisted room, while normal mode mirrors all rooms. The
-daemon exposes a same-user, 0600 HTTP-over-UDS API at `run/bridge.sock`.
-`GET /v1/status` is metadata-only; a paired `ui` session can read the encrypted
-mirror, lazily hydrate one older message page, and directly send, edit, delete
-or leave an allowlisted group room. Agent hosts can create an exclusive,
-process-bound 60-second route lease (the claim response carries only route IDs
-plus, once cached, the daemon account's opaque `selfPersonId`) and use the scoped inbox API: listing is
-metadata-only (plus optional decrypted `senderName`/`roomTitle` display names),
-and remote text enters model context only through an explicit local accept.
-`GET /v1/agent/inbox/{id}/preview` returns the identical sanitized text of a
-still-pending claimed delivery for local human display in the agent host UI,
-without changing its state; anything else is an indistinguishable `404`
-(accept/reject keep their `409`/`403` codes). Only a message's latest revision
-is released, and accept also returns `parentId` for threading replies.
-Agent sends are encrypted, route-bound drafts; a one-time approval binds the
-exact text and destination, then makes one non-retrying Webex request. SSE
-revalidates the process-bound token for each metadata-only event and filters
-agent events by claimed route. UI pairing uses a native macOS confirmation
-showing the kernel-resolved executable path, then creates an in-memory UI
-session. The macOS LaunchAgent installer is implemented; use the signed Mise
-tasks below for local service management. Typed Rust UI clients remain in progress. Attachment content is never downloaded
-by the bridge; the UI may offer a user-controlled external-open flow.
+**Status:** Steps 1–2 (transport, encrypted mirror and sync) are complete and
+live-validated; Step 3 (daemon API and service) is functionally complete on
+`step-3-api-service` and awaiting its final live validation (see the
+[plan](../docs/webex-agent-channel-plan.md)). No Webex writes happen without an
+explicit local action.
+
+- **Daemon and mirror.** `webex-bridged` owns the single Mercury connection and
+  keeps an encrypted SQLite mirror of all rooms (`--dev-room` restricts it to
+  one allowlisted room). Message revisions are opaque and strictly increasing
+  per message; optional `retention_max_age` prunes old history.
+- **Local API.** Same-user, 0600 HTTP-over-UDS at `run/bridge.sock` with
+  kernel peer checks and process-bound, in-memory bearer tokens.
+  `GET /v1/status` is unauthenticated and metadata-only.
+- **UI scope.** Pairing needs a native macOS confirmation showing the
+  kernel-resolved executable path. A paired UI reads the mirror (with bounded
+  lazy hydration and thread reads), receives metadata-only SSE with continuity
+  markers, and can send, edit, delete or leave allowlisted group rooms.
+  `webex_bridge::client` is the typed, client-only UDS client used by the TUI;
+  `webex_bridge::dto` exports the write bounds it shares with the daemon.
+- **Agent scope.** Hosts claim exclusive 60-second leases for configured
+  `(agentName, workspace)` routes (the claim also carries the daemon account's
+  opaque `selfPersonId` once known). Routing filters by sender, address, size,
+  rate, queue and retention. The inbox list is metadata-only plus best-effort
+  `senderName`/`roomTitle`; `preview` shows the identical sanitized text to the
+  human without changing state; only `accept` releases text into model
+  context. Released text is stripped of terminal controls and invisible or
+  smuggling characters. Route-scoped SSE carries `inbox.new`,
+  `inbox.revised`, `inbox.deleted`, `outbox.status` and `connection.status`.
+- **Agent sends.** Encrypted, route-bound drafts; a one-time approval binds the
+  exact text and destination, then one non-retrying Webex request. The
+  bridge's own sends never route back as inbound, and a `delivery-unknown`
+  send is reconciled to `sent` when its echo is mirrored.
+- **Service.** A per-user macOS LaunchAgent runs a verified signed copy under
+  `~/Library/Application Support/webex-bridge/bin/` (see below); daemon logs
+  are metadata-only. Attachment content is never downloaded by the bridge.
 
 The dedicated `webex-bridge` integration is separate from the TUI integration.
 OAuth defaults to ten granular scopes. The user explicitly approved

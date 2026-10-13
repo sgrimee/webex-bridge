@@ -295,6 +295,26 @@ struct CloseAfterTerminal<S> {
     closing: Arc<AtomicU64>,
     /// UI-only session deadline. Agent SSE behavior remains unchanged.
     expiry: Option<Pin<Box<Sleep>>>,
+    /// UI-only lease identity, re-read when the deadline fires: a renewal
+    /// extends the same token in place, so the stream re-arms rather than
+    /// closing a still-valid subscription.
+    lease: Option<UiLease>,
+}
+
+struct UiLease {
+    sessions: auth::Sessions,
+    token: String,
+    peer: auth::PeerIdentity,
+}
+
+impl UiLease {
+    /// The current, still-in-the-future deadline of this verified lease.
+    fn live_deadline(&self) -> Option<std::time::Instant> {
+        self.sessions
+            .expires_at(&self.token, auth::Scope::Ui, self.peer)
+            .ok()
+            .filter(|deadline| *deadline > std::time::Instant::now())
+    }
 }
 
 impl<S: Unpin> Unpin for CloseAfterTerminal<S> {}
@@ -309,9 +329,18 @@ where
         if self.closing.load(Ordering::SeqCst) == 2 {
             return Poll::Ready(None);
         }
-        if let Some(expiry) = self.expiry.as_mut() {
-            if expiry.as_mut().poll(context).is_ready() {
-                self.closing.store(2, Ordering::SeqCst);
+        let this = &mut *self;
+        if let Some(expiry) = this.expiry.as_mut() {
+            while expiry.as_mut().poll(context).is_ready() {
+                // Re-arm on a renewed lease; polling again registers the
+                // waker for the new deadline.
+                if let Some(deadline) = this.lease.as_ref().and_then(UiLease::live_deadline) {
+                    expiry
+                        .as_mut()
+                        .reset(tokio::time::Instant::from_std(deadline));
+                    continue;
+                }
+                this.closing.store(2, Ordering::SeqCst);
                 return Poll::Ready(Some(Ok(SseEvent::default()
                     .event(SESSION_EXPIRED_EVENT)
                     .data(r#"{"reason":"session_expired"}"#))));
@@ -355,6 +384,11 @@ async fn stream(
     } else {
         None
     };
+    let lease = ui_subscriber.then(|| UiLease {
+        sessions: sessions.clone(),
+        token: token.clone(),
+        peer,
+    });
     let stream_is_ui = ui_subscriber;
     let closing = Arc::new(AtomicU64::new(0));
     let closing_events = Arc::clone(&closing);
@@ -412,6 +446,7 @@ async fn stream(
         inner: events,
         closing,
         expiry,
+        lease,
     };
     let initial = if ui_subscriber {
         vec![Ok::<SseEvent, Infallible>(

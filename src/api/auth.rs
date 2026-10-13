@@ -52,6 +52,11 @@ struct Session {
     expires_at: Instant,
     agent_session_id: Option<String>,
     claimed_routes: Vec<String>,
+    /// UI-only: hash of the paired secret this session was issued under.
+    /// Renewal re-checks that the pairing still exists.
+    ui_pairing: Option<String>,
+    /// UI-only: absolute renewal cap fixed at initial issuance.
+    renew_cap: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -73,6 +78,20 @@ pub enum SessionError {
     Peer,
     /// An agent session ID does not belong to the supplied token.
     SessionId,
+}
+
+/// Why a UI lease cannot be renewed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenewError {
+    /// The bearer itself does not authorize this UI caller.
+    Session(SessionError),
+    /// The presenting process cannot be identified by the kernel, or the
+    /// session was issued without a known process ID.
+    UnknownPeer,
+    /// The session was not issued from a paired UI secret.
+    NotRenewable,
+    /// The lease already ends at its absolute cap from initial issuance.
+    CapReached,
 }
 
 /// A matching route is already leased to a live agent session.
@@ -140,9 +159,108 @@ impl Sessions {
                 expires_at,
                 agent_session_id: None,
                 claimed_routes: Vec::new(),
+                ui_pairing: None,
+                renew_cap: None,
             },
         );
         token
+    }
+
+    /// Issue a renewable UI token bound to one paired secret hash. Its lease
+    /// can be extended up to `max_age` after this issuance, never beyond.
+    #[must_use]
+    pub fn issue_ui(
+        &self,
+        peer: PeerIdentity,
+        pairing_hash: String,
+        ttl: Duration,
+        max_age: Duration,
+    ) -> String {
+        let token = Self::token();
+        let now = Instant::now();
+        let renew_cap = now.checked_add(max_age).unwrap_or(now);
+        let expires_at = now.checked_add(ttl).unwrap_or(now).min(renew_cap);
+        let mut state = self.inner.lock().expect("session mutex poisoned");
+        Self::prune(&mut state);
+        state.sessions.insert(
+            token.clone(),
+            Session {
+                scope: Scope::Ui,
+                peer,
+                expires_at,
+                agent_session_id: None,
+                claimed_routes: Vec::new(),
+                ui_pairing: Some(pairing_hash),
+                renew_cap: Some(renew_cap),
+            },
+        );
+        token
+    }
+
+    /// Return the pairing hash of a verified, renewable UI session.
+    pub fn ui_pairing(
+        &self,
+        token: &str,
+        peer: PeerIdentity,
+    ) -> std::result::Result<String, RenewError> {
+        self.authorize(Some(token), Scope::Ui, peer)
+            .map_err(RenewError::Session)?;
+        let state = self.inner.lock().expect("session mutex poisoned");
+        state
+            .sessions
+            .get(token)
+            .ok_or(RenewError::Session(SessionError::Missing))?
+            .ui_pairing
+            .clone()
+            .ok_or(RenewError::NotRenewable)
+    }
+
+    /// Extend a UI lease in place (same token) to `now + ttl`, clamped to its
+    /// absolute cap. Only the exact issuing process may renew: both the
+    /// issuance and the presenting PID must be known and equal.
+    pub fn renew_ui(
+        &self,
+        token: &str,
+        peer: PeerIdentity,
+        ttl: Duration,
+    ) -> std::result::Result<Instant, RenewError> {
+        self.authorize(Some(token), Scope::Ui, peer)
+            .map_err(RenewError::Session)?;
+        let mut state = self.inner.lock().expect("session mutex poisoned");
+        let session = state
+            .sessions
+            .get_mut(token)
+            .ok_or(RenewError::Session(SessionError::Missing))?;
+        // Re-check under the lock: the lease may have elapsed since authorize.
+        let now = Instant::now();
+        if session.expires_at <= now {
+            return Err(RenewError::Session(SessionError::Expired));
+        }
+        match (session.peer.pid, peer.pid) {
+            (Some(issued), Some(presented)) if issued == presented => {}
+            (Some(_), Some(_)) => return Err(RenewError::Session(SessionError::Peer)),
+            _ => return Err(RenewError::UnknownPeer),
+        }
+        if session.ui_pairing.is_none() {
+            return Err(RenewError::NotRenewable);
+        }
+        let cap = session.renew_cap.ok_or(RenewError::NotRenewable)?;
+        if session.expires_at >= cap {
+            return Err(RenewError::CapReached);
+        }
+        session.expires_at = now.checked_add(ttl).unwrap_or(now).min(cap);
+        Ok(session.expires_at)
+    }
+
+    /// Test hook: move a UI session's lease and absolute cap (`Instant` cannot
+    /// be backdated portably, so tests shorten deadlines instead of waiting).
+    #[cfg(test)]
+    pub(crate) fn set_ui_lease_for_tests(&self, token: &str, expires_at: Instant, cap: Instant) {
+        let mut state = self.inner.lock().expect("session mutex poisoned");
+        if let Some(session) = state.sessions.get_mut(token) {
+            session.expires_at = expires_at.min(cap);
+            session.renew_cap = Some(cap);
+        }
     }
 
     /// Atomically issue an agent token and lease its configured routes.
@@ -174,6 +292,8 @@ impl Sessions {
                 expires_at,
                 agent_session_id: Some(agent_session_id),
                 claimed_routes: route_ids,
+                ui_pairing: None,
+                renew_cap: None,
             },
         );
         Ok(token)
@@ -358,6 +478,74 @@ mod tests {
         assert_eq!(
             sessions.authorize(Some(&token), Scope::Ui, peer),
             Err(SessionError::Expired)
+        );
+    }
+
+    #[test]
+    fn ui_renewal_keeps_the_token_and_respects_peer_scope_and_cap() {
+        let sessions = Sessions::default();
+        let peer = PeerIdentity {
+            uid: 501,
+            pid: Some(10),
+        };
+        let token = sessions.issue_ui(
+            peer,
+            "pairing-hash".into(),
+            Duration::from_secs(1),
+            Duration::from_secs(3600),
+        );
+        let before = sessions.expires_at(&token, Scope::Ui, peer).unwrap();
+        let renewed = sessions
+            .renew_ui(&token, peer, Duration::from_secs(600))
+            .unwrap();
+        assert!(renewed > before);
+        assert_eq!(sessions.expires_at(&token, Scope::Ui, peer), Ok(renewed));
+        assert_eq!(
+            sessions.ui_pairing(&token, peer).as_deref(),
+            Ok("pairing-hash")
+        );
+        assert_eq!(
+            sessions.renew_ui(
+                &token,
+                PeerIdentity {
+                    uid: 501,
+                    pid: Some(11)
+                },
+                Duration::from_secs(600)
+            ),
+            Err(RenewError::Session(SessionError::Peer))
+        );
+        assert_eq!(
+            sessions.renew_ui(
+                &token,
+                PeerIdentity {
+                    uid: 501,
+                    pid: None
+                },
+                Duration::from_secs(600)
+            ),
+            Err(RenewError::UnknownPeer)
+        );
+
+        // The cap clamps the extension, then refuses further renewal.
+        let cap = Instant::now() + Duration::from_secs(30);
+        sessions.set_ui_lease_for_tests(&token, renewed, cap);
+        assert_eq!(
+            sessions.renew_ui(&token, peer, Duration::from_secs(600)),
+            Err(RenewError::CapReached)
+        );
+        assert_eq!(sessions.expires_at(&token, Scope::Ui, peer), Ok(cap));
+
+        // Non-pairing UI tokens and agent tokens are never renewable here.
+        let plain = sessions.issue(Scope::Ui, peer, Duration::from_secs(60));
+        assert_eq!(
+            sessions.renew_ui(&plain, peer, Duration::from_secs(600)),
+            Err(RenewError::NotRenewable)
+        );
+        let agent = sessions.issue(Scope::Agent, peer, Duration::from_secs(60));
+        assert_eq!(
+            sessions.renew_ui(&agent, peer, Duration::from_secs(600)),
+            Err(RenewError::Session(SessionError::Scope))
         );
     }
 

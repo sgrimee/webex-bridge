@@ -524,6 +524,7 @@ mod tests {
         let ui_routes = [
             ("POST", "/v1/ui/pair", Some(r#"{"secretHash":""}"#)),
             ("POST", "/v1/ui/sessions", Some(r#"{"secret":""}"#)),
+            ("POST", "/v1/ui/sessions/renew", None),
             ("GET", "/v1/me", None),
             ("GET", "/v1/ui/continuity", None),
             ("GET", "/v1/rooms", None),

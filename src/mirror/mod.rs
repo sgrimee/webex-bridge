@@ -1563,6 +1563,14 @@ impl Mirror {
         Ok(found)
     }
 
+    /// Test hook: remove one UI pairing, as a user revocation would.
+    #[cfg(test)]
+    pub(crate) fn unpair_ui_client(&mut self, secret_hash: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM ui_clients WHERE secret_hash=?1", [secret_hash])?;
+        Ok(())
+    }
+
     /// Canonical IDs whose latest revision is active in a room. Reconcile only on events/outage.
     pub fn active_message_ids(&self, room_id: &str) -> Result<Vec<String>> {
         let mut statement = self.conn.prepare(

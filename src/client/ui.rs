@@ -34,6 +34,12 @@ struct SessionResponse {
     lease_ttl: u64,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RenewResponse {
+    lease_ttl: u64,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateMessageRequest<'a> {
@@ -97,11 +103,35 @@ pub struct UiClient {
 }
 
 impl UiClient {
-    /// Server-issued lease duration in seconds. UI hosts recreate the session
-    /// when this lease is near expiry.
+    /// Lease duration in seconds granted at session creation. UI hosts call
+    /// [`Self::renew`] before it elapses, or recreate the session.
     #[must_use]
     pub const fn lease_ttl(&self) -> u64 {
         self.lease_ttl
+    }
+
+    /// Extend this session's lease in place and return the seconds until the
+    /// new expiry. The token is unchanged, so every clone and any open event
+    /// stream stays valid. Only the issuing process can renew. The daemon
+    /// refuses with [`ClientError::is_pairing_removed`] (session ended) or
+    /// [`ClientError::is_session_cap_reached`] (12 h absolute limit; the token
+    /// stays valid until its current expiry) — then create a new session.
+    ///
+    /// [`ClientError::is_pairing_removed`]: super::ClientError::is_pairing_removed
+    /// [`ClientError::is_session_cap_reached`]: super::ClientError::is_session_cap_reached
+    pub async fn renew(&self) -> Result<u64> {
+        let response = self
+            .bridge
+            .request(
+                Method::POST,
+                "/v1/ui/sessions/renew",
+                Some(self.token.as_str()),
+                None,
+            )
+            .await?;
+        Ok(BridgeClient::json::<RenewResponse>(response)
+            .await?
+            .lease_ttl)
     }
 
     /// Read the daemon account from the encrypted mirror, refreshing it from
@@ -1395,5 +1425,268 @@ mod server_tests {
 
         drop(stream);
         server.shutdown().await.unwrap();
+    }
+
+    const RENEW_SECRET: &str = "a-local-ui-secret-that-is-long-enough";
+
+    struct RenewableServer {
+        _temp: tempfile::TempDir,
+        server: api::ApiServer,
+        bridge: BridgeClient,
+        sessions: crate::api::auth::Sessions,
+        mirror: SharedMirror,
+        events: EventBus,
+        hash: String,
+    }
+
+    async fn renewable_server() -> RenewableServer {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(temp.path().join("bridge"));
+        let mirror = SharedMirror::new(Mirror::in_memory([49_u8; 32]).unwrap());
+        let hash = URL_SAFE_NO_PAD.encode(Sha256::digest(RENEW_SECRET.as_bytes()));
+        let pairing = hash.clone();
+        mirror
+            .with(move |db| db.pair_ui_client(&pairing, "/test/webex-tui"))
+            .await
+            .unwrap();
+        let (_connection_tx, connection_rx) = watch::channel(ConnectionStatus::Connected);
+        let state = ApiState::new(mirror.clone(), connection_rx);
+        let sessions = state.sessions();
+        let events = state.events();
+        let server = api::start(&paths, state).await.unwrap();
+        RenewableServer {
+            _temp: temp,
+            server,
+            bridge: BridgeClient::new(paths.socket),
+            sessions,
+            mirror,
+            events,
+            hash,
+        }
+    }
+
+    fn this_process() -> crate::api::auth::PeerIdentity {
+        crate::api::auth::PeerIdentity {
+            uid: crate::api::auth::daemon_uid(),
+            pid: Some(std::process::id()),
+        }
+    }
+
+    fn api_code(error: &crate::client::ClientError) -> Option<(u16, &str)> {
+        match error {
+            crate::client::ClientError::Api { status, code, .. } => {
+                Some((status.as_u16(), code.as_str()))
+            }
+            _ => None,
+        }
+    }
+
+    async fn renew_raw(bridge: &BridgeClient, token: Option<&str>) -> Result<u64> {
+        let response = bridge
+            .request(Method::POST, "/v1/ui/sessions/renew", token, None)
+            .await?;
+        Ok(BridgeClient::json::<RenewResponse>(response)
+            .await?
+            .lease_ttl)
+    }
+
+    #[tokio::test]
+    async fn ui_renewal_extends_the_same_token_in_place() {
+        let env = renewable_server().await;
+        let ui = env.bridge.create_ui_session(RENEW_SECRET).await.unwrap();
+        let token = ui.token.as_str().to_owned();
+        let before = env
+            .sessions
+            .expires_at(&token, crate::api::auth::Scope::Ui, this_process())
+            .unwrap();
+        // Shorten the lease so the extension is observable.
+        env.sessions.set_ui_lease_for_tests(
+            &token,
+            std::time::Instant::now() + Duration::from_secs(5),
+            before + Duration::from_secs(3600),
+        );
+        let lease_ttl = ui.renew().await.unwrap();
+        assert!((590..=600).contains(&lease_ttl), "{lease_ttl}");
+        let after = env
+            .sessions
+            .expires_at(&token, crate::api::auth::Scope::Ui, this_process())
+            .unwrap();
+        assert!(after > std::time::Instant::now() + Duration::from_secs(590));
+        // Same token (and every clone) keeps working; no new token issued.
+        let clone = ui.clone();
+        assert_eq!(clone.token.as_str(), token);
+        assert_eq!(clone.rooms().await.unwrap(), Vec::<Room>::new());
+        env.server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ui_renewal_requires_the_issuing_process() {
+        let env = renewable_server().await;
+        let me = this_process();
+        let other = env.sessions.issue_ui(
+            crate::api::auth::PeerIdentity {
+                uid: me.uid,
+                pid: me.pid.map(|pid| pid + 1),
+            },
+            env.hash.clone(),
+            Duration::from_secs(60),
+            Duration::from_secs(3600),
+        );
+        let error = renew_raw(&env.bridge, Some(&other)).await.unwrap_err();
+        assert_eq!(api_code(&error), Some((403, "forbidden_peer")));
+        // Issued without a kernel PID: never renewable.
+        let unknown = env.sessions.issue_ui(
+            crate::api::auth::PeerIdentity {
+                uid: me.uid,
+                pid: None,
+            },
+            env.hash.clone(),
+            Duration::from_secs(60),
+            Duration::from_secs(3600),
+        );
+        let error = renew_raw(&env.bridge, Some(&unknown)).await.unwrap_err();
+        assert_eq!(api_code(&error), Some((403, "forbidden_peer")));
+        // A UI token not issued from a paired secret cannot be renewed.
+        let plain = env
+            .sessions
+            .issue(crate::api::auth::Scope::Ui, me, Duration::from_secs(60));
+        let error = renew_raw(&env.bridge, Some(&plain)).await.unwrap_err();
+        assert_eq!(api_code(&error), Some((403, "forbidden_session")));
+        let error = renew_raw(&env.bridge, None).await.unwrap_err();
+        assert_eq!(api_code(&error), Some((401, "auth_required")));
+        let error = renew_raw(&env.bridge, Some("not-a-session"))
+            .await
+            .unwrap_err();
+        assert_eq!(api_code(&error), Some((401, "auth_required")));
+        env.server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ui_renewal_is_refused_for_agent_bearers() {
+        let env = renewable_server().await;
+        let agent = env
+            .sessions
+            .issue_agent(
+                this_process(),
+                "test-agent".into(),
+                vec!["route-a".into()],
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        let before = env
+            .sessions
+            .expires_at(&agent, crate::api::auth::Scope::Agent, this_process())
+            .unwrap();
+        let error = renew_raw(&env.bridge, Some(&agent)).await.unwrap_err();
+        assert_eq!(api_code(&error), Some((403, "forbidden_scope")));
+        assert_eq!(
+            env.sessions
+                .expires_at(&agent, crate::api::auth::Scope::Agent, this_process()),
+            Ok(before)
+        );
+        env.server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ui_renewal_ends_the_session_when_pairing_was_removed() {
+        let env = renewable_server().await;
+        let ui = env.bridge.create_ui_session(RENEW_SECRET).await.unwrap();
+        let hash = env.hash.clone();
+        env.mirror
+            .with(move |db| db.unpair_ui_client(&hash))
+            .await
+            .unwrap();
+        let error = ui.renew().await.unwrap_err();
+        assert!(error.is_pairing_removed());
+        assert_eq!(api_code(&error), Some((401, "pairing_removed")));
+        // Revoked immediately, not left to run out its current lease.
+        let error = ui.rooms().await.unwrap_err();
+        assert_eq!(api_code(&error), Some((401, "auth_required")));
+        env.server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ui_renewal_never_passes_the_absolute_cap() {
+        let env = renewable_server().await;
+        let ui = env.bridge.create_ui_session(RENEW_SECRET).await.unwrap();
+        let token = ui.token.as_str().to_owned();
+        let now = std::time::Instant::now();
+        env.sessions.set_ui_lease_for_tests(
+            &token,
+            now + Duration::from_secs(5),
+            now + Duration::from_secs(30),
+        );
+        let lease_ttl = ui.renew().await.unwrap();
+        assert!(lease_ttl <= 30, "{lease_ttl}");
+        let error = ui.renew().await.unwrap_err();
+        assert!(error.is_session_cap_reached());
+        assert_eq!(api_code(&error), Some((409, "session_cap_reached")));
+        // The capped token stays valid until its current expiry.
+        assert_eq!(ui.rooms().await.unwrap(), Vec::<Room>::new());
+        env.server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ui_event_stream_follows_a_renewed_lease_then_expires_at_the_cap() {
+        let env = renewable_server().await;
+        let ui = env.bridge.create_ui_session(RENEW_SECRET).await.unwrap();
+        let token = ui.token.as_str().to_owned();
+        let mut stream = ui.events().await.unwrap();
+        let ready = stream.next().await.unwrap().unwrap();
+        assert_eq!(ready.name, crate::client::events::CONTINUITY_READY_EVENT);
+
+        // The stream armed its timer at the original deadline. Shorten it,
+        // renew, and check that the old deadline passing does not close it.
+        let now = std::time::Instant::now();
+        env.sessions.set_ui_lease_for_tests(
+            &token,
+            now + Duration::from_millis(150),
+            now + Duration::from_secs(3600),
+        );
+        // Wake the stream so its timer is not left at the original deadline:
+        // a quiet UI stream must also notice the shorter one.
+        let mut short = crate::client::events::EventStream::connect(env.bridge.clone(), &token)
+            .await
+            .unwrap();
+        let _ready = short.next().await.unwrap().unwrap();
+        ui.renew().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        env.events.publish_ui(
+            "connection.status",
+            serde_json::json!({"connection":"connected"}),
+        );
+        for active in [&mut stream, &mut short] {
+            let event = tokio::time::timeout(Duration::from_secs(1), active.next())
+                .await
+                .expect("renewed stream should stay open")
+                .unwrap()
+                .unwrap();
+            assert_eq!(event.name, "connection.status");
+        }
+
+        // At the cap renewal is refused, and a quiet stream ends there. (A
+        // lease only ever grows in production, so a stream armed earlier is
+        // re-checked at its own deadline; this one is armed at the cap.)
+        let now = std::time::Instant::now();
+        let cap = now + Duration::from_millis(150);
+        env.sessions.set_ui_lease_for_tests(&token, cap, cap);
+        assert!(ui.renew().await.unwrap_err().is_session_cap_reached());
+        drop(short);
+        let mut short = crate::client::events::EventStream::connect(env.bridge.clone(), &token)
+            .await
+            .unwrap();
+        let _ready = short.next().await.unwrap().unwrap();
+        let expired = tokio::time::timeout(Duration::from_secs(1), short.next())
+            .await
+            .expect("capped stream should expire")
+            .unwrap()
+            .unwrap();
+        assert!(expired.is_session_expired());
+        assert!(tokio::time::timeout(Duration::from_secs(1), short.next())
+            .await
+            .expect("expired stream should close")
+            .is_none());
+        drop(stream);
+        env.server.shutdown().await.unwrap();
     }
 }

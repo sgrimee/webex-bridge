@@ -20,7 +20,12 @@ async fn typed_bootstrap_contract(
 ) -> std::result::Result<UiClient, ClientError> {
     let _: Status = bridge.status().await?;
     bridge.pair_ui(secret_hash).await?;
-    bridge.create_ui_session(secret).await
+    let client = bridge.create_ui_session(secret).await?;
+    // Lease renewal keeps the same token; its refusals are typed.
+    if let Err(error) = client.renew().await {
+        let _: bool = error.is_pairing_removed() || error.is_session_cap_reached();
+    }
+    Ok(client)
 }
 
 async fn typed_tui_intent_contract(

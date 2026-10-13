@@ -86,6 +86,35 @@ impl ClientError {
         )
     }
 
+    /// Whether a UI renewal was refused because the client's pairing was
+    /// removed. The daemon has already ended the session; re-pairing is needed.
+    #[must_use]
+    pub fn is_pairing_removed(&self) -> bool {
+        matches!(
+            self,
+            Self::Api {
+                status: StatusCode::UNAUTHORIZED,
+                code,
+                ..
+            } if code == "pairing_removed"
+        )
+    }
+
+    /// Whether a UI renewal was refused because the session reached its
+    /// absolute lifetime. The current token remains valid until its expiry;
+    /// create a new session from the paired secret.
+    #[must_use]
+    pub fn is_session_cap_reached(&self) -> bool {
+        matches!(
+            self,
+            Self::Api {
+                status: StatusCode::CONFLICT,
+                code,
+                ..
+            } if code == "session_cap_reached"
+        )
+    }
+
     /// Whether the paired daemon has not yet mirrored an authoritative account
     /// identity. Callers can still show other locally available mirror data.
     #[must_use]

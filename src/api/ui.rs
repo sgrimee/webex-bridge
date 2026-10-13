@@ -19,6 +19,8 @@ use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 const UI_LEASE_TTL: Duration = Duration::from_secs(600);
+/// Absolute lifetime of one UI token, from initial issuance, across renewals.
+const UI_SESSION_MAX_AGE: Duration = Duration::from_secs(12 * 60 * 60);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -30,6 +32,12 @@ struct PairRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateSessionRequest {
     secret: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RenewSessionResponse {
+    lease_ttl: u64,
 }
 
 #[derive(Serialize)]
@@ -98,38 +106,60 @@ fn reject_agent_bootstrap_bearer(
     }
 }
 
+fn ui_session_error(error: auth::SessionError) -> Response {
+    match error {
+        auth::SessionError::Scope => json_error(
+            StatusCode::FORBIDDEN,
+            "forbidden_scope",
+            "Session is not authorized for UI endpoints",
+        ),
+        auth::SessionError::Peer => json_error(
+            StatusCode::FORBIDDEN,
+            "forbidden_peer",
+            "Session belongs to a different local process",
+        ),
+        auth::SessionError::Missing | auth::SessionError::Expired => json_error(
+            StatusCode::UNAUTHORIZED,
+            "auth_required",
+            "A valid UI session is required",
+        ),
+        auth::SessionError::SessionId => json_error(
+            StatusCode::FORBIDDEN,
+            "forbidden_session",
+            "Session is not authorized for UI endpoints",
+        ),
+    }
+}
+
 fn ui_session(
     state: &ApiState,
     peer: auth::PeerIdentity,
     headers: &HeaderMap,
 ) -> Result<(), Box<Response>> {
-    match state
+    state
         .sessions()
         .authorize(bearer(headers), auth::Scope::Ui, peer)
-    {
-        Ok(()) => Ok(()),
-        Err(auth::SessionError::Scope) => Err(Box::new(json_error(
-            StatusCode::FORBIDDEN,
-            "forbidden_scope",
-            "Session is not authorized for UI endpoints",
-        ))),
-        Err(auth::SessionError::Peer) => Err(Box::new(json_error(
+        .map_err(|error| Box::new(ui_session_error(error)))
+}
+
+fn renew_error(error: auth::RenewError) -> Response {
+    match error {
+        auth::RenewError::Session(error) => ui_session_error(error),
+        auth::RenewError::UnknownPeer => json_error(
             StatusCode::FORBIDDEN,
             "forbidden_peer",
-            "Session belongs to a different local process",
-        ))),
-        Err(auth::SessionError::Missing | auth::SessionError::Expired) => {
-            Err(Box::new(json_error(
-                StatusCode::UNAUTHORIZED,
-                "auth_required",
-                "A valid UI session is required",
-            )))
-        }
-        Err(auth::SessionError::SessionId) => Err(Box::new(json_error(
+            "The local client process cannot be identified",
+        ),
+        auth::RenewError::NotRenewable => json_error(
             StatusCode::FORBIDDEN,
             "forbidden_session",
-            "Session is not authorized for UI endpoints",
-        ))),
+            "Session cannot be renewed",
+        ),
+        auth::RenewError::CapReached => json_error(
+            StatusCode::CONFLICT,
+            "session_cap_reached",
+            "UI session reached its maximum age; create a new session",
+        ),
     }
 }
 
@@ -1435,10 +1465,62 @@ async fn create_session(
         );
     }
     Json(CreateSessionResponse {
-        token: state.sessions().issue(auth::Scope::Ui, peer, UI_LEASE_TTL),
+        token: state
+            .sessions()
+            .issue_ui(peer, candidate, UI_LEASE_TTL, UI_SESSION_MAX_AGE),
         lease_ttl: UI_LEASE_TTL.as_secs(),
     })
     .into_response()
+}
+
+/// Extend the presented UI lease in place. The same token stays valid; only
+/// the issuing process may renew, the pairing must still exist, and the lease
+/// never extends beyond [`UI_SESSION_MAX_AGE`] after initial issuance.
+async fn renew_session(
+    State(state): State<ApiState>,
+    Extension(peer): Extension<auth::PeerIdentity>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(token) = bearer(&headers) else {
+        return ui_session_error(auth::SessionError::Missing);
+    };
+    let pairing = match state.sessions().ui_pairing(token, peer) {
+        Ok(pairing) => pairing,
+        Err(error) => return renew_error(error),
+    };
+    let paired = match state
+        .mirror()
+        .with(move |db| db.ui_client_paired(&pairing))
+        .await
+    {
+        Ok(paired) => paired,
+        Err(_) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bridge_unavailable",
+                "Pairing store is unavailable",
+            )
+        }
+    };
+    if !paired {
+        // The user removed this client's pairing: end the session now rather
+        // than letting it run out its current lease.
+        state.sessions().revoke(token);
+        return json_error(
+            StatusCode::UNAUTHORIZED,
+            "pairing_removed",
+            "The UI pairing for this session no longer exists",
+        );
+    }
+    match state.sessions().renew_ui(token, peer, UI_LEASE_TTL) {
+        Ok(expires_at) => Json(RenewSessionResponse {
+            lease_ttl: expires_at
+                .saturating_duration_since(std::time::Instant::now())
+                .as_secs(),
+        })
+        .into_response(),
+        Err(error) => renew_error(error),
+    }
 }
 
 /// Pairing, session and full-mirror read routes for the terminal UI.
@@ -1446,6 +1528,7 @@ pub fn router() -> Router<ApiState> {
     Router::new()
         .route("/v1/ui/pair", post(pair))
         .route("/v1/ui/sessions", post(create_session))
+        .route("/v1/ui/sessions/renew", post(renew_session))
         .route("/v1/me", get(me))
         .route("/v1/ui/continuity", get(continuity))
         .route("/v1/rooms", get(rooms))

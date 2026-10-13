@@ -19,6 +19,9 @@ explicit local action.
   kernel-resolved executable path. A paired UI reads the mirror (with bounded
   lazy hydration and thread reads), receives metadata-only SSE with continuity
   markers, and can send, edit, delete or leave allowlisted group rooms.
+  UI leases last 10 minutes; `POST /v1/ui/sessions/renew` extends the same
+  token by 10 minutes for the issuing process only, while its pairing still
+  exists, up to 12 hours after issuance (SSE follows the extended lease).
   `webex_bridge::client` is the typed, client-only UDS client used by the TUI;
   `webex_bridge::dto` exports the write bounds it shares with the daemon.
 - **Agent scope.** Hosts claim exclusive 60-second leases for configured

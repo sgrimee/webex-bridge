@@ -51,6 +51,10 @@ run = '"${CARGO_TARGET_DIR:-target}/debug/webex-bridge" install-service'
 description = "Show bridge authentication and mirror progress (installed CLI)"
 run = '"$HOME/Library/Application Support/webex-bridge/bin/webex-bridge" status'
 
+[tasks."service:health"]
+description = "Keychain-free daemon status over the socket (installed CLI)"
+run = '"$HOME/Library/Application Support/webex-bridge/bin/webex-bridge" health'
+
 [tasks."service:logs"]
 description = "Follow redacted daemon lifecycle logs"
 run = "tail -f ~/Library/Logs/webex-bridge/bridged.log"

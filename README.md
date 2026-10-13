@@ -48,7 +48,8 @@ mise run check             # fmt check + tests + clippy
 mise run build             # build and sign both local executables
 mise run service:start     # signed build, copy into private bin/, install/start LaunchAgent
 mise run service:restart   # signed build, re-copy into private bin/, restart LaunchAgent
-mise run service:status    # installed CLI
+mise run service:status    # installed CLI (reads Keychain auth state)
+mise run service:health    # socket-only daemon status, no Keychain access
 mise run service:stop      # remove LaunchAgent and installed binaries
 ```
 

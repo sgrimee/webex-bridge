@@ -25,6 +25,9 @@ pub mod dev_env_secrets;
 pub mod diagnostics;
 #[cfg(feature = "server")]
 pub mod dialog;
+/// Keychain-free daemon health check over the protected socket.
+#[cfg(feature = "server")]
+pub mod health;
 #[cfg(feature = "server")]
 pub mod hydrate;
 #[cfg(feature = "server")]

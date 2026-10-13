@@ -9,7 +9,7 @@ use std::{
 use webex_bridge::{
     auth,
     config::Config,
-    hydrate,
+    health, hydrate,
     mirror::{Mirror, SharedMirror},
     paths::Paths,
     rooms, service, supervisor,
@@ -37,6 +37,10 @@ async fn main() -> Result<()> {
         [command] if command == "me" => {
             let tokens = auth::fresh_token(&paths).await?;
             println!("{}", rooms::own_person_id(&tokens.access_token).await?);
+        }
+        [command] if command == "health" => {
+            // Socket-only and Keychain-free: safe from any build of the CLI.
+            println!("{}", health::summary(&health::daemon_status(&paths.socket).await?));
         }
         [command] if command == "install-service" => {
             service::install(&build_dir()?, &paths)?;
@@ -226,7 +230,7 @@ async fn main() -> Result<()> {
             })
             .await?;
         }
-        _ => bail!("Usage: webex-bridge login | me | status | install-service | uninstall-service | sync failures | sync recover-gap --room ROOM_ID | devices status | messages inspect --id ID | rooms find --title TITLE | rooms verify --url SPACE_URL --title TITLE | routes init --url SPACE_URL --title TITLE --agent NAME --workspace PATH | membership (invite|cycle) --room ROOM_ID --email PERSON_EMAIL | probe [--room ROOM_ID [--refresh-after-secs 1..120 [--refresh-gap-secs 1..120]]]"),
+        _ => bail!("Usage: webex-bridge login | me | status | health | install-service | uninstall-service | sync failures | sync recover-gap --room ROOM_ID | devices status | messages inspect --id ID | rooms find --title TITLE | rooms verify --url SPACE_URL --title TITLE | routes init --url SPACE_URL --title TITLE --agent NAME --workspace PATH | membership (invite|cycle) --room ROOM_ID --email PERSON_EMAIL | probe [--room ROOM_ID [--refresh-after-secs 1..120 [--refresh-gap-secs 1..120]]]"),
     }
     Ok(())
 }

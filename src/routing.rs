@@ -339,14 +339,9 @@ impl Mirror {
                 self.audit_filtered_once(&key, "not_addressed")?;
                 continue;
             }
-            let cutoff = (Utc::now() - Duration::minutes(1)).to_rfc3339();
-            let per_minute: u32 = self.conn.query_row(
-                "SELECT count(DISTINCT message_id) FROM messages
-                 WHERE sender_id=?1 AND created_at>=?2",
-                params![sender_id, cutoff],
-                |row| row.get(0),
-            )?;
-            if per_minute > config.limits.sender_rate_per_min {
+            let per_minute =
+                self.sender_messages_since(&sender_id, Utc::now() - Duration::minutes(1))?;
+            if per_minute > u64::from(config.limits.sender_rate_per_min) {
                 self.audit_filtered_once(&key, "sender_rate_limited")?;
                 continue;
             }
@@ -679,6 +674,33 @@ impl Mirror {
             )?;
         }
         Ok(())
+    }
+
+    /// Distinct messages from `sender_id` created at or after `cutoff`, by
+    /// parsed timestamp. A lexical day-prefix bound (one day of margin for any
+    /// UTC offset) only narrows the scan; it never decides inclusion.
+    fn sender_messages_since(&self, sender_id: &str, cutoff: DateTime<Utc>) -> Result<u64> {
+        let day_floor = (cutoff - Duration::days(1)).format("%Y-%m-%d").to_string();
+        let mut statement = self.conn.prepare(
+            "SELECT message_id,MIN(created_at) FROM messages
+             WHERE sender_id=?1 AND substr(created_at,1,10)>=?2
+             GROUP BY message_id",
+        )?;
+        let rows = statement
+            .query_map(params![sender_id, day_floor], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let count = rows
+            .iter()
+            .filter(|(_, created)| {
+                created.as_deref().is_some_and(|created| {
+                    DateTime::parse_from_rfc3339(created)
+                        .is_ok_and(|created| created.with_timezone(&Utc) >= cutoff)
+                })
+            })
+            .count();
+        Ok(u64::try_from(count).unwrap_or(u64::MAX))
     }
 
     fn filtered_as(&self, key: &DeliveryKey, reason: &str) -> Result<bool> {
@@ -1596,5 +1618,40 @@ mod tests {
             .unwrap());
         mirror.upsert_message(&echo("human-copy", DRAFT)).unwrap();
         assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
+    }
+
+    #[test]
+    fn sender_rate_uses_parsed_timestamps_not_string_order() {
+        let mut mirror = Mirror::in_memory([24; 32]).unwrap();
+        let now = Utc::now();
+        let insert = |mirror: &mut Mirror, id: &str, created: String| {
+            let mut m = message("hi");
+            m.id = Some(id.into());
+            m.created = Some(created);
+            mirror.upsert_message(&m).unwrap();
+        };
+        // Within the minute, but with an offset that sorts before the
+        // UTC cutoff string ("+02:00" local time is two hours "earlier").
+        let recent_offset = (now - Duration::seconds(10))
+            .with_timezone(&chrono::FixedOffset::west_opt(2 * 3600).unwrap())
+            .to_rfc3339();
+        insert(&mut mirror, "offset-recent", recent_offset);
+        // Mixed precision: "...:00Z" vs "...:00.500Z".
+        insert(
+            &mut mirror,
+            "precise-recent",
+            (now - Duration::seconds(5)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+        insert(
+            &mut mirror,
+            "old",
+            (now - Duration::minutes(5)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        );
+        assert_eq!(
+            mirror
+                .sender_messages_since("person", now - Duration::minutes(1))
+                .unwrap(),
+            2
+        );
     }
 }

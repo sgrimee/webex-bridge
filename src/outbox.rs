@@ -425,7 +425,7 @@ impl Mirror {
             .conn
             .query_row(
                 "SELECT 1 FROM outbox WHERE room_id=?1 AND sha256=?2
-                   AND state IN ('sending','sent','delivery-unknown','failed')",
+                   AND state IN ('sending','sent','delivery-unknown')",
                 params![room_id, digest(body.as_bytes())],
                 |row| row.get::<_, i64>(0),
             )
@@ -440,7 +440,7 @@ impl Mirror {
         let mut statement = self.conn.prepare(
             "SELECT draft_id,body_ct,body_nonce FROM outbox
              WHERE room_id=?1 AND created_at>=?2
-               AND state IN ('sending','sent','delivery-unknown','failed')",
+               AND state IN ('sending','sent','delivery-unknown')",
         )?;
         let rows = statement
             .query_map(params![room_id, since], |row| {

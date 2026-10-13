@@ -1582,4 +1582,19 @@ mod tests {
             .unwrap();
         assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
     }
+
+    #[test]
+    fn a_definitely_failed_draft_is_not_an_echo_fingerprint() {
+        let config = echo_config();
+        let mut mirror = Mirror::in_memory([23; 32]).unwrap();
+        mirror.sync_routes(&config.routes).unwrap();
+        let draft_id = approved_draft(&mut mirror, &config);
+        mirror.mark_failed(&draft_id).unwrap();
+        // Webex rejected it, so nothing was posted: identical text is a real message.
+        assert!(!mirror
+            .is_own_outbound("room", "person", DRAFT, None)
+            .unwrap());
+        mirror.upsert_message(&echo("human-copy", DRAFT)).unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
+    }
 }

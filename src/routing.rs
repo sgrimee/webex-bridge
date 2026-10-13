@@ -175,6 +175,9 @@ pub struct AcceptedDelivery {
     pub created_at: String,
     /// Revision accepted by the local user.
     pub revision: i64,
+    /// Delivery state after this decision: always `accepted` on the wire
+    /// (a rejection returns no body), so hosts can assert it explicitly.
+    pub state: &'static str,
     /// Thread parent message ID, when the accepted message is a reply, so the
     /// agent host can thread its answer.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -756,6 +759,7 @@ impl Mirror {
                 sender_id: None,
                 created_at: String::new(),
                 revision: key.revision,
+                state: target,
                 parent_id: None,
                 markdown: String::new(),
             }));
@@ -766,6 +770,7 @@ impl Mirror {
             sender_id,
             created_at,
             revision: key.revision,
+            state: target,
             parent_id,
             markdown,
         }))
@@ -1172,6 +1177,7 @@ mod tests {
             .unwrap();
         assert_eq!(accepted.markdown, preview.markdown);
         assert_eq!(accepted.parent_id.as_deref(), Some("parent-message"));
+        assert_eq!(accepted.state, "accepted");
 
         // Accepted, rejected, other-route, unknown and malformed: all `None`.
         assert!(mirror

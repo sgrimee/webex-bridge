@@ -80,3 +80,23 @@ fn public_client_contract_covers_all_thirteen_tui_intents() {
     let _ = UiClient::lease_ttl;
     let _ = BridgeEvent::requires_resync;
 }
+
+/// The TUI shares the daemon's own write bounds instead of copying them.
+#[test]
+fn write_bounds_are_exported_for_client_only_builds() {
+    use webex_bridge::dto::{
+        valid_message_body, valid_resource_id, MAX_MESSAGE_BODY_BYTES, MAX_RESOURCE_ID_BYTES,
+    };
+    assert_eq!(MAX_MESSAGE_BODY_BYTES, 7439);
+    assert_eq!(MAX_RESOURCE_ID_BYTES, 1024);
+    // 3719 two-byte characters + 1 byte = exactly the limit.
+    let exact = "é".repeat(3719) + "x";
+    assert!(valid_message_body(&exact));
+    assert!(!valid_message_body(&(exact + "x")));
+    assert!(!valid_message_body(""));
+    assert!(!valid_message_body("nul\0"));
+    assert!(valid_resource_id(&"x".repeat(MAX_RESOURCE_ID_BYTES)));
+    assert!(!valid_resource_id(&"x".repeat(MAX_RESOURCE_ID_BYTES + 1)));
+    assert!(!valid_resource_id(""));
+    assert!(!valid_resource_id("a\nb"));
+}

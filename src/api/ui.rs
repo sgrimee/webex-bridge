@@ -5,7 +5,7 @@
 //! native dialog; only that scope can decrypt and read full-mirror content.
 
 use super::{auth, ApiState};
-use crate::{dialog, dto};
+use crate::{dialog, dto, dto::valid_resource_id};
 use axum::{
     extract::{Extension, Path, Query, State},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
@@ -133,10 +133,6 @@ fn ui_session(
     }
 }
 
-fn valid_resource_id(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 1024 && !value.chars().any(char::is_control)
-}
-
 fn continuity_dto(continuity: crate::api::events::Continuity) -> dto::Continuity {
     dto::Continuity {
         instance_id: continuity.instance_id,
@@ -253,17 +249,11 @@ fn request_body<'a>(
         (Some(_), Some(_)) => None,
         (Some(body), None)
             if matches!(body.kind.as_str(), "plainText" | "markdown")
-                && !body.content.is_empty()
-                && body.content.len() <= 7439
-                && !body.content.contains('\0') =>
+                && dto::valid_message_body(&body.content) =>
         {
             Some((&body.kind, &body.content))
         }
-        (None, Some(markdown))
-            if !markdown.is_empty() && markdown.len() <= 7439 && !markdown.contains('\0') =>
-        {
-            Some(("markdown", markdown))
-        }
+        (None, Some(markdown)) if dto::valid_message_body(markdown) => Some(("markdown", markdown)),
         _ => None,
     }
 }

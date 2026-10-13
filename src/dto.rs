@@ -5,6 +5,30 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Maximum UI create/edit message body content, in UTF-8 bytes. This is the
+/// Webex message size limit enforced by the daemon for plain text and Markdown.
+pub const MAX_MESSAGE_BODY_BYTES: usize = 7439;
+
+/// Maximum opaque resource-ID length (room, message, parent, person, team)
+/// accepted by the UI API, in bytes. IDs are never decoded by clients.
+pub const MAX_RESOURCE_ID_BYTES: usize = 1024;
+
+/// Whether `content` is a writable UI message body: 1..=[`MAX_MESSAGE_BODY_BYTES`]
+/// UTF-8 bytes with no NUL. Clients may refuse early; the daemon is authoritative.
+#[must_use]
+pub fn valid_message_body(content: &str) -> bool {
+    !content.is_empty() && content.len() <= MAX_MESSAGE_BODY_BYTES && !content.contains('\0')
+}
+
+/// Whether `value` is an acceptable opaque UI resource ID: nonempty, at most
+/// [`MAX_RESOURCE_ID_BYTES`] bytes and free of control characters.
+#[must_use]
+pub fn valid_resource_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_RESOURCE_ID_BYTES
+        && !value.chars().any(char::is_control)
+}
+
 /// Metadata-only daemon health response, available before UI pairing.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

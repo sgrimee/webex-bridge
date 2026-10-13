@@ -16,7 +16,7 @@ use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const WEBEX_MAX_MESSAGE_BYTES: usize = 7439;
+const WEBEX_MAX_MESSAGE_BYTES: usize = crate::dto::MAX_MESSAGE_BODY_BYTES;
 type StoredDraft = (
     String,
     String,

@@ -254,8 +254,11 @@ impl WebexRest {
         parent_id: Option<&str>,
         markdown: &str,
     ) -> Result<Message> {
-        if markdown.is_empty() || markdown.len() > 7439 {
-            bail!("Webex Markdown must be between 1 and 7439 bytes");
+        if markdown.is_empty() || markdown.len() > crate::dto::MAX_MESSAGE_BODY_BYTES {
+            bail!(
+                "Webex Markdown must be between 1 and {} bytes",
+                crate::dto::MAX_MESSAGE_BODY_BYTES
+            );
         }
         let _ = GlobalId::new(GlobalIdType::Room, room_id.to_owned())?;
         if let Some(parent_id) = parent_id {
@@ -281,8 +284,11 @@ impl WebexRest {
         room_id: &str,
         markdown: &str,
     ) -> Result<Message> {
-        if markdown.is_empty() || markdown.len() > 7439 {
-            bail!("Webex Markdown must be between 1 and 7439 bytes");
+        if markdown.is_empty() || markdown.len() > crate::dto::MAX_MESSAGE_BODY_BYTES {
+            bail!(
+                "Webex Markdown must be between 1 and {} bytes",
+                crate::dto::MAX_MESSAGE_BODY_BYTES
+            );
         }
         let _ = GlobalId::new(GlobalIdType::Message, message_id.to_owned())?;
         let _ = GlobalId::new(GlobalIdType::Room, room_id.to_owned())?;
@@ -355,7 +361,7 @@ impl WebexRest {
         kind: &str,
         content: &str,
     ) -> std::result::Result<Message, UiWriteError> {
-        if content.is_empty() || content.len() > 7439 || content.contains('\0') {
+        if !crate::dto::valid_message_body(content) {
             return Err(UiWriteError::Rejected);
         }
         let _ = GlobalId::new(GlobalIdType::Room, room_id.to_owned())
@@ -385,7 +391,7 @@ impl WebexRest {
         kind: &str,
         content: &str,
     ) -> std::result::Result<Message, UiWriteError> {
-        if content.is_empty() || content.len() > 7439 || content.contains('\0') {
+        if !crate::dto::valid_message_body(content) {
             return Err(UiWriteError::Rejected);
         }
         let _ = GlobalId::new(GlobalIdType::Message, message_id.to_owned())
@@ -523,10 +529,7 @@ impl WebexRest {
             .into_iter()
             .find(|membership| membership.room_id == room_id && membership.person_id == me.id)
             .context("Current user has no membership in this room")?;
-        if membership.id.is_empty()
-            || membership.id.len() > 1024
-            || membership.id.chars().any(char::is_control)
-        {
+        if !crate::dto::valid_resource_id(&membership.id) {
             bail!("Webex membership ID is invalid");
         }
         let response = self
@@ -574,10 +577,7 @@ impl WebexRest {
             .into_iter()
             .find(|membership| membership.room_id == room_id && membership.person_id == me.id)
             .ok_or(UiWriteError::Rejected)?;
-        if membership.id.is_empty()
-            || membership.id.len() > 1024
-            || membership.id.chars().any(char::is_control)
-        {
+        if !crate::dto::valid_resource_id(&membership.id) {
             return Err(UiWriteError::Rejected);
         }
         let path = self

@@ -71,6 +71,13 @@ fn random_secret() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// How long normalised (not byte-exact) own-echo matching looks back.
+const OWN_ECHO_NORMALIZED_DAYS: i64 = 7;
+
+fn normalize_echo(body: &str) -> String {
+    body.replace("\r\n", "\n").trim_end().to_owned()
+}
+
 fn digest(value: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(value))
 }
@@ -333,6 +340,66 @@ impl Mirror {
             sha256,
             expires_at,
         }))
+    }
+
+    /// Whether a mirrored message is this bridge's own agent send echoing back.
+    ///
+    /// `approve_draft` persists the draft's room and body hash as `sending`
+    /// before the one Webex request, so an echo routed before `mark_sent`
+    /// (Mercury race) or after a `delivery-unknown` attempt still matches. Such
+    /// messages never route: the fingerprint has no expiry. A known daemon
+    /// account must be the sender; with no cached account identity the match
+    /// fails closed on room + body alone.
+    pub(crate) fn is_own_outbound(
+        &self,
+        room_id: &str,
+        sender_id: &str,
+        body: &str,
+        account_id: Option<&str>,
+    ) -> Result<bool> {
+        if account_id.is_some_and(|account| account != sender_id) {
+            return Ok(false);
+        }
+        let exact = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM outbox WHERE room_id=?1 AND sha256=?2
+                   AND state IN ('sending','sent','delivery-unknown','failed')",
+                params![room_id, digest(body.as_bytes())],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if exact {
+            return Ok(true);
+        }
+        // Tolerate Webex echo normalisation (CRLF, trailing whitespace) for
+        // recent attempts in this room by comparing decrypted draft bodies.
+        let since = (Utc::now() - Duration::days(OWN_ECHO_NORMALIZED_DAYS)).to_rfc3339();
+        let mut statement = self.conn.prepare(
+            "SELECT draft_id,body_ct,body_nonce FROM outbox
+             WHERE room_id=?1 AND created_at>=?2
+               AND state IN ('sending','sent','delivery-unknown','failed')",
+        )?;
+        let rows = statement
+            .query_map(params![room_id, since], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let wanted = normalize_echo(body);
+        for (draft_id, body_ct, body_nonce) in rows {
+            let draft =
+                self.crypto
+                    .open(&body_ct, &body_nonce, &aad("outbox", "body", &draft_id))?;
+            if std::str::from_utf8(&draft).is_ok_and(|draft| normalize_echo(draft) == wanted) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn agent_hops(&self, room_id: &str, parent_id: &str) -> Result<i64> {

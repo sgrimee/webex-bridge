@@ -701,6 +701,14 @@ impl Mirror {
     /// Read the cached daemon account for an authorized UI session. A missing
     /// identity is normal before the first successful authoritative `/me`.
     pub fn ui_account_identity(&self) -> Result<Option<UiPerson>> {
+        let Some(person_id) = self.account_person_id()? else {
+            return Ok(None);
+        };
+        self.ui_person(&person_id)
+    }
+
+    /// Decrypt only the cached daemon account person ID, if `/me` has run.
+    pub(crate) fn account_person_id(&self) -> Result<Option<String>> {
         let person_id_ct: Option<Vec<u8>> = self
             .conn
             .query_row(
@@ -709,15 +717,15 @@ impl Mirror {
                 |row| row.get(0),
             )
             .optional()?;
-        let Some(person_id_ct) = person_id_ct else {
-            return Ok(None);
-        };
-        let person_id = String::from_utf8(self.crypto.open_prefixed(
-            &person_id_ct,
-            &aad("account_identity", "person_id", ACCOUNT_IDENTITY_AAD_ID),
-        )?)
-        .context("Invalid encrypted account person ID")?;
-        self.ui_person(&person_id)
+        person_id_ct
+            .map(|person_id_ct| {
+                String::from_utf8(self.crypto.open_prefixed(
+                    &person_id_ct,
+                    &aad("account_identity", "person_id", ACCOUNT_IDENTITY_AAD_ID),
+                )?)
+                .context("Invalid encrypted account person ID")
+            })
+            .transpose()
     }
 
     /// Check cached person identity without decrypting free text.

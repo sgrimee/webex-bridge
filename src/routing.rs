@@ -225,7 +225,7 @@ impl Mirror {
             .collect::<HashMap<_, _>>();
         let mut statement = self.conn.prepare(
             "SELECT r.route_id,r.created_at,m.message_id,m.revision,m.sender_id,m.created_at,
-                    m.body_ct,m.body_nonce
+                    m.body_ct,m.body_nonce,r.room_id
              FROM routes r JOIN messages m ON m.room_id=r.room_id
              WHERE m.status='active'
                AND m.revision=(SELECT MAX(revision) FROM messages WHERE message_id=m.message_id)
@@ -243,10 +243,12 @@ impl Mirror {
                 row.get::<_, String>(5)?,
                 row.get::<_, Option<Vec<u8>>>(6)?,
                 row.get::<_, Option<Vec<u8>>>(7)?,
+                row.get::<_, String>(8)?,
             ))
         })?;
         let candidates = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
+        let account_id = self.account_person_id()?;
         let mut queued = Vec::new();
         for (
             route_id,
@@ -257,6 +259,7 @@ impl Mirror {
             created_at,
             body_ct,
             body_nonce,
+            room_id,
         ) in candidates
         {
             let Some(route) = routes.get(route_id.as_str()) else {
@@ -299,6 +302,12 @@ impl Mirror {
                 &super::mirror::message_aad("body", &message_id, revision),
             )?)
             .context("Invalid encrypted message body")?;
+            // An agent send echoing back must never re-enter as inbound input,
+            // even before `mark_sent` or after a `delivery-unknown` attempt.
+            if self.is_own_outbound(&room_id, &sender_id, &body, account_id.as_deref())? {
+                self.audit_filtered_once(&key, "own_outbound")?;
+                continue;
+            }
             if body.len() > config.limits.agent_inbound_max_bytes {
                 self.audit_filtered_once(&key, "inbound_too_large")?;
                 continue;
@@ -1225,5 +1234,109 @@ mod tests {
         assert!(fresh[0].revision > old.revision);
         assert_ne!(fresh[0].id, old.id);
         assert!(mirror.preview_delivery(&routes, &old.id).unwrap().is_none());
+    }
+
+    fn echo_config() -> Config {
+        let mut config = config();
+        config.routes[0].receive = Receive::All;
+        config.dev = Some(crate::config::DevConfig {
+            write_allowlist: vec!["room".into()],
+            secret_source: crate::config::DevSecretSource::Keychain,
+        });
+        config
+    }
+
+    const DRAFT: &str = "Reviewed it\n\n— 🤖 sam/coder · ref r1";
+
+    fn approved_draft(mirror: &mut Mirror, config: &Config) -> String {
+        let draft = mirror.create_draft(config, "r", None, DRAFT).unwrap();
+        mirror
+            .approve_draft(
+                config,
+                &["r".into()],
+                &draft.draft_id,
+                &draft.sha256,
+                &draft.approval_token,
+            )
+            .unwrap()
+            .unwrap();
+        draft.draft_id
+    }
+
+    fn echo(id: &str, body: &str) -> Message {
+        let mut echo = message(body);
+        echo.id = Some(id.into());
+        echo
+    }
+
+    #[test]
+    fn own_send_echo_routed_before_mark_sent_never_becomes_a_delivery() {
+        let config = echo_config();
+        let mut mirror = Mirror::in_memory([16; 32]).unwrap();
+        mirror.sync_routes(&config.routes).unwrap();
+        let draft_id = approved_draft(&mut mirror, &config);
+        // Mercury hydrates and routes the echo while the draft is still `sending`.
+        mirror.upsert_message(&echo("echo", DRAFT)).unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 0);
+        let reason: String = mirror
+            .conn
+            .query_row(
+                "SELECT detail_redacted FROM audit WHERE action='route_filtered'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, "own_outbound");
+        mirror.mark_sent(&draft_id, "echo").unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 0);
+        // A normalised echo (CRLF, trailing newline) is still recognised.
+        mirror
+            .upsert_message(&echo(
+                "echo-2",
+                &format!("{}\r\n", DRAFT.replace('\n', "\r\n")),
+            ))
+            .unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 0);
+        // Ordinary messages from the same sender still route.
+        mirror
+            .upsert_message(&echo("human", "a human question"))
+            .unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
+    }
+
+    #[test]
+    fn delivery_unknown_send_echo_never_becomes_a_delivery() {
+        let config = echo_config();
+        let mut mirror = Mirror::in_memory([17; 32]).unwrap();
+        mirror.sync_routes(&config.routes).unwrap();
+        let draft_id = approved_draft(&mut mirror, &config);
+        mirror.mark_delivery_unknown(&draft_id).unwrap();
+        // The Webex message ID was never learnt; only the fingerprint matches.
+        mirror.upsert_message(&echo("unknown", DRAFT)).unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 0);
+    }
+
+    #[test]
+    fn known_account_restricts_echo_matching_to_its_own_messages() {
+        let config = echo_config();
+        let mut mirror = Mirror::in_memory([18; 32]).unwrap();
+        mirror.sync_routes(&config.routes).unwrap();
+        approved_draft(&mut mirror, &config);
+        mirror
+            .cache_account_identity(&webex::Person {
+                id: "account".into(),
+                display_name: "Me".into(),
+                ..webex::Person::default()
+            })
+            .unwrap();
+        // Another allowed person quoting the exact text is not the bridge's echo.
+        mirror.upsert_message(&echo("quote", DRAFT)).unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
+        let mut own = echo("own", DRAFT);
+        own.person_id = Some("account".into());
+        let mut config = config;
+        config.routes[0].allowed_senders.push("account".into());
+        mirror.upsert_message(&own).unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 0);
     }
 }

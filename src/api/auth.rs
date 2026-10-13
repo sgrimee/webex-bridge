@@ -105,12 +105,35 @@ pub enum ClaimError {
 ///
 /// Tokens deliberately do not survive a daemon restart. A captured token is
 /// also useless from a different local process when peer PIDs are available.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Sessions {
     inner: Arc<Mutex<SessionState>>,
+    /// Bumped on every explicit revocation, so open event streams re-check
+    /// their token at once instead of at their next lease deadline.
+    revocations: Arc<tokio::sync::watch::Sender<u64>>,
+}
+
+impl Default for Sessions {
+    fn default() -> Self {
+        Self {
+            inner: Arc::default(),
+            revocations: Arc::new(tokio::sync::watch::channel(0).0),
+        }
+    }
 }
 
 impl Sessions {
+    /// Wakes on every explicit revocation (logout, release, unpair). A wake
+    /// carries no token: receivers re-check their own session.
+    pub fn revocations(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.revocations.subscribe()
+    }
+
+    fn notify_revoked(&self) {
+        self.revocations
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+    }
+
     fn token() -> String {
         let mut bytes = [0_u8; 32];
         rand::thread_rng().fill_bytes(&mut bytes);
@@ -402,6 +425,10 @@ impl Sessions {
         for token in &tokens {
             Self::revoke_locked(&mut state, token);
         }
+        drop(state);
+        if !tokens.is_empty() {
+            self.notify_revoked();
+        }
         tokens.len()
     }
 
@@ -409,6 +436,8 @@ impl Sessions {
     pub fn revoke(&self, token: &str) {
         let mut state = self.inner.lock().expect("session mutex poisoned");
         Self::revoke_locked(&mut state, token);
+        drop(state);
+        self.notify_revoked();
     }
 
     /// Release one owned agent lease.

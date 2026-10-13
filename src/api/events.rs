@@ -343,6 +343,9 @@ struct CloseAfterTerminal<S> {
     /// extends the same token in place, so the stream re-arms rather than
     /// closing a still-valid subscription.
     lease: Option<UiLease>,
+    /// UI-only revocation wake-ups (logout, unpair). A quiet stream whose
+    /// token was revoked ends at once rather than at its old lease deadline.
+    revocations: Option<tokio_stream::wrappers::WatchStream<u64>>,
 }
 
 struct UiLease {
@@ -374,6 +377,30 @@ where
             return Poll::Ready(None);
         }
         let this = &mut *self;
+        if let Some(revocations) = this.revocations.as_mut() {
+            loop {
+                match Pin::new(&mut *revocations).poll_next(context) {
+                    Poll::Ready(Some(_)) => {
+                        if this
+                            .lease
+                            .as_ref()
+                            .and_then(UiLease::live_deadline)
+                            .is_none()
+                        {
+                            this.closing.store(2, Ordering::SeqCst);
+                            return Poll::Ready(Some(Ok(SseEvent::default()
+                                .event(SESSION_EXPIRED_EVENT)
+                                .data(r#"{"reason":"session_expired"}"#))));
+                        }
+                    }
+                    Poll::Ready(None) => {
+                        this.revocations = None;
+                        break;
+                    }
+                    Poll::Pending => break,
+                }
+            }
+        }
         if let Some(expiry) = this.expiry.as_mut() {
             while expiry.as_mut().poll(context).is_ready() {
                 // Re-arm on a renewed lease; polling again registers the
@@ -407,6 +434,9 @@ async fn stream(
     Extension(peer): Extension<auth::PeerIdentity>,
     headers: HeaderMap,
 ) -> Response {
+    // Subscribe to revocations before authorizing, so a revoke racing this
+    // request still wakes the stream.
+    let revocation_rx = state.sessions().revocations();
     let (token, subscriber) = match subscriber(&state, peer, &headers) {
         Ok(subscriber) => subscriber,
         Err(response) => return *response,
@@ -428,6 +458,8 @@ async fn stream(
     } else {
         None
     };
+    let revocations =
+        ui_subscriber.then(|| tokio_stream::wrappers::WatchStream::from_changes(revocation_rx));
     let lease = ui_subscriber.then(|| UiLease {
         sessions: sessions.clone(),
         token: token.clone(),
@@ -506,6 +538,7 @@ async fn stream(
         closing,
         expiry,
         lease,
+        revocations,
     };
     let initial = if ui_subscriber {
         vec![Ok::<SseEvent, Infallible>(

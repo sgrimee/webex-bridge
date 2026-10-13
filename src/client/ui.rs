@@ -1689,4 +1689,46 @@ mod server_tests {
         drop(stream);
         env.server.shutdown().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn revoking_a_ui_session_closes_its_quiet_event_stream_at_once() {
+        let env = renewable_server().await;
+        let ui = env.bridge.create_ui_session(RENEW_SECRET).await.unwrap();
+        let other = env.bridge.create_ui_session(RENEW_SECRET).await.unwrap();
+        let mut stream = ui.events().await.unwrap();
+        let _ready = stream.next().await.unwrap().unwrap();
+
+        // Revoking another token wakes the stream, which re-checks its own
+        // still-valid lease and stays open.
+        env.sessions.revoke(other.token.as_str());
+        env.events.publish_ui(
+            "connection.status",
+            serde_json::json!({"connection":"connected"}),
+        );
+        let event = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("unrelated revoke must not close the stream")
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.name, "connection.status");
+
+        // Unpair-style revocation: no bus event and a 600 s lease, yet the
+        // quiet stream ends immediately with the terminal event.
+        assert_eq!(
+            env.sessions
+                .revoke_ui_pairings(std::slice::from_ref(&env.hash)),
+            1
+        );
+        let expired = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("revoked stream should wake at once")
+            .unwrap()
+            .unwrap();
+        assert!(expired.is_session_expired());
+        assert!(tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("revoked stream should close")
+            .is_none());
+        env.server.shutdown().await.unwrap();
+    }
 }

@@ -74,6 +74,9 @@ fn random_secret() -> String {
 /// Prefix of the mandatory agent trailer line (`— 🤖 <agentName> · …`).
 const AGENT_TRAILER_PREFIX: &str = "— 🤖 ";
 
+/// How recent an attempt must be for the account + exact-trailer echo rule.
+const OWN_ECHO_TRAILER_MINUTES: i64 = 10;
+
 /// How long normalised (not byte-exact) own-echo matching looks back.
 const OWN_ECHO_NORMALIZED_DAYS: i64 = 7;
 
@@ -116,11 +119,18 @@ fn validate_markdown(route: &Route, markdown: &str) -> Result<()> {
     let Some(last_line) = markdown.lines().last() else {
         bail!("Markdown has no content");
     };
-    let required_prefix = format!("— 🤖 {}", route.agent_name);
-    if !last_line.starts_with(&required_prefix) {
+    if !is_agent_trailer(last_line, &route.agent_name) {
         bail!("Agent Markdown must end with its required trailer");
     }
     Ok(())
+}
+
+/// Whether `line` is exactly the trailer of `agent_name`: `— 🤖 <name>`
+/// followed by end of line or whitespace, so `sam/coder2` is not `sam/coder`.
+pub(crate) fn is_agent_trailer(line: &str, agent_name: &str) -> bool {
+    line.strip_prefix(AGENT_TRAILER_PREFIX)
+        .and_then(|rest| rest.strip_prefix(agent_name))
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
 }
 
 impl Mirror {
@@ -272,8 +282,12 @@ impl Mirror {
     }
 
     /// Mark a one-shot outbound attempt as confirmed by Webex.
+    /// Any delivery already created for this Webex message (an echo routed
+    /// through a fingerprint false negative) is superseded in the same
+    /// transaction, so the agent's own send never stays an inbound delivery.
     pub fn mark_sent(&mut self, draft_id: &str, webex_message_id: &str) -> Result<()> {
-        if self.conn.execute(
+        let tx = self.conn.transaction()?;
+        if tx.execute(
             "UPDATE outbox SET state='sent',webex_message_id=?2
              WHERE draft_id=?1 AND state='sending'",
             params![draft_id, webex_message_id],
@@ -281,6 +295,12 @@ impl Mirror {
         {
             bail!("Draft is not in the sending state");
         }
+        tx.execute(
+            "UPDATE deliveries SET state='superseded',decided_at=?2
+             WHERE message_id=?1 AND state IN ('pending','accepted','rejected')",
+            params![webex_message_id, Utc::now().to_rfc3339()],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -353,6 +373,14 @@ impl Mirror {
     /// messages never route: the fingerprint has no expiry. A known daemon
     /// account must be the sender; with no cached account identity the match
     /// fails closed on room + body alone.
+    ///
+    /// When the account is known, a normalisation-robust rule also applies:
+    /// an account message whose last line is exactly a route's trailer is an
+    /// echo if that route has an attempt (sending/sent/delivery-unknown) in
+    /// this room within the last 10 minutes, whatever Webex did to the body.
+    /// The attempt time is bounded by the draft's approval expiry, so the check
+    /// uses `expires_at`. User edits of agent-sent messages never route either:
+    /// routing excludes every revision of a recorded `webex_message_id`.
     pub(crate) fn is_own_outbound(
         &self,
         room_id: &str,
@@ -374,6 +402,24 @@ impl Mirror {
             .is_some_and(|line| line.starts_with(AGENT_TRAILER_PREFIX))
         {
             return Ok(false);
+        }
+        if account_id.is_some() {
+            let last_line = body.trim_end().lines().last().unwrap_or_default();
+            let since = (Utc::now() - Duration::minutes(OWN_ECHO_TRAILER_MINUTES)).to_rfc3339();
+            let mut statement = self.conn.prepare(
+                "SELECT DISTINCT r.agent_name FROM outbox o JOIN routes r ON r.route_id=o.route_id
+                 WHERE o.room_id=?1 AND o.expires_at>=?2
+                   AND o.state IN ('sending','sent','delivery-unknown')",
+            )?;
+            let agents = statement
+                .query_map(params![room_id, since], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if agents
+                .iter()
+                .any(|agent| is_agent_trailer(last_line, agent))
+            {
+                return Ok(true);
+            }
         }
         let exact = self
             .conn

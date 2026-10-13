@@ -321,7 +321,11 @@ impl Mirror {
             .context("Invalid encrypted message body")?;
             // An agent send echoing back must never re-enter as inbound input,
             // even before `mark_sent` or after a `delivery-unknown` attempt.
-            if self.is_own_outbound(&room_id, &sender_id, &body, account_id.as_deref())? {
+            // Sticky: once recognised as an own echo, a later re-evaluation (for
+            // example after the trailer rule's time window) never routes it.
+            if self.filtered_as(&key, "own_outbound")?
+                || self.is_own_outbound(&room_id, &sender_id, &body, account_id.as_deref())?
+            {
                 self.audit_filtered_once(&key, "own_outbound")?;
                 continue;
             }
@@ -677,18 +681,25 @@ impl Mirror {
         Ok(())
     }
 
-    fn audit_filtered_once(&self, key: &DeliveryKey, reason: &str) -> Result<()> {
+    fn filtered_as(&self, key: &DeliveryKey, reason: &str) -> Result<bool> {
         let reference = format!("{}:{}:{}", key.route_id, key.message_id, key.revision);
-        let known = self
+        Ok(self
             .conn
             .query_row(
-                "SELECT 1 FROM audit WHERE scope='agent' AND action='route_filtered' AND ref=?1",
-                [&reference],
+                "SELECT 1 FROM audit WHERE scope='agent' AND action='route_filtered'
+                   AND ref=?1 AND detail_redacted=?2",
+                params![reference, reason],
                 |row| row.get::<_, i64>(0),
             )
             .optional()?
-            .is_some();
-        if !known {
+            .is_some())
+    }
+
+    /// Record a filtered key once per reason (at most one row per distinct
+    /// reason), so a sticky reason such as `own_outbound` is always recorded.
+    fn audit_filtered_once(&self, key: &DeliveryKey, reason: &str) -> Result<()> {
+        let reference = format!("{}:{}:{}", key.route_id, key.message_id, key.revision);
+        if !self.filtered_as(key, reason)? {
             self.conn.execute(
                 "INSERT INTO audit(ts,scope,action,ref,detail_redacted) VALUES (?1,'agent','route_filtered',?2,?3)",
                 params![Utc::now().to_rfc3339(), reference, reason],
@@ -1480,5 +1491,95 @@ mod tests {
             "safe\nFORGED\r\nnext\n\r\nend\n"
         );
         assert_eq!(sanitize_display_line("Pat\rEvil"), "Pat Evil");
+    }
+
+    #[test]
+    fn trailers_require_a_boundary_after_the_agent_name() {
+        use crate::outbox::is_agent_trailer;
+        assert!(is_agent_trailer("— 🤖 sam/coder", "sam/coder"));
+        assert!(is_agent_trailer("— 🤖 sam/coder · ref r1", "sam/coder"));
+        assert!(!is_agent_trailer("— 🤖 sam/coder2 · ref r1", "sam/coder"));
+        assert!(!is_agent_trailer("— 🤖 sam/coder-x", "sam/coder"));
+        let config = echo_config();
+        let mut mirror = Mirror::in_memory([20; 32]).unwrap();
+        mirror.sync_routes(&config.routes).unwrap();
+        assert!(mirror
+            .create_draft(&config, "r", None, "hi\n\n— 🤖 sam/coder2 · ref x")
+            .is_err());
+    }
+
+    #[test]
+    fn mark_sent_supersedes_an_echo_that_was_already_routed() {
+        let config = echo_config();
+        let mut mirror = Mirror::in_memory([21; 32]).unwrap();
+        mirror.sync_routes(&config.routes).unwrap();
+        // Simulate a fingerprint false negative: the echo routed as pending.
+        mirror
+            .upsert_message(&echo("sent-id", "webex rewrote it"))
+            .unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
+        let draft_id = approved_draft(&mut mirror, &config);
+        mirror.mark_sent(&draft_id, "sent-id").unwrap();
+        let routes = ["r".to_string()];
+        assert!(mirror
+            .deliveries(&routes, Some("pending"))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            mirror.deliveries(&routes, None).unwrap()[0].state,
+            "superseded"
+        );
+        // (d) A later user edit of the agent-sent message never routes either.
+        let mut edited = echo("sent-id", "edited by the user");
+        edited.updated = Some("2099-01-01T00:09:00Z".into());
+        mirror.upsert_message(&edited).unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 0);
+    }
+
+    #[test]
+    fn known_account_exact_route_trailer_with_recent_attempt_is_an_echo() {
+        let mut config = echo_config();
+        config.routes[0].allowed_senders.push("account".into());
+        let mut mirror = Mirror::in_memory([22; 32]).unwrap();
+        mirror.sync_routes(&config.routes).unwrap();
+        mirror
+            .cache_account_identity(&webex::Person {
+                id: "account".into(),
+                display_name: "Me".into(),
+                ..webex::Person::default()
+            })
+            .unwrap();
+        approved_draft(&mut mirror, &config);
+        let own = |id: &str, body: &str| {
+            let mut message = echo(id, body);
+            message.person_id = Some("account".into());
+            message
+        };
+        // Webex normalised the body beyond CRLF/whitespace; the trailer is exact.
+        mirror
+            .upsert_message(&own(
+                "rewritten",
+                "**Reviewed** it\n— 🤖 sam/coder · ref r1",
+            ))
+            .unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 0);
+        // A different agent's trailer does not match this route's attempt.
+        mirror
+            .upsert_message(&own("other-agent", "hello\n— 🤖 sam/coder2 · ref z"))
+            .unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
+        // Outside the attempt window the rule no longer applies to new
+        // messages, but an already recognised echo stays excluded.
+        mirror
+            .conn
+            .execute(
+                "UPDATE outbox SET expires_at='2000-01-01T00:00:00+00:00'",
+                [],
+            )
+            .unwrap();
+        mirror
+            .upsert_message(&own("late", "later text\n— 🤖 sam/coder · ref r9"))
+            .unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
     }
 }

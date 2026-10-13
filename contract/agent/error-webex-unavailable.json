@@ -1,0 +1,17 @@
+{
+  "kind": "http",
+  "request": {
+    "body": {
+      "approvalToken": "<token>",
+      "sha256": "VCISJhCnGQCrWhvYJtTtJD8vMZwtUX9PaVKZ7lY9mxk"
+    },
+    "route": "POST /v1/agent/outbox/{draftId}/approve"
+  },
+  "response": {
+    "body": {
+      "code": "webex_unavailable",
+      "message": "Webex is not connected; the draft remains pending"
+    },
+    "status": 503
+  }
+}

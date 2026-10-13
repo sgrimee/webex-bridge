@@ -28,7 +28,7 @@ use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::watch;
 use tokio_stream::StreamExt;
 use wiremock::{
-    matchers::{method, path},
+    matchers::{body_string_contains, method, path},
     Mock, MockServer, ResponseTemplate,
 };
 
@@ -289,6 +289,20 @@ async fn agent_contract_fixtures_match_the_real_daemon_output() {
     }
 
     let remote = MockServer::start().await;
+    // Specific cases first: a definite Webex rejection, and an ambiguous
+    // 200 without a message ID (delivery-unknown).
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_string_contains("synthetic failure case"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({"message": "synthetic"})))
+        .mount(&remote)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_string_contains("synthetic unknown case"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&remote)
+        .await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -688,6 +702,59 @@ async fn agent_contract_fixtures_match_the_real_daemon_output() {
         sent,
     );
 
+    // Approve outcomes other than sent: a definite rejection and an
+    // ambiguous delivery, each with its status read-back and SSE frame.
+    for (case, outcome) in [
+        ("synthetic failure case", "failed"),
+        ("synthetic unknown case", "delivery-unknown"),
+    ] {
+        let (_, draft, _) = call(
+            &bridge,
+            Method::POST,
+            "/v1/agent/outbox",
+            Some(&token),
+            Some(json!({"routeId": ROUTE, "markdown": format!("{case}\n— 🤖 sam/coder")})),
+        )
+        .await;
+        let draft = draft.unwrap();
+        let draft_id = draft["draftId"].as_str().unwrap().to_owned();
+        let (status, body, sent) = call(
+            &bridge,
+            Method::POST,
+            &format!("/v1/agent/outbox/{draft_id}/approve"),
+            Some(&token),
+            Some(json!({"sha256": draft["sha256"], "approvalToken": draft["approvalToken"]})),
+        )
+        .await;
+        assert_eq!(body.as_ref().unwrap()["state"], outcome);
+        rec.http(
+            &format!("outbox-approve-{outcome}"),
+            "POST /v1/agent/outbox/{draftId}/approve",
+            status,
+            body,
+            sent,
+        );
+        rec.events(
+            &format!("event-outbox-status-{outcome}"),
+            &frames(&events, &mut stream).await,
+        );
+        let (status, body, sent) = call(
+            &bridge,
+            Method::GET,
+            &format!("/v1/agent/outbox/{draft_id}"),
+            Some(&token),
+            None,
+        )
+        .await;
+        rec.http(
+            &format!("outbox-status-{outcome}"),
+            "GET /v1/agent/outbox/{draftId}",
+            status,
+            body,
+            sent,
+        );
+    }
+
     // --- Daemon-wide events ------------------------------------------------
     events.publish_both(
         "connection.status",
@@ -721,6 +788,55 @@ async fn agent_contract_fixtures_match_the_real_daemon_output() {
         sent,
     );
     server.shutdown().await.unwrap();
+
+    // --- Webex not connected: a daemon without a REST client ---------------
+    let offline_paths = Paths::under(temp.path().join("offline"));
+    let (_offline_tx, offline_rx) = watch::channel(ConnectionStatus::Disconnected);
+    let offline = start(
+        &offline_paths,
+        ApiState::with_config(mirror.clone(), offline_rx, Arc::clone(&config)),
+    )
+    .await
+    .unwrap();
+    let offline_bridge = BridgeClient::new(offline_paths.socket.clone());
+    let (_, claimed, _) = call(
+        &offline_bridge,
+        Method::POST,
+        "/v1/agent/sessions",
+        None,
+        Some(claim),
+    )
+    .await;
+    let offline_token = claimed.unwrap()["token"].as_str().unwrap().to_owned();
+    let (_, draft, _) = call(
+        &offline_bridge,
+        Method::POST,
+        "/v1/agent/outbox",
+        Some(&offline_token),
+        Some(json!({"routeId": ROUTE, "markdown": "Synthetic offline reply\n— 🤖 sam/coder"})),
+    )
+    .await;
+    let draft = draft.unwrap();
+    let (status, body, sent) = call(
+        &offline_bridge,
+        Method::POST,
+        &format!(
+            "/v1/agent/outbox/{}/approve",
+            draft["draftId"].as_str().unwrap()
+        ),
+        Some(&offline_token),
+        Some(json!({"sha256": draft["sha256"], "approvalToken": draft["approvalToken"]})),
+    )
+    .await;
+    assert_eq!(status, 503);
+    rec.http(
+        "error-webex-unavailable",
+        "POST /v1/agent/outbox/{draftId}/approve",
+        status,
+        body,
+        sent,
+    );
+    offline.shutdown().await.unwrap();
 
     // --- Synthetic-only guard, then compare or regenerate -------------------
     let rendered = rec

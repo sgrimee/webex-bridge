@@ -1,0 +1,12 @@
+{
+  "frames": [
+    {
+      "data": {
+        "draftId": "<draft-id>",
+        "state": "failed"
+      },
+      "event": "outbox.status"
+    }
+  ],
+  "kind": "sse"
+}

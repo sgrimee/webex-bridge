@@ -8,6 +8,10 @@
 //! `cargo build`/`cargo test` runs can therefore never replace (and ad-hoc
 //! re-sign) the running service binary.
 
+// The plist, signature and copy helpers are platform-neutral and unit tested
+// everywhere, but only the macOS install path calls them.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
+
 use crate::paths::{check_mode, Paths};
 use anyhow::{bail, Context, Result};
 use std::{

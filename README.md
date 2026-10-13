@@ -2,11 +2,8 @@
 
 Local Webex connection owner, encrypted mirror and scoped API for UI and agent clients.
 
-**Status:** Steps 1–2 (transport, encrypted mirror and sync) are complete and
-live-validated; Step 3 (daemon API and service) is functionally complete on
-`step-3-api-service` and awaiting its final live validation (see the
-[plan](../docs/webex-agent-channel-plan.md)). No Webex writes happen without an
-explicit local action.
+macOS only for now (LaunchAgent, Keychain, native pairing dialog). No Webex
+write happens without an explicit local action.
 
 - **Daemon and mirror.** `webex-bridged` owns the single Mercury connection and
   keeps an encrypted SQLite mirror of all rooms (`--dev-room` restricts it to
@@ -46,16 +43,63 @@ explicit local action.
   `~/Library/Application Support/webex-bridge/bin/` (see below); daemon logs
   are metadata-only. Attachment content is never downloaded by the bridge.
 
-The dedicated `webex-bridge` integration is separate from the TUI integration.
-OAuth defaults to ten granular scopes. The user explicitly approved
-`[webex] oauth_scope = "spark_all"` for this installation after Webex WDM
-rejected the confirmed granular token with HTTP 403. There is no automatic
-scope upgrade: changing the config rejects cached tokens until a fresh
-`webex-bridge login`. Secrets are in the macOS login Keychain; an unsigned CLI
-cannot use the optional `biometric-keychain` feature (requires a properly
-signed/entitled app). Never put tokens or client secrets in `config.toml`.
+## Setup
 
-Local testing:
+Requirements: macOS, Rust 1.88 (`rust-toolchain.toml`) and a persistent code
+signing identity in your login Keychain (an Apple Development certificate or a
+self-signed "Code Signing" certificate created in Keychain Access); [mise](https://mise.jdx.dev) is optional.
+
+1. **Create your own Webex integration** at
+   <https://developer.webex.com/my-apps>, with the redirect URI
+   `http://localhost:8765/callback` and these scopes: `spark:messages_read`,
+   `spark:messages_write`, `spark:rooms_read`, `spark:rooms_write`,
+   `spark:memberships_read`, `spark:memberships_write`, `spark:people_read`,
+   `spark:teams_read`, `spark:devices_read`, `spark:devices_write`. Keep its
+   client ID and secret for step 3. Use a dedicated integration for the
+   bridge, not one shared with another client.
+2. **Build, sign and install the service** (copies the signed binaries into
+   `~/Library/Application Support/webex-bridge/bin/` and starts the
+   LaunchAgent):
+
+   ```sh
+   mise run service:start
+   # without mise: ./scripts/sign-bridged-dev, then
+   #   "${CARGO_TARGET_DIR:-target}/debug/webex-bridge" install-service
+   ```
+3. **Log in with the installed CLI:**
+
+   ```sh
+   CLI="$HOME/Library/Application Support/webex-bridge/bin/webex-bridge"
+   "$CLI" login     # prompts once for the client ID and secret, then OAuth
+   "$CLI" health    # socket-only daemon status, no Keychain access
+   "$CLI" status    # authentication and mirror progress
+   ```
+
+   `login` opens the browser for the OAuth consent and stores the client
+   credentials and tokens in the macOS login Keychain. Always use the
+   installed, signed CLI: a `cargo run` build is ad-hoc signed, so the
+   Keychain would prompt on every rebuild.
+
+Clients (the terminal UI, the pi agent channel) then pair with the daemon
+through a native confirmation dialog.
+
+OAuth defaults to the ten granular scopes above. If Webex WDM rejects that
+token with HTTP 403 (it did for the author's account), the only alternative is
+an explicit opt-in: set `[webex] oauth_scope = "spark_all"` in
+`~/Library/Application Support/webex-bridge/config.toml`, add `spark:all` to the
+integration and run `login` again. There is no automatic scope upgrade: a
+changed scope rejects cached tokens until a fresh `login`. Secrets live only in
+the macOS login Keychain; never put tokens or client secrets in `config.toml`.
+An unsigned CLI cannot use the optional `biometric-keychain` feature (it needs
+a properly signed and entitled app).
+
+**Keychain prompts.** The daemon reads two Keychain items (OAuth state and the
+mirror key). With a self-signed development identity, macOS asks again for
+each item after a rebuild; choose **Always Allow** each time. This is accepted
+for development; an ad-hoc (`cargo run`) signature is refused instead, because
+its prompts would never stop.
+
+## Development
 
 `mise.toml` provides the preferred, signing-safe shortcuts:
 
@@ -78,17 +122,10 @@ the plist points at that copy. Later `cargo build`/`cargo test` runs therefore
 cannot replace or ad-hoc re-sign the running daemon. The build scripts and
 Mise tasks honour `CARGO_TARGET_DIR`.
 
-Upgrading from an install made before this change (whose plist still points
-at `target/debug/webex-bridged`): build outside the checkout so the running
-binary is not overwritten in place, then reinstall once:
-
 ```sh
-CARGO_TARGET_DIR=$HOME/tmp/wb-target mise run service:restart
-```
-
-```sh
-cargo run --bin webex-bridge -- login
-cargo run --bin webex-bridge -- status
+CLI="$HOME/Library/Application Support/webex-bridge/bin/webex-bridge"
+"$CLI" login
+"$CLI" status
 # Always build and persistently sign the daemon before starting/installing it:
 # an ad-hoc Cargo signature causes repeated Keychain/password prompts.
 ./scripts/sign-bridged-dev
@@ -96,36 +133,35 @@ cargo run --bin webex-bridge -- status
 # signed build (`cargo run` would rebuild ad hoc and is refused by the
 # installer, which rejects unsigned or ad-hoc-signed source binaries and copies).
 "${CARGO_TARGET_DIR:-target}/debug/webex-bridge" install-service
-"$HOME/Library/Application Support/webex-bridge/bin/webex-bridge" uninstall-service
+"$CLI" uninstall-service
 # Explicit local diagnostic: emits roomId, title, isMember and result as JSON.
 # It decrypts the room title for stdout only; daemon logs remain metadata-only.
-cargo run --bin webex-bridge -- sync failures
-cargo run --bin webex-bridge -- probe --room <approved-room-id>
+"$CLI" sync failures
+"$CLI" probe --room <approved-room-id>
 # With [dev] write_allowlist configured, one-time refresh test:
-cargo run --bin webex-bridge -- probe --room <approved-room-id> --refresh-after-secs 20
+"$CLI" probe --room <approved-room-id> --refresh-after-secs 20
 # For refresh-gap continuity, drop the listener for an explicit 1–120 s window.
-cargo run --bin webex-bridge -- probe --room <approved-room-id> --refresh-after-secs 10 --refresh-gap-secs 60
-# Explicit Step 1 membership diagnostics; the room must be allowlisted.
-cargo run --bin webex-bridge -- membership invite --room <approved-room-id> --email <consented-participant-email>
+"$CLI" probe --room <approved-room-id> --refresh-after-secs 10 --refresh-gap-secs 60
+# Membership diagnostics; the room must be allowlisted.
+"$CLI" membership invite --room <approved-room-id> --email <consented-participant-email>
 # Temporarily removes and restores that existing participant; final state remains a member.
-cargo run --bin webex-bridge -- membership cycle --room <approved-room-id> --email <consented-participant-email>
+"$CLI" membership cycle --room <approved-room-id> --email <consented-participant-email>
 ```
 
 Probe output contains only IDs, timestamps, lengths and sanitized event types,
 not message bodies. `webex-bridged --dev-room <allowlisted ID>` is a restricted
-Step 2 validation mode; without it, the daemon follows D7 and mirrors all
-rooms. Optional `[webex] retention_max_age = "365d"` prunes old encrypted
+validation mode; without it, the daemon mirrors all rooms. Optional
+`[webex] retention_max_age = "365d"` prunes old encrypted
 message revisions (and their agent delivery metadata); leaving it unset keeps
 all history. Message `revision` values come from one mirror-wide counter: they
 are opaque, strictly increasing per message and never reused, even when a pruned
-message is later re-hydrated, but they are not contiguous and not an edit count. All write paths must
-enforce `[dev] write_allowlist` in later steps. See [the local implementation plan](../docs/webex-agent-channel-plan.md)
-and [`docs/events.md`](docs/events.md) for observations.
+message is later re-hydrated, but they are not contiguous and not an edit count.
+See [`docs/events.md`](docs/events.md) for observed Mercury event shapes.
 
 ## Daemon diagnostics and macOS development Keychain access
 
 `bridged.log` is deliberately metadata-only: it never includes Webex payloads,
-room/message IDs, tokens, secrets, or decrypted mirror data. The daemon now
+room/message IDs, tokens, secrets, or decrypted mirror data. The daemon
 emits timestamped lifecycle events at normal level (startup, mirror open,
 connect/reconnect, refresh, and sync counts/duration). For additional safe
 progress events, run it with `--debug` or set `WEBEX_BRIDGE_LOG=debug`. Debug
@@ -135,7 +171,7 @@ and route name only:
 
 ```sh
 ./target/debug/webex-bridged --debug
-# or, after the initial setup below:
+# or, with the signing setup below:
 WEBEX_BRIDGE_LOG=debug ./scripts/run-bridged-dev
 ```
 
@@ -155,8 +191,9 @@ Apple Development or local Code Signing certificate in Keychain Access/Xcode:
 ```
 
 It builds the daemon and re-signs it with a persistent identity and stable
-identifier before starting it. On its first run, choose **Always Allow** for
-each Keychain item; subsequent rebuilds/restarts should not prompt. If several
+identifier before starting it. Choose **Always Allow** for each Keychain item
+when asked; with a self-signed identity this repeats after each rebuild (see
+Setup). If several
 signing identities are present, select one explicitly:
 
 ```sh
@@ -168,5 +205,14 @@ The launcher intentionally refuses to fall back to an ad-hoc signature: that
 would reintroduce the repeated prompts. A password-file/plaintext development
 mode is not provided.
 
-During development this crate depends on the sibling `../webex-rust` checkout.
-No PRs or remote dependency changes are required for local work.
+## Dependencies
+
+The `webex` crate comes from the
+[sgrimee/webex-rust](https://github.com/sgrimee/webex-rust) fork. Published
+branches pin it as a git dependency; for local work on both crates, point it at
+a sibling `../webex-rust` checkout (a path dependency or a `[patch]` entry).
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.

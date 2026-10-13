@@ -1,0 +1,9 @@
+{
+  "kind": "http",
+  "request": {
+    "route": "DELETE /v1/agent/sessions/{sessionId}"
+  },
+  "response": {
+    "status": 204
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "kind": "http",
+  "request": {
+    "body": {
+      "markdown": "no trailer",
+      "routeId": "agents-social"
+    },
+    "route": "POST /v1/agent/outbox"
+  },
+  "response": {
+    "body": {
+      "code": "invalid_request",
+      "message": "Draft does not meet route, approval, or message-format requirements"
+    },
+    "status": 400
+  }
+}

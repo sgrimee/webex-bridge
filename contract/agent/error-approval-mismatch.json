@@ -1,0 +1,17 @@
+{
+  "kind": "http",
+  "request": {
+    "body": {
+      "approvalToken": "<token>",
+      "sha256": "2VH9WqQqdITbFxoDdgPPCqLRABta3SIcBTG5zVZHmH8"
+    },
+    "route": "POST /v1/agent/outbox/{draftId}/approve"
+  },
+  "response": {
+    "body": {
+      "code": "approval_mismatch",
+      "message": "Draft approval does not match the pending draft"
+    },
+    "status": 403
+  }
+}

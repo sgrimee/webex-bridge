@@ -1,0 +1,13 @@
+{
+  "kind": "http",
+  "request": {
+    "route": "GET /v1/rooms"
+  },
+  "response": {
+    "body": {
+      "code": "forbidden_scope",
+      "message": "Session is not authorized for UI endpoints"
+    },
+    "status": 403
+  }
+}

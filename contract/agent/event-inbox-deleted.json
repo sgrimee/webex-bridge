@@ -1,0 +1,21 @@
+{
+  "frames": [
+    {
+      "data": {
+        "deliveryId": "YWdlbnRzLXNvY2lhbABZMmx6WTI5emNHRnlhem92TDNWekwwMUZVMU5CUjBVdk1EQXdNREF3TURBdE1EQXdNQzAwTURBd0xUZ3dNREF0TURBd01EQXdNREF3TVRBMAAz",
+        "reason": "deleted",
+        "revision": 3
+      },
+      "event": "inbox.deleted"
+    },
+    {
+      "data": {
+        "deliveryId": "YWdlbnRzLXNvY2lhbABZMmx6WTI5emNHRnlhem92TDNWekwwMUZVMU5CUjBVdk1EQXdNREF3TURBdE1EQXdNQzAwTURBd0xUZ3dNREF0TURBd01EQXdNREF3TVRBMAA0",
+        "reason": "deleted",
+        "revision": 4
+      },
+      "event": "inbox.deleted"
+    }
+  ],
+  "kind": "sse"
+}

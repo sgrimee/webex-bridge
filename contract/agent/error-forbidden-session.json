@@ -1,0 +1,13 @@
+{
+  "kind": "http",
+  "request": {
+    "route": "POST /v1/agent/sessions/{sessionId}/heartbeat"
+  },
+  "response": {
+    "body": {
+      "code": "forbidden_session",
+      "message": "Session ID does not match the bearer token"
+    },
+    "status": 403
+  }
+}

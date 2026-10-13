@@ -1,0 +1,22 @@
+{
+  "kind": "http",
+  "request": {
+    "body": {
+      "markdown": "Synthetic agent reply\n— 🤖 sam/coder",
+      "parentId": "Y2lzY29zcGFyazovL3VzL01FU1NBR0UvMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMTAx",
+      "routeId": "agents-social"
+    },
+    "route": "POST /v1/agent/outbox"
+  },
+  "response": {
+    "body": {
+      "approvalToken": "<token>",
+      "draftId": "<draft-id>",
+      "expiresAt": "<timestamp>",
+      "preview": "Synthetic agent reply\n— 🤖 sam/coder",
+      "roomTitle": "Synthetic Room",
+      "sha256": "2VH9WqQqdITbFxoDdgPPCqLRABta3SIcBTG5zVZHmH8"
+    },
+    "status": 200
+  }
+}

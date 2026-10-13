@@ -1,0 +1,19 @@
+{
+  "kind": "http",
+  "request": {
+    "body": {
+      "agentName": "sam/coder",
+      "cwd": "/synthetic/workspace",
+      "host": "",
+      "sessionId": "synthetic-host-session"
+    },
+    "route": "POST /v1/agent/sessions"
+  },
+  "response": {
+    "body": {
+      "code": "invalid_request",
+      "message": "Agent session fields are invalid"
+    },
+    "status": 400
+  }
+}

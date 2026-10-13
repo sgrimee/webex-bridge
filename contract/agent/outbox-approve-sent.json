@@ -1,0 +1,16 @@
+{
+  "kind": "http",
+  "request": {
+    "body": {
+      "approvalToken": "<token>",
+      "sha256": "2VH9WqQqdITbFxoDdgPPCqLRABta3SIcBTG5zVZHmH8"
+    },
+    "route": "POST /v1/agent/outbox/{draftId}/approve"
+  },
+  "response": {
+    "body": {
+      "state": "sent"
+    },
+    "status": 200
+  }
+}

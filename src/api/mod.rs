@@ -314,6 +314,10 @@ async fn serve_connection(stream: UnixStream, app: Router, owner_uid: u32) {
         .await;
 }
 
+/// Agent wire-contract fixtures generated from the real daemon output.
+#[cfg(all(test, feature = "client"))]
+mod contract_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

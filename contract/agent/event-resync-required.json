@@ -1,0 +1,11 @@
+{
+  "frames": [
+    {
+      "data": {
+        "reason": "event_lag"
+      },
+      "event": "resync.required"
+    }
+  ],
+  "kind": "sse"
+}

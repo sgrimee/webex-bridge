@@ -1,0 +1,25 @@
+{
+  "kind": "http",
+  "request": {
+    "body": {
+      "agentName": "sam/coder",
+      "cwd": "/synthetic/workspace",
+      "host": "pi",
+      "sessionId": "synthetic-host-session"
+    },
+    "route": "POST /v1/agent/sessions"
+  },
+  "response": {
+    "body": {
+      "leaseTtl": 60,
+      "routes": [
+        {
+          "id": "agents-social"
+        }
+      ],
+      "selfPersonId": "Y2lzY29zcGFyazovL3VzL1BFT1BMRS8wMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDM",
+      "token": "<token>"
+    },
+    "status": 200
+  }
+}

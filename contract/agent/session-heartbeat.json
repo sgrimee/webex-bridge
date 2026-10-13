@@ -1,0 +1,9 @@
+{
+  "kind": "http",
+  "request": {
+    "route": "POST /v1/agent/sessions/{sessionId}/heartbeat"
+  },
+  "response": {
+    "status": 204
+  }
+}

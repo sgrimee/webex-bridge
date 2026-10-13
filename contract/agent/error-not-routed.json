@@ -1,0 +1,19 @@
+{
+  "kind": "http",
+  "request": {
+    "body": {
+      "agentName": "sam/unrouted",
+      "cwd": "/synthetic/workspace",
+      "host": "pi",
+      "sessionId": "synthetic-host-session"
+    },
+    "route": "POST /v1/agent/sessions"
+  },
+  "response": {
+    "body": {
+      "code": "not_routed",
+      "message": "No configured route matches this agent name and workspace"
+    },
+    "status": 403
+  }
+}

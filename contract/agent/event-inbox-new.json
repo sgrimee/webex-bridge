@@ -1,0 +1,12 @@
+{
+  "frames": [
+    {
+      "data": {
+        "deliveryId": "YWdlbnRzLXNvY2lhbABZMmx6WTI5emNHRnlhem92TDNWekwwMUZVMU5CUjBVdk1EQXdNREF3TURBdE1EQXdNQzAwTURBd0xUZ3dNREF0TURBd01EQXdNREF3TVRBMAAz",
+        "revision": 3
+      },
+      "event": "inbox.new"
+    }
+  ],
+  "kind": "sse"
+}

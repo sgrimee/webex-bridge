@@ -1,0 +1,13 @@
+{
+  "kind": "http",
+  "request": {
+    "route": "GET /v1/agent/inbox/{deliveryId}/preview"
+  },
+  "response": {
+    "body": {
+      "code": "not_found",
+      "message": "Delivery was not found"
+    },
+    "status": 404
+  }
+}

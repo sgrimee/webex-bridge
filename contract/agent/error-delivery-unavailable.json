@@ -1,0 +1,13 @@
+{
+  "kind": "http",
+  "request": {
+    "route": "POST /v1/agent/inbox/{deliveryId}/accept"
+  },
+  "response": {
+    "body": {
+      "code": "delivery_unavailable",
+      "message": "Delivery is no longer pending"
+    },
+    "status": 409
+  }
+}

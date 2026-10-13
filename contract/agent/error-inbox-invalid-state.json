@@ -1,0 +1,13 @@
+{
+  "kind": "http",
+  "request": {
+    "route": "GET /v1/agent/inbox?state=bogus"
+  },
+  "response": {
+    "body": {
+      "code": "invalid_request",
+      "message": "Inbox state is invalid or unavailable"
+    },
+    "status": 400
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "kind": "http",
+  "request": {
+    "route": "GET /v1/agent/inbox"
+  },
+  "response": {
+    "body": {
+      "code": "auth_required",
+      "message": "A valid agent session is required"
+    },
+    "status": 401
+  }
+}

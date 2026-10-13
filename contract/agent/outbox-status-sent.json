@@ -1,0 +1,16 @@
+{
+  "kind": "http",
+  "request": {
+    "route": "GET /v1/agent/outbox/{draftId}"
+  },
+  "response": {
+    "body": {
+      "draftId": "<draft-id>",
+      "expiresAt": "<timestamp>",
+      "routeId": "agents-social",
+      "sha256": "2VH9WqQqdITbFxoDdgPPCqLRABta3SIcBTG5zVZHmH8",
+      "state": "sent"
+    },
+    "status": 200
+  }
+}

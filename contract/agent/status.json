@@ -1,0 +1,22 @@
+{
+  "kind": "http",
+  "request": {
+    "route": "GET /v1/status"
+  },
+  "response": {
+    "body": {
+      "apiVersion": 1,
+      "connection": "connected",
+      "sync": {
+        "catchupNotifyThreshold": 50,
+        "failures": 0,
+        "gaps": 0,
+        "initialDone": 0,
+        "initialPending": 1,
+        "revisions": 3,
+        "rooms": 1
+      }
+    },
+    "status": 200
+  }
+}

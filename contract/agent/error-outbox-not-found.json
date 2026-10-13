@@ -1,0 +1,13 @@
+{
+  "kind": "http",
+  "request": {
+    "route": "GET /v1/agent/outbox/{draftId}"
+  },
+  "response": {
+    "body": {
+      "code": "not_routed",
+      "message": "Draft was not found"
+    },
+    "status": 404
+  }
+}

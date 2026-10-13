@@ -1,0 +1,9 @@
+{
+  "kind": "http",
+  "request": {
+    "route": "POST /v1/agent/inbox/{deliveryId}/reject"
+  },
+  "response": {
+    "status": 204
+  }
+}

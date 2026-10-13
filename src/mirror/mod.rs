@@ -76,6 +76,19 @@ struct StoredAttachmentMeta {
     count: u32,
 }
 
+/// Attachment count of decrypted files metadata in either the current
+/// count-only form or the legacy URL-list form.
+fn legacy_attachment_count(bytes: &[u8]) -> Option<usize> {
+    serde_json::from_slice::<StoredAttachmentMeta>(bytes)
+        .ok()
+        .and_then(|meta| usize::try_from(meta.count).ok())
+        .or_else(|| {
+            serde_json::from_slice::<Vec<serde_json::Value>>(bytes)
+                .ok()
+                .map(|legacy| legacy.len())
+        })
+}
+
 /// Result of a canonical message upsert.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Upsert {
@@ -888,6 +901,7 @@ impl Mirror {
                     (None, None) => None,
                     _ => bail!("Mirror body ciphertext/nonce mismatch"),
                 };
+                let old_files_ct = old_files.clone();
                 let old_files = old_files
                     .as_ref()
                     .map(|blob| {
@@ -895,11 +909,45 @@ impl Mirror {
                             .open_prefixed(blob, &message_aad("files", id, *revision))
                     })
                     .transpose()?;
-                if old_body.as_deref() == body.map(str::as_bytes)
-                    && old_files == files
-                    && old_body_kind.as_deref() == body_kind
-                {
-                    return Ok(Upsert::Unchanged);
+                if old_body.as_deref() == body.map(str::as_bytes) {
+                    // Rows written before body_kind existed (NULL) or with
+                    // legacy URL-list attachment metadata are not edits when
+                    // the authoritative REST body and attachment count match:
+                    // a new revision here would re-queue old agent deliveries.
+                    // Backfill them in place instead, at the same revision.
+                    let kind_legacy = old_body_kind.is_none() && body_kind.is_some();
+                    let kind_matches = kind_legacy || old_body_kind.as_deref() == body_kind;
+                    let files_exact = old_files == files;
+                    let files_legacy = !files_exact
+                        && match (old_files.as_deref(), files.as_ref()) {
+                            (Some(old), Some(_)) => {
+                                legacy_attachment_count(old) == message.files.as_ref().map(Vec::len)
+                            }
+                            _ => false,
+                        };
+                    if kind_matches && (files_exact || files_legacy) {
+                        if kind_legacy || files_legacy {
+                            let files_ct = if files_legacy {
+                                files
+                                    .as_ref()
+                                    .map(|data| {
+                                        self.crypto.seal_prefixed(
+                                            data,
+                                            &message_aad("files", id, *revision),
+                                        )
+                                    })
+                                    .transpose()?
+                            } else {
+                                old_files_ct.clone()
+                            };
+                            self.conn.execute(
+                                "UPDATE messages SET body_kind=?3,files_meta_ct=?4
+                                 WHERE message_id=?1 AND revision=?2",
+                                params![id, revision, body_kind, files_ct],
+                            )?;
+                        }
+                        return Ok(Upsert::Unchanged);
+                    }
                 }
             }
         }
@@ -1776,6 +1824,75 @@ mod tests {
             updated: updated.map(str::to_owned),
             ..Message::default()
         }
+    }
+
+    #[test]
+    fn legacy_rows_are_backfilled_not_rerevisioned_by_an_identical_hydrate() {
+        let mut mirror = Mirror::in_memory([31_u8; 32]).unwrap();
+        let mut plain = message("legacy", "unchanged body", None);
+        plain.files = Some(vec!["https://files.example.test/a".into()]);
+        assert_eq!(mirror.upsert_message(&plain).unwrap(), Upsert::Created(0));
+        // Simulate a row written before body_kind existed, with legacy
+        // URL-list attachment metadata.
+        let legacy_files = mirror
+            .crypto
+            .seal_prefixed(
+                br#"["https://files.example.test/legacy-secret.pdf"]"#,
+                &message_aad("files", "legacy", 0),
+            )
+            .unwrap();
+        mirror
+            .conn
+            .execute(
+                "UPDATE messages SET body_kind=NULL,files_meta_ct=?1 WHERE message_id='legacy'",
+                [legacy_files],
+            )
+            .unwrap();
+
+        // The identical authoritative payload (as a delete reconcile or
+        // catch-up re-reads it) is not an edit.
+        assert_eq!(mirror.upsert_message(&plain).unwrap(), Upsert::Unchanged);
+        let (revisions, kind, files): (i64, Option<String>, Vec<u8>) = mirror
+            .conn
+            .query_row(
+                "SELECT COUNT(*),MAX(body_kind),MAX(files_meta_ct) FROM messages WHERE message_id='legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(revisions, 1, "no new revision");
+        assert_eq!(kind.as_deref(), Some("plain_text"), "kind backfilled");
+        assert!(!files
+            .windows(b"legacy-secret".len())
+            .any(|window| window == b"legacy-secret"));
+        assert_eq!(
+            mirror
+                .ui_message("legacy")
+                .unwrap()
+                .unwrap()
+                .attachment_count,
+            1
+        );
+        // Backfilled rows now compare exactly.
+        assert_eq!(mirror.upsert_message(&plain).unwrap(), Upsert::Unchanged);
+
+        // A different attachment count or body is still a real edit.
+        let mut more_files = plain.clone();
+        more_files.files = Some(vec!["a".into(), "b".into()]);
+        assert_eq!(
+            mirror.upsert_message(&more_files).unwrap(),
+            Upsert::Edited(1)
+        );
+        mirror
+            .conn
+            .execute(
+                "UPDATE messages SET body_kind=NULL WHERE message_id='legacy'",
+                [],
+            )
+            .unwrap();
+        let mut edited = more_files.clone();
+        edited.text = Some("a real edit".into());
+        assert_eq!(mirror.upsert_message(&edited).unwrap(), Upsert::Edited(2));
     }
 
     #[test]

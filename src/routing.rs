@@ -1057,6 +1057,44 @@ mod tests {
     }
 
     #[test]
+    fn rehydrating_a_legacy_row_does_not_requeue_an_accepted_delivery() {
+        let config = config();
+        let mut mirror = Mirror::in_memory([32; 32]).unwrap();
+        mirror.sync_routes(&config.routes).unwrap();
+        let routed = message("sam/coder: decided long ago");
+        mirror.upsert_message(&routed).unwrap();
+        mirror.queue_deliveries(&config).unwrap();
+        let pending = mirror.deliveries(&["r".into()], Some("pending")).unwrap();
+        mirror
+            .decide_delivery(&["r".into()], &pending[0].id, true)
+            .unwrap()
+            .unwrap();
+        let _ = mirror.take_agent_events();
+        // The row predates body_kind; a delete reconcile re-reads it.
+        mirror
+            .conn
+            .execute("UPDATE messages SET body_kind=NULL", [])
+            .unwrap();
+        assert_eq!(
+            mirror.upsert_message(&routed).unwrap(),
+            crate::mirror::Upsert::Unchanged
+        );
+        mirror.queue_deliveries(&config).unwrap();
+        assert!(mirror.take_agent_events().events.is_empty());
+        assert!(mirror
+            .deliveries(&["r".into()], Some("pending"))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            mirror
+                .deliveries(&["r".into()], Some("accepted"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn only_addressed_allowed_new_messages_are_released_after_acceptance() {
         let config = config();
         let mut mirror = Mirror::in_memory([6; 32]).unwrap();

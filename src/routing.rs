@@ -711,7 +711,15 @@ fn is_invisible_smuggling(ch: char) -> bool {
             | '\u{17b4}'
             | '\u{17b5}'
             | '\u{00ad}'
+            // Variation Selectors Supplement: no legitimate chat use, and a run
+            // of them can encode an arbitrary hidden byte string.
+            | '\u{e0100}'..='\u{e01ef}'
     )
+}
+
+/// Standard variation selectors U+FE00–U+FE0F.
+fn is_variation_selector(ch: char) -> bool {
+    matches!(ch, '\u{fe00}'..='\u{fe0f}')
 }
 
 /// Unicode General_Category=Cf (format) characters, per Unicode 15.1.
@@ -745,25 +753,42 @@ fn is_format_char(ch: char) -> bool {
 /// Remove terminal control introducers, bidi overrides/isolates and invisible
 /// smuggling characters before any released remote text crosses the local API
 /// boundary. Newlines and tabs remain ordinary message data; Unicode
-/// line/paragraph separators become explicit `\n`. ZWJ/ZWNJ, LRM/RLM and
-/// variation selectors U+FE00–U+FE0F are kept because emoji sequences and
-/// right-to-left or Indic scripts legitimately need them.
+/// line/paragraph separators become explicit `\n`. ZWJ/ZWNJ and LRM/RLM are
+/// kept because emoji sequences and right-to-left or Indic scripts need them.
+/// A variation selector U+FE00–U+FE0F (e.g. emoji presentation FE0F, text
+/// presentation FE0E) is kept only as the single selector directly after a
+/// visible base character: the rest of a run, or a selector with no base, is
+/// dropped, so selector runs cannot encode hidden data.
 fn sanitize_terminal_text(input: &str) -> String {
-    input
-        .chars()
-        .filter(|ch| {
-            !matches!(
-                *ch,
-                '\u{1b}' | '\u{009b}' | '\u{009d}' | '\u{0090}' | '\u{0098}'
-            ) && !is_bidi_control(*ch)
-                && !is_invisible_smuggling(*ch)
-                && (!ch.is_control() || matches!(*ch, '\n' | '\r' | '\t'))
-        })
-        .map(|ch| match ch {
+    let mut output = String::with_capacity(input.len());
+    // Whether the previous kept character can take one variation selector.
+    let mut selector_allowed = false;
+    for ch in input.chars() {
+        let ch = match ch {
             '\u{2028}' | '\u{2029}' => '\n',
             other => other,
-        })
-        .collect()
+        };
+        if matches!(
+            ch,
+            '\u{1b}' | '\u{009b}' | '\u{009d}' | '\u{0090}' | '\u{0098}'
+        ) || is_bidi_control(ch)
+            || is_invisible_smuggling(ch)
+            || (ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+        {
+            continue;
+        }
+        if is_variation_selector(ch) {
+            if selector_allowed {
+                output.push(ch);
+                selector_allowed = false;
+            }
+            continue;
+        }
+        selector_allowed =
+            !ch.is_control() && !ch.is_whitespace() && !matches!(ch, '\u{200c}'..='\u{200f}');
+        output.push(ch);
+    }
+    output
 }
 
 fn best_effort_display(value: Result<Option<String>>) -> Option<String> {
@@ -1154,7 +1179,8 @@ mod tests {
             sanitize_display_line(&format!(
                 "Pat{hidden}\u{200d}\u{fe0f}\u{0600}\u{fff9} Sender"
             )),
-            "Pat\u{fe0f} Sender"
+            // A selector after ZWJ has no base, so it is dropped too.
+            "Pat Sender"
         );
 
         let config = config();
@@ -1358,5 +1384,33 @@ mod tests {
         config.routes[0].allowed_senders.push("account".into());
         mirror.upsert_message(&own).unwrap();
         assert_eq!(mirror.queue_deliveries(&config).unwrap(), 0);
+    }
+
+    #[test]
+    fn variation_selector_runs_and_supplement_cannot_smuggle_data() {
+        // At most one selector per base: the rest of a run is dropped.
+        assert_eq!(
+            sanitize_terminal_text("❤\u{fe0f}\u{fe0f}\u{fe00}\u{fe0d} ok"),
+            "❤\u{fe0f} ok"
+        );
+        assert_eq!(sanitize_terminal_text("x\u{fe0e}\u{fe0f}"), "x\u{fe0e}");
+        // A selector with no visible base is dropped.
+        assert_eq!(
+            sanitize_terminal_text("\u{fe0f}a \u{fe0f}\n\u{fe0f}"),
+            "a \n"
+        );
+        // The Variation Selectors Supplement is stripped entirely.
+        let supplement: String = (0xe0100..=0xe01ef)
+            .map(|code| char::from_u32(code).unwrap())
+            .collect();
+        assert_eq!(sanitize_terminal_text(&format!("a{supplement}b")), "ab");
+        // Legitimate emoji sequences survive: ZWJ + presentation + keycap.
+        let emoji = "👩\u{200d}❤\u{fe0f}\u{200d}👨 1\u{fe0f}\u{20e3}";
+        assert_eq!(sanitize_terminal_text(emoji), emoji);
+        // Names use the same rule.
+        assert_eq!(
+            sanitize_display_line("Pat❤\u{fe0f}\u{fe0f}\u{e0101}"),
+            "Pat❤\u{fe0f}"
+        );
     }
 }

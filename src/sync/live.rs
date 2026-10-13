@@ -131,6 +131,27 @@ pub async fn reconcile_room(
     rest: &WebexRest,
     room_id: &str,
 ) -> Result<ReconcileResult> {
+    let started = std::time::Instant::now();
+    let outcome = reconcile_room_inner(mirror, rest, room_id).await;
+    let elapsed_ms = started.elapsed().as_millis();
+    // Counts and timing only: never room/message IDs or bodies.
+    match &outcome {
+        Ok(result) => diagnostics::debug(format_args!(
+            "sync.reconcile checked={} edited={} deleted={} elapsed_ms={elapsed_ms}",
+            result.checked, result.edited, result.deleted
+        )),
+        Err(_) => diagnostics::debug(format_args!(
+            "sync.reconcile_failed elapsed_ms={elapsed_ms}"
+        )),
+    }
+    outcome
+}
+
+async fn reconcile_room_inner(
+    mirror: &SharedMirror,
+    rest: &WebexRest,
+    room_id: &str,
+) -> Result<ReconcileResult> {
     let room = rest
         .room(room_id)
         .await?
@@ -225,6 +246,7 @@ pub async fn ingest_event(
             }))
         }
         ActivityType::Message(MessageActivity::Deleted) => {
+            diagnostics::debug("sync.delete_received");
             // `event.try_global_id()` mislabels this room target as a Message ID.
             let room_id = event_room_id(event, true)?;
             if only_room.is_some_and(|allowed| allowed != room_id) {

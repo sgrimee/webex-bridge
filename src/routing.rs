@@ -32,6 +32,9 @@ pub struct Delivery {
     pub revision: i64,
     /// Pending, accepted or rejected; only requested states are returned.
     pub state: String,
+    /// Whether Webex reports this revision as edited (it has an `updated`
+    /// time). Hosts can refuse to act on a message changed after review.
+    pub edited: bool,
     /// Decrypted sender display name from the people mirror, when known.
     /// Local display metadata only; never message text.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -56,6 +59,9 @@ pub struct DeliveryPreview {
     pub route_id: String,
     /// Revision being previewed.
     pub revision: i64,
+    /// Whether Webex reports this revision as edited (it has an `updated`
+    /// time). Hosts can refuse to act on a message changed after review.
+    pub edited: bool,
     /// Canonical message creation time.
     pub created_at: String,
     /// Canonical sender Webex person ID.
@@ -181,6 +187,9 @@ pub struct AcceptedDelivery {
     pub created_at: String,
     /// Revision accepted by the local user.
     pub revision: i64,
+    /// Whether Webex reports this revision as edited (it has an `updated`
+    /// time). Hosts can refuse to act on a message changed after review.
+    pub edited: bool,
     /// Delivery state after this decision: always `accepted` on the wire
     /// (a rejection returns no body), so hosts can assert it explicitly.
     pub state: &'static str,
@@ -204,6 +213,7 @@ struct ReleasedMessage {
     sender_id: Option<String>,
     created_at: String,
     parent_id: Option<String>,
+    edited: bool,
     markdown: String,
 }
 
@@ -213,6 +223,7 @@ type StoredReleasedMessage = (
     Option<String>,
     Option<Vec<u8>>,
     Option<Vec<u8>>,
+    bool,
 );
 
 impl DeliveryKey {
@@ -325,7 +336,7 @@ impl Mirror {
             .collect::<HashMap<_, _>>();
         let mut statement = self.conn.prepare(
             "SELECT r.route_id,r.created_at,m.message_id,m.revision,m.sender_id,m.created_at,
-                    m.body_ct,m.body_nonce,r.room_id
+                    m.body_ct,m.body_nonce,r.room_id,m.updated_at IS NOT NULL
              FROM routes r JOIN messages m ON m.room_id=r.room_id
              WHERE m.status='active'
                AND m.revision=(SELECT MAX(revision) FROM messages WHERE message_id=m.message_id)
@@ -344,6 +355,7 @@ impl Mirror {
                 row.get::<_, Option<Vec<u8>>>(6)?,
                 row.get::<_, Option<Vec<u8>>>(7)?,
                 row.get::<_, String>(8)?,
+                row.get::<_, bool>(9)?,
             ))
         })?;
         let candidates = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -369,6 +381,7 @@ impl Mirror {
             body_ct,
             body_nonce,
             room_id,
+            edited,
         ) in candidates
         {
             let Some(route) = routes.get(route_id.as_str()) else {
@@ -499,6 +512,7 @@ impl Mirror {
                 created_at,
                 revision,
                 state: "pending".into(),
+                edited,
                 sender_name: None,
                 room_title: None,
             };
@@ -542,7 +556,8 @@ impl Mirror {
             .collect::<Vec<_>>()
             .join(",");
         let mut query = format!(
-            "SELECT d.route_id,d.message_id,d.revision,d.state,m.sender_id,m.created_at,r.room_id
+            "SELECT d.route_id,d.message_id,d.revision,d.state,m.sender_id,m.created_at,r.room_id,
+                    m.updated_at IS NOT NULL
              FROM deliveries d JOIN messages m ON m.message_id=d.message_id AND m.revision=d.revision
              JOIN routes r ON r.route_id=d.route_id
              WHERE d.route_id IN ({placeholders})"
@@ -568,6 +583,7 @@ impl Mirror {
                     route_id: key.route_id.clone(),
                     revision: key.revision,
                     state: row.get(3)?,
+                    edited: row.get(7)?,
                     sender_id: row.get(4)?,
                     created_at: row.get(5)?,
                     sender_name: None,
@@ -647,6 +663,7 @@ impl Mirror {
             message_id: key.message_id.clone(),
             route_id: key.route_id,
             revision: key.revision,
+            edited: released.edited,
             created_at: released.created_at,
             sender_id: released.sender_id,
             sender_name,
@@ -664,7 +681,8 @@ impl Mirror {
         let stored: Option<StoredReleasedMessage> = self
             .conn
             .query_row(
-                "SELECT sender_id,created_at,parent_id,body_ct,body_nonce FROM messages
+                "SELECT sender_id,created_at,parent_id,body_ct,body_nonce,updated_at IS NOT NULL
+                 FROM messages
                  WHERE message_id=?1 AND revision=?2 AND status='active'
                    AND revision=(SELECT MAX(revision) FROM messages WHERE message_id=?1)",
                 params![key.message_id, key.revision],
@@ -675,11 +693,13 @@ impl Mirror {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((sender_id, created_at, parent_id, Some(body_ct), Some(body_nonce))) = stored
+        let Some((sender_id, created_at, parent_id, Some(body_ct), Some(body_nonce), edited)) =
+            stored
         else {
             return Ok(None);
         };
@@ -695,6 +715,7 @@ impl Mirror {
             sender_id,
             created_at,
             parent_id,
+            edited,
             markdown,
         }))
     }
@@ -765,6 +786,7 @@ impl Mirror {
             sender_id,
             created_at,
             parent_id,
+            edited,
             markdown,
         }) = released
         else {
@@ -775,6 +797,7 @@ impl Mirror {
                 sender_id: None,
                 created_at: String::new(),
                 revision: key.revision,
+                edited: false,
                 state: target,
                 parent_id: None,
                 markdown: String::new(),
@@ -787,6 +810,7 @@ impl Mirror {
             sender_id,
             created_at,
             revision: key.revision,
+            edited,
             state: target,
             parent_id,
             markdown,
@@ -1107,17 +1131,20 @@ mod tests {
         let routes = ["r".to_string()];
         let pending = mirror.deliveries(&routes, Some("pending")).unwrap();
         assert_eq!(pending.len(), 1, "only the edited revision is pending");
+        assert!(pending[0].edited, "the inbox flags the edited revision");
         let preview = mirror
             .preview_delivery(&routes, &pending[0].id)
             .unwrap()
             .unwrap();
         assert_eq!(preview.parent_id.as_deref(), Some("thread-root"));
+        assert!(preview.edited);
         let accepted = mirror
             .decide_delivery(&routes, &pending[0].id, true)
             .unwrap()
             .unwrap();
         assert_eq!(accepted.markdown, "sam/coder: in a thread, edited");
         assert_eq!(accepted.parent_id.as_deref(), Some("thread-root"));
+        assert!(accepted.edited);
     }
 
     #[test]
@@ -1342,6 +1369,10 @@ mod tests {
         assert_eq!(accepted.markdown, preview.markdown);
         assert_eq!(accepted.parent_id.as_deref(), Some("parent-message"));
         assert_eq!(accepted.state, "accepted");
+        assert!(
+            !accepted.edited && !preview.edited,
+            "an original is not edited"
+        );
         assert_eq!(accepted.message_id, "message");
         assert_eq!(preview.message_id, "message");
 

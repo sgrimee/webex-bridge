@@ -6,6 +6,7 @@
   "response": {
     "body": {
       "createdAt": "2099-01-01T00:00:02Z",
+      "edited": false,
       "id": "YWdlbnRzLXNvY2lhbABZMmx6WTI5emNHRnlhem92TDNWekwwMUZVMU5CUjBVdk1EQXdNREF3TURBdE1EQXdNQzAwTURBd0xUZ3dNREF0TURBd01EQXdNREF3TVRBeQAx",
       "markdown": "sam/coder: synthetic question in a thread",
       "messageId": "Y2lzY29zcGFyazovL3VzL01FU1NBR0UvMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMTAy",

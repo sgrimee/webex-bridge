@@ -1,0 +1,21 @@
+{
+  "kind": "http",
+  "request": {
+    "route": "GET /v1/agent/inbox/{deliveryId}/preview"
+  },
+  "response": {
+    "body": {
+      "createdAt": "2099-01-01T00:00:04Z",
+      "edited": true,
+      "id": "YWdlbnRzLXNvY2lhbABZMmx6WTI5emNHRnlhem92TDNWekwwMUZVMU5CUjBVdk1EQXdNREF3TURBdE1EQXdNQzAwTURBd0xUZ3dNREF0TURBd01EQXdNREF3TVRBMAA0",
+      "markdown": "sam/coder: synthetic edited",
+      "messageId": "Y2lzY29zcGFyazovL3VzL01FU1NBR0UvMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMTA0",
+      "revision": 4,
+      "roomTitle": "Synthetic Room",
+      "routeId": "agents-social",
+      "senderId": "Y2lzY29zcGFyazovL3VzL1BFT1BMRS8wMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDI",
+      "senderName": "Synthetic Sender"
+    },
+    "status": 200
+  }
+}

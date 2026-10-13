@@ -580,7 +580,26 @@ async fn agent_contract_fixtures_match_the_real_daemon_output() {
         db.upsert_message(&edited).map(|_| ())
     }))
     .await;
-    rec.events("event-inbox-revised", &frames(&events, &mut stream).await);
+    let revised = frames(&events, &mut stream).await;
+    rec.events("event-inbox-revised", &revised);
+    // The revised (edited) delivery, as the host previews it before deciding.
+    let revised_id = revised[0].data["deliveryId"].as_str().unwrap().to_owned();
+    let (status, body, sent) = call(
+        &bridge,
+        Method::GET,
+        &format!("/v1/agent/inbox/{revised_id}/preview"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(body.as_ref().unwrap()["edited"], true);
+    rec.http(
+        "inbox-preview-edited",
+        "GET /v1/agent/inbox/{deliveryId}/preview",
+        status,
+        body,
+        sent,
+    );
     sync(Box::new(|db| {
         db.mark_deleted(&room(), &message_id(4)).map(|_| ())
     }))

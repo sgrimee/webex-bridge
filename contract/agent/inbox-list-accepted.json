@@ -8,6 +8,7 @@
       "deliveries": [
         {
           "createdAt": "2099-01-01T00:00:02Z",
+          "edited": false,
           "id": "YWdlbnRzLXNvY2lhbABZMmx6WTI5emNHRnlhem92TDNWekwwMUZVMU5CUjBVdk1EQXdNREF3TURBdE1EQXdNQzAwTURBd0xUZ3dNREF0TURBd01EQXdNREF3TVRBeQAx",
           "revision": 1,
           "roomTitle": "Synthetic Room",

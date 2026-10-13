@@ -643,6 +643,7 @@ mod tests {
             created_at: "2099-01-01T00:00:00Z".into(),
             revision: 7,
             state: "pending".into(),
+            edited: false,
             sender_name: Some("Private Name".into()),
             room_title: Some("Private Room".into()),
         };

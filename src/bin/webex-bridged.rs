@@ -523,6 +523,13 @@ async fn run_sync(
             .borrow_and_update()
             .clone()
             .context("Missing Webex REST client")?;
+        // Best-effort, metadata-only: lets routing recognise this account's
+        // own agent-send echoes. Retried on every reconnect or sync retry.
+        if sync::refresh_account_identity(&mirror, &rest).await {
+            diagnostics::debug("sync.account_identity_cached");
+        } else {
+            diagnostics::warn("sync.account_identity_unavailable; retry_on_next_sync");
+        }
         let started = Instant::now();
         diagnostics::debug("sync.started");
         tokio::select! {

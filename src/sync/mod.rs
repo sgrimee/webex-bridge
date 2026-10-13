@@ -253,6 +253,24 @@ pub async fn synchronize_once(
     Ok(summary)
 }
 
+/// Best-effort: resolve the daemon account (`GET /people/me`) and cache it in
+/// the encrypted mirror, so agent routing restricts own-send echo matching to
+/// that account without waiting for a UI to call `/v1/me`. A failure leaves any
+/// earlier identity in place and is retried on the next connection or sync
+/// retry; routing then fails closed on room + body. Nothing is logged here.
+pub async fn refresh_account_identity(mirror: &SharedMirror, rest: &WebexRest) -> bool {
+    let Ok(person) = rest.me().await else {
+        return false;
+    };
+    if person.id.is_empty() {
+        return false;
+    }
+    mirror
+        .with(|db| db.cache_account_identity(&person))
+        .await
+        .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,6 +494,38 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .initial_done
+        );
+    }
+
+    #[tokio::test]
+    async fn account_identity_is_cached_best_effort_for_echo_routing() {
+        let server = MockServer::start().await;
+        let mirror = SharedMirror::new(Mirror::in_memory([19_u8; 32]).unwrap());
+        let rest =
+            WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
+        // Unavailable: nothing cached, no error escapes.
+        assert!(!refresh_account_identity(&mirror, &rest).await);
+        assert_eq!(
+            mirror.with(|db| db.account_person_id()).await.unwrap(),
+            None
+        );
+        Mock::given(method("GET"))
+            .and(path("/v1/people/me"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "account-person",
+                "displayName": "Private Name",
+                "emails": ["private@example.test"]
+            })))
+            .mount(&server)
+            .await;
+        assert!(refresh_account_identity(&mirror, &rest).await);
+        assert_eq!(
+            mirror
+                .with(|db| db.account_person_id())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("account-person")
         );
     }
 }

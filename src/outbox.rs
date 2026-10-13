@@ -71,6 +71,9 @@ fn random_secret() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// Prefix of the mandatory agent trailer line (`— 🤖 <agentName> · …`).
+const AGENT_TRAILER_PREFIX: &str = "— 🤖 ";
+
 /// How long normalised (not byte-exact) own-echo matching looks back.
 const OWN_ECHO_NORMALIZED_DAYS: i64 = 7;
 
@@ -358,6 +361,18 @@ impl Mirror {
         account_id: Option<&str>,
     ) -> Result<bool> {
         if account_id.is_some_and(|account| account != sender_id) {
+            return Ok(false);
+        }
+        // Every stored draft hash covers Markdown that `validate_markdown`
+        // required to end with the route's `— 🤖 <agent>` trailer, so only a
+        // body carrying an agent trailer can match; a short human "yes" never
+        // collides with an agent send. Check it explicitly before any lookup.
+        if !body
+            .trim_end()
+            .lines()
+            .last()
+            .is_some_and(|line| line.starts_with(AGENT_TRAILER_PREFIX))
+        {
             return Ok(false);
         }
         let exact = self

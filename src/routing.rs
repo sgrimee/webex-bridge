@@ -1297,11 +1297,31 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(mirror.queue_deliveries(&config).unwrap(), 0);
-        // Ordinary messages from the same sender still route.
+        // Every outbox hash covers a trailer-bearing body, so a human's short
+        // reply can never collide with an agent send, even with the same hash
+        // context (room, sender); ordinary messages from the sender still route.
+        let sha_of_yes: String = {
+            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+            URL_SAFE_NO_PAD.encode(Sha256::digest(b"yes"))
+        };
+        let stored_sha: String = mirror
+            .conn
+            .query_row("SELECT sha256 FROM outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_ne!(stored_sha, sha_of_yes);
+        assert!(!mirror
+            .is_own_outbound("room", "person", "yes", None)
+            .unwrap());
+        mirror.upsert_message(&echo("yes", "yes")).unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
         mirror
             .upsert_message(&echo("human", "a human question"))
             .unwrap();
         assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
+        // A trailer-less body never matches even when its text is a draft prefix.
+        assert!(!mirror
+            .is_own_outbound("room", "person", "Reviewed it", None)
+            .unwrap());
     }
 
     #[test]

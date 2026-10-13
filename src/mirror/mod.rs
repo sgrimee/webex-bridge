@@ -1653,8 +1653,9 @@ impl Mirror {
     }
 
     /// Test hook: remove one UI pairing by hash, as an out-of-band revocation
-    /// (one that does not end live sessions) would.
-    #[cfg(test)]
+    /// (one that does not end live sessions) would. Used only by the client
+    /// server tests, which need the `client` feature.
+    #[cfg(all(test, feature = "client"))]
     pub(crate) fn unpair_ui_client(&mut self, secret_hash: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM ui_clients WHERE secret_hash=?1", [secret_hash])?;

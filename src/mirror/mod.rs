@@ -130,6 +130,18 @@ pub struct UiTeam {
     pub name: Option<String>,
 }
 
+/// One paired UI executable. The secret hash is deliberately omitted.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiPairing {
+    /// Kernel-resolved executable path confirmed by the user at pairing.
+    pub executable: String,
+    /// RFC 3339 pairing time.
+    pub paired_at: String,
+    /// RFC 3339 time of the last session creation or renewal.
+    pub last_seen: Option<String>,
+}
+
 /// Full person metadata released only to an authorized UI session.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1563,12 +1575,71 @@ impl Mirror {
         Ok(found)
     }
 
-    /// Test hook: remove one UI pairing, as a user revocation would.
+    /// Test hook: remove one UI pairing by hash, as an out-of-band revocation
+    /// (one that does not end live sessions) would.
     #[cfg(test)]
     pub(crate) fn unpair_ui_client(&mut self, secret_hash: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM ui_clients WHERE secret_hash=?1", [secret_hash])?;
         Ok(())
+    }
+
+    /// Test hook: count audit rows for one scope/action.
+    #[cfg(test)]
+    pub(crate) fn audit_count_for_tests(&self, scope: &str, action: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM audit WHERE scope=?1 AND action=?2",
+            [scope, action],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Paired UI clients, without their secret hashes.
+    pub fn ui_pairings(&self) -> Result<Vec<UiPairing>> {
+        let mut statement = self.conn.prepare(
+            "SELECT exe_path,paired_at,last_seen FROM ui_clients ORDER BY exe_path,paired_at",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(UiPairing {
+                executable: row.get(0)?,
+                paired_at: row.get(1)?,
+                last_seen: row.get(2)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Remove the pairings of one exact executable path (`None`: every
+    /// pairing) and audit the count. Returns the removed secret hashes so the
+    /// caller can end their live sessions.
+    pub fn unpair_ui_clients(&mut self, executable: Option<&str>) -> Result<Vec<String>> {
+        if executable
+            .is_some_and(|path| !path.starts_with('/') || path.chars().any(char::is_control))
+        {
+            bail!("Invalid UI executable path");
+        }
+        let tx = self.conn.transaction()?;
+        let hashes = {
+            let mut statement = tx.prepare(
+                "DELETE FROM ui_clients WHERE ?1 IS NULL OR exe_path=?1 RETURNING secret_hash",
+            )?;
+            let rows = statement.query_map([executable], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        tx.execute(
+            "INSERT INTO audit(ts,scope,action,ref,detail_redacted) VALUES (?1,'ui','unpair',NULL,?2)",
+            params![
+                Utc::now().to_rfc3339(),
+                format!(
+                    "{}removed={}",
+                    if executable.is_none() { "all;" } else { "" },
+                    hashes.len()
+                )
+            ],
+        )?;
+        tx.commit()?;
+        Ok(hashes)
     }
 
     /// Canonical IDs whose latest revision is active in a room. Reconcile only on events/outage.

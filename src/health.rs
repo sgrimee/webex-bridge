@@ -17,18 +17,36 @@ const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
 
 /// Query the running daemon's metadata-only status.
 pub async fn daemon_status(socket: &Path) -> Result<dto::Status> {
+    let response = socket_request(socket, "GET", "/v1/status", None).await?;
+    parse_status_response(&response)
+}
+
+/// Send one credential-free `Connection: close` HTTP/1.1 request over the
+/// daemon socket and return the raw response. Callers parse it with
+/// [`split_response`]. No bearer is ever attached.
+pub(crate) async fn socket_request(
+    socket: &Path,
+    method: &str,
+    path: &str,
+    json_body: Option<&str>,
+) -> Result<Vec<u8>> {
     let metadata = std::fs::symlink_metadata(socket)
         .context("Bridge daemon socket is unavailable; is webex-bridged running?")?;
     if !metadata.file_type().is_socket() {
         bail!("Bridge daemon socket path is not a Unix socket");
     }
-    let response = tokio::time::timeout(HEALTH_TIMEOUT, async {
+    let request = match json_body {
+        Some(body) => format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+        None => format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+    };
+    tokio::time::timeout(HEALTH_TIMEOUT, async {
         let mut stream = UnixStream::connect(socket)
             .await
             .context("Cannot connect to the bridge daemon socket")?;
-        stream
-            .write_all(b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .await?;
+        stream.write_all(request.as_bytes()).await?;
         let mut response = Vec::new();
         stream
             .take(MAX_RESPONSE_BYTES)
@@ -37,29 +55,40 @@ pub async fn daemon_status(socket: &Path) -> Result<dto::Status> {
         Ok::<_, anyhow::Error>(response)
     })
     .await
-    .context("Timed out waiting for the bridge daemon")??;
-    parse_status_response(&response)
+    .context("Timed out waiting for the bridge daemon")?
 }
 
-/// Parse a complete `Connection: close` HTTP/1.1 status response.
-fn parse_status_response(response: &[u8]) -> Result<dto::Status> {
+/// Split a complete, non-chunked HTTP/1.1 response into status and body.
+pub(crate) fn split_response(response: &[u8]) -> Result<(u16, &[u8])> {
     let split = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
         .context("Bridge daemon returned an incomplete response")?;
     let head = std::str::from_utf8(&response[..split])
         .context("Bridge daemon returned a malformed response")?;
-    let status_line = head.lines().next().unwrap_or_default();
-    if !status_line.starts_with("HTTP/1.1 200") {
-        bail!("Bridge daemon status endpoint did not return 200");
-    }
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("HTTP/1.1 "))
+        .and_then(|rest| rest.get(..3))
+        .and_then(|code| code.parse::<u16>().ok())
+        .context("Bridge daemon returned a malformed status line")?;
     if head
         .lines()
         .any(|line| line.to_ascii_lowercase().starts_with("transfer-encoding:"))
     {
         bail!("Bridge daemon returned an unexpected transfer encoding");
     }
-    serde_json::from_slice(&response[split + 4..]).context("Bridge daemon status is malformed")
+    Ok((status, &response[split + 4..]))
+}
+
+/// Parse a complete `Connection: close` HTTP/1.1 status response.
+fn parse_status_response(response: &[u8]) -> Result<dto::Status> {
+    let (status, body) = split_response(response)?;
+    if status != 200 {
+        bail!("Bridge daemon status endpoint did not return 200");
+    }
+    serde_json::from_slice(body).context("Bridge daemon status is malformed")
 }
 
 /// One-line, metadata-only summary for the CLI.

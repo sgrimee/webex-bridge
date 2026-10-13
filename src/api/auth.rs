@@ -384,6 +384,27 @@ impl Sessions {
         Ok(())
     }
 
+    /// End every UI session issued under one of these pairing hashes.
+    /// Returns how many sessions were revoked.
+    pub fn revoke_ui_pairings(&self, pairing_hashes: &[String]) -> usize {
+        let mut state = self.inner.lock().expect("session mutex poisoned");
+        let tokens = state
+            .sessions
+            .iter()
+            .filter(|(_, session)| {
+                session
+                    .ui_pairing
+                    .as_ref()
+                    .is_some_and(|hash| pairing_hashes.contains(hash))
+            })
+            .map(|(token, _)| token.clone())
+            .collect::<Vec<_>>();
+        for token in &tokens {
+            Self::revoke_locked(&mut state, token);
+        }
+        tokens.len()
+    }
+
     /// Remove one session, for explicit logout or a released lease.
     pub fn revoke(&self, token: &str) {
         let mut state = self.inner.lock().expect("session mutex poisoned");

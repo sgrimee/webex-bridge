@@ -34,6 +34,23 @@ struct CreateSessionRequest {
     secret: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UnpairRequest {
+    /// Exact kernel-resolved executable path shown by `ui pairings`.
+    executable: Option<String>,
+    /// Remove every pairing. Mutually exclusive with `executable`.
+    #[serde(default)]
+    all: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UnpairResponse {
+    removed: usize,
+    sessions_ended: usize,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RenewSessionResponse {
@@ -1523,10 +1540,79 @@ async fn renew_session(
     }
 }
 
+/// List paired UI executables (never their secret hashes). Like pairing,
+/// this needs only the same-user socket; agent bearers are refused.
+async fn pairings(
+    State(state): State<ApiState>,
+    Extension(peer): Extension<auth::PeerIdentity>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = reject_agent_bootstrap_bearer(&state, peer, &headers) {
+        return *response;
+    }
+    match state.mirror().with(|db| db.ui_pairings()).await {
+        Ok(pairings) => Json(serde_json::json!({ "pairings": pairings })).into_response(),
+        Err(_) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "bridge_unavailable",
+            "Pairing store is unavailable",
+        ),
+    }
+}
+
+/// Remove UI pairings and immediately end every live session issued under
+/// them. Removal only drops privilege (re-pairing needs the native dialog),
+/// so the same-user socket suffices; agent bearers are still refused.
+async fn unpair(
+    State(state): State<ApiState>,
+    Extension(peer): Extension<auth::PeerIdentity>,
+    headers: HeaderMap,
+    Json(request): Json<UnpairRequest>,
+) -> Response {
+    if let Err(response) = reject_agent_bootstrap_bearer(&state, peer, &headers) {
+        return *response;
+    }
+    let executable = match (request.executable, request.all) {
+        (Some(path), false) if path.starts_with('/') && !path.chars().any(char::is_control) => {
+            Some(path)
+        }
+        (None, true) => None,
+        _ => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Give either an absolute executable path or all=true",
+            )
+        }
+    };
+    let hashes = match state
+        .mirror()
+        .with(move |db| db.unpair_ui_clients(executable.as_deref()))
+        .await
+    {
+        Ok(hashes) => hashes,
+        Err(_) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bridge_unavailable",
+                "Pairing store is unavailable",
+            )
+        }
+    };
+    let sessions_ended = state.sessions().revoke_ui_pairings(&hashes);
+    Json(UnpairResponse {
+        removed: hashes.len(),
+        sessions_ended,
+    })
+    .into_response()
+}
+
 /// Pairing, session and full-mirror read routes for the terminal UI.
 pub fn router() -> Router<ApiState> {
     Router::new()
         .route("/v1/ui/pair", post(pair))
+        .route("/v1/ui/pairings", get(pairings))
+        .route("/v1/ui/pairings/remove", post(unpair))
         .route("/v1/ui/sessions", post(create_session))
         .route("/v1/ui/sessions/renew", post(renew_session))
         .route("/v1/me", get(me))

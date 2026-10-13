@@ -46,3 +46,6 @@ pub mod service;
 pub mod supervisor;
 #[cfg(feature = "server")]
 pub mod sync;
+/// Keychain-free UI pairing listing and removal over the protected socket.
+#[cfg(feature = "server")]
+pub mod ui_pairing;

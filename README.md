@@ -22,6 +22,11 @@ explicit local action.
   UI leases last 10 minutes; `POST /v1/ui/sessions/renew` extends the same
   token by 10 minutes for the issuing process only, while its pairing still
   exists, up to 12 hours after issuance (SSE follows the extended lease).
+  `webex-bridge ui pairings` and `webex-bridge ui unpair (PATH|--all)` list
+  and remove pairings through the daemon (Keychain-free) and end the removed
+  pairings' live sessions at once. Unpair needs no confirmation dialog: it only
+  removes access, re-pairing requires the native dialog, and webex-pi's
+  tool-call guard blocks agents from referencing the bridge or its socket.
   `webex_bridge::client` is the typed, client-only UDS client used by the TUI;
   `webex_bridge::dto` exports the write bounds it shares with the daemon.
 - **Agent scope.** Hosts claim exclusive 60-second leases for configured

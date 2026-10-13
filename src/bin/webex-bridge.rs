@@ -42,6 +42,31 @@ async fn main() -> Result<()> {
             // Socket-only and Keychain-free: safe from any build of the CLI.
             println!("{}", health::summary(&health::daemon_status(&paths.socket).await?));
         }
+        [command, action] if command == "ui" && action == "pairings" => {
+            // Socket-only and Keychain-free, like `health`.
+            let pairings = webex_bridge::ui_pairing::pairings(&paths.socket).await?;
+            if pairings.is_empty() {
+                println!("No paired UI clients");
+            }
+            for pairing in pairings {
+                println!(
+                    "{}\tpaired {}\tlast seen {}",
+                    pairing.executable,
+                    pairing.paired_at,
+                    pairing.last_seen.as_deref().unwrap_or("never")
+                );
+            }
+        }
+        [command, action, target] if command == "ui" && action == "unpair" => {
+            // Socket-only and Keychain-free; the daemon also ends the live
+            // sessions of every removed pairing.
+            let executable = (target != "--all").then_some(target.as_str());
+            let result = webex_bridge::ui_pairing::unpair(&paths.socket, executable).await?;
+            println!(
+                "Removed {} UI pairing(s); ended {} live session(s)",
+                result.removed, result.sessions_ended
+            );
+        }
         [command] if command == "install-service" => {
             service::install(&build_dir()?, &paths)?;
             println!("webex-bridged service installed and started");
@@ -230,7 +255,7 @@ async fn main() -> Result<()> {
             })
             .await?;
         }
-        _ => bail!("Usage: webex-bridge login | me | status | health | install-service | uninstall-service | sync failures | sync recover-gap --room ROOM_ID | devices status | messages inspect --id ID | rooms find --title TITLE | rooms verify --url SPACE_URL --title TITLE | routes init --url SPACE_URL --title TITLE --agent NAME --workspace PATH | membership (invite|cycle) --room ROOM_ID --email PERSON_EMAIL | probe [--room ROOM_ID [--refresh-after-secs 1..120 [--refresh-gap-secs 1..120]]]"),
+        _ => bail!("Usage: webex-bridge login | me | status | health | ui pairings | ui unpair (EXECUTABLE_PATH|--all) | install-service | uninstall-service | sync failures | sync recover-gap --room ROOM_ID | devices status | messages inspect --id ID | rooms find --title TITLE | rooms verify --url SPACE_URL --title TITLE | routes init --url SPACE_URL --title TITLE --agent NAME --workspace PATH | membership (invite|cycle) --room ROOM_ID --email PERSON_EMAIL | probe [--room ROOM_ID [--refresh-after-secs 1..120 [--refresh-gap-secs 1..120]]]"),
     }
     Ok(())
 }

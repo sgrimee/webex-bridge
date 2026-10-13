@@ -43,6 +43,8 @@ const SESSION_EXPIRED_EVENT: &str = "session.expired";
 enum Audience {
     Ui,
     AgentRoute(String),
+    /// Every agent subscriber, whatever its routes (metadata-only signals).
+    Agents,
     Both,
 }
 
@@ -64,7 +66,7 @@ impl Audience {
     fn permits(&self, subscriber: &Subscriber) -> bool {
         match (self, subscriber) {
             (Self::Ui | Self::Both, Subscriber::Ui) => true,
-            (Self::Both, Subscriber::Agent { .. }) => true,
+            (Self::Both | Self::Agents, Subscriber::Agent { .. }) => true,
             (Self::AgentRoute(route_id), Subscriber::Agent { route_ids }) => {
                 route_ids.iter().any(|owned| owned == route_id)
             }
@@ -157,6 +159,65 @@ impl EventBus {
     /// Notify the current holder of exactly one configured agent route.
     pub fn publish_agent_route(&self, route_id: &str, name: &'static str, data: Value) {
         self.publish(Audience::AgentRoute(route_id.into()), name, data);
+    }
+
+    /// Publish drained agent notifications, each to exactly its route:
+    /// `inbox.new` / `inbox.revised` (with the superseded delivery IDs),
+    /// `inbox.deleted` and `outbox.status`. A bounded-backlog overflow becomes
+    /// one `resync.required` for agents, who then reload their inbox.
+    pub fn publish_agent_events(&self, batch: crate::routing::AgentEventBatch) {
+        use crate::routing::AgentEvent;
+        if batch.lagged {
+            self.publish(
+                Audience::Agents,
+                RESYNC_REQUIRED_EVENT,
+                json!({ "reason": EVENT_LAG_REASON }),
+            );
+        }
+        for event in batch.events {
+            match event {
+                AgentEvent::Queued {
+                    delivery,
+                    supersedes,
+                } => {
+                    let (name, data) = if supersedes.is_empty() {
+                        (
+                            "inbox.new",
+                            json!({ "deliveryId": delivery.id, "revision": delivery.revision }),
+                        )
+                    } else {
+                        (
+                            "inbox.revised",
+                            json!({
+                                "deliveryId": delivery.id,
+                                "revision": delivery.revision,
+                                "supersedes": supersedes,
+                            }),
+                        )
+                    };
+                    self.publish_agent_route(&delivery.route_id, name, data);
+                }
+                AgentEvent::Removed {
+                    route_id,
+                    delivery_id,
+                    revision,
+                    reason,
+                } => self.publish_agent_route(
+                    &route_id,
+                    "inbox.deleted",
+                    json!({ "deliveryId": delivery_id, "revision": revision, "reason": reason }),
+                ),
+                AgentEvent::Outbox {
+                    route_id,
+                    draft_id,
+                    state,
+                } => self.publish_agent_route(
+                    &route_id,
+                    "outbox.status",
+                    json!({ "draftId": draft_id, "state": state }),
+                ),
+            }
+        }
     }
 
     /// Notify both scopes of a non-content daemon state change.
@@ -423,5 +484,85 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn agent_events_map_to_named_route_scoped_sse_events() {
+        use crate::routing::{AgentEvent, AgentEventBatch, Delivery};
+        let events = EventBus::default();
+        let mut receiver = events.subscribe();
+        let delivery = |id: &str| Delivery {
+            id: id.into(),
+            route_id: "route-a".into(),
+            sender_id: Some("person".into()),
+            created_at: "2099-01-01T00:00:00Z".into(),
+            revision: 7,
+            state: "pending".into(),
+            sender_name: Some("Private Name".into()),
+            room_title: Some("Private Room".into()),
+        };
+        events.publish_agent_events(AgentEventBatch {
+            events: vec![
+                AgentEvent::Queued {
+                    delivery: delivery("new"),
+                    supersedes: Vec::new(),
+                },
+                AgentEvent::Queued {
+                    delivery: delivery("revised"),
+                    supersedes: vec!["old".into()],
+                },
+                AgentEvent::Removed {
+                    route_id: "route-a".into(),
+                    delivery_id: "gone".into(),
+                    revision: 3,
+                    reason: "deleted",
+                },
+                AgentEvent::Outbox {
+                    route_id: "route-a".into(),
+                    draft_id: "draft".into(),
+                    state: "delivery-unknown",
+                },
+            ],
+            lagged: true,
+        });
+        let published = (0..5)
+            .map(|_| receiver.try_recv().unwrap())
+            .collect::<Vec<_>>();
+        let names: Vec<_> = published.iter().map(|event| event.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "resync.required",
+                "inbox.new",
+                "inbox.revised",
+                "inbox.deleted",
+                "outbox.status"
+            ]
+        );
+        let route_a = Subscriber::Agent {
+            route_ids: vec!["route-a".into()],
+        };
+        let route_b = Subscriber::Agent {
+            route_ids: vec!["route-b".into()],
+        };
+        assert!(published
+            .iter()
+            .all(|event| event.audience.permits(&route_a)));
+        // Only the metadata-only lag signal reaches other routes; nothing reaches the UI.
+        assert_eq!(
+            published
+                .iter()
+                .filter(|event| event.audience.permits(&route_b))
+                .count(),
+            1
+        );
+        assert!(!published
+            .iter()
+            .any(|event| event.audience.permits(&Subscriber::Ui)));
+        assert!(published[2].data.contains(r#""supersedes":["old"]"#));
+        assert!(published[3].data.contains(r#""reason":"deleted""#));
+        assert!(published[4].data.contains(r#""draftId":"draft""#));
+        // Display names never travel in events.
+        assert!(!published.iter().any(|event| event.data.contains("Private")));
     }
 }

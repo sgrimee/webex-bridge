@@ -7,6 +7,7 @@
 use crate::{
     config::{Config, Route},
     mirror::{crypto::aad, Mirror},
+    routing::AgentEvent,
 };
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -295,12 +296,42 @@ impl Mirror {
         {
             bail!("Draft is not in the sending state");
         }
+        let removed = {
+            let mut statement = tx.prepare(
+                "SELECT route_id,revision FROM deliveries
+                 WHERE message_id=?1 AND state IN ('pending','accepted','rejected')",
+            )?;
+            let rows = statement
+                .query_map([webex_message_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
         tx.execute(
             "UPDATE deliveries SET state='superseded',decided_at=?2
              WHERE message_id=?1 AND state IN ('pending','accepted','rejected')",
             params![webex_message_id, Utc::now().to_rfc3339()],
         )?;
+        let route_id: String = tx.query_row(
+            "SELECT route_id FROM outbox WHERE draft_id=?1",
+            [draft_id],
+            |row| row.get(0),
+        )?;
         tx.commit()?;
+        for (delivery_route, revision) in removed {
+            self.agent_events.push(AgentEvent::removed(
+                delivery_route,
+                webex_message_id,
+                revision,
+                "own_send",
+            ));
+        }
+        self.agent_events.push(AgentEvent::Outbox {
+            route_id,
+            draft_id: draft_id.into(),
+            state: "sent",
+        });
         Ok(())
     }
 
@@ -313,7 +344,7 @@ impl Mirror {
         {
             bail!("Draft is not in the sending state");
         }
-        Ok(())
+        self.push_outbox_event(draft_id, "failed")
     }
 
     /// Preserve ambiguous delivery instead of retrying a possibly sent message.
@@ -325,7 +356,7 @@ impl Mirror {
         {
             bail!("Draft is not in the sending state");
         }
-        Ok(())
+        self.push_outbox_event(draft_id, "delivery-unknown")
     }
 
     /// Return status only for drafts belonging to routes claimed by this host.
@@ -363,6 +394,20 @@ impl Mirror {
             sha256,
             expires_at,
         }))
+    }
+
+    fn push_outbox_event(&mut self, draft_id: &str, state: &'static str) -> Result<()> {
+        let route_id: String = self.conn.query_row(
+            "SELECT route_id FROM outbox WHERE draft_id=?1",
+            [draft_id],
+            |row| row.get(0),
+        )?;
+        self.agent_events.push(AgentEvent::Outbox {
+            route_id,
+            draft_id: draft_id.into(),
+            state,
+        });
+        Ok(())
     }
 
     /// Whether a mirrored message is this bridge's own agent send echoing back.

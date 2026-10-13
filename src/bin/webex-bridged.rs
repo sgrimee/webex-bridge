@@ -13,7 +13,6 @@ use webex_bridge::{
     diagnostics,
     mirror::{Mirror, SharedMirror},
     paths::Paths,
-    routing::Delivery,
     supervisor,
     sync::{self, history::WebexRest, live},
 };
@@ -118,13 +117,16 @@ async fn main() -> Result<()> {
                         // Queue from the encrypted mirror only after a
                         // successful hydration/upsert. Routing never reads a
                         // Mercury payload directly.
-                        let queued = mirror
-                            .with(|db| db.queue_new_deliveries(&config))
+                        let agent_events = mirror
+                            .with(|db| {
+                                db.queue_new_deliveries(&config)?;
+                                Ok(db.take_agent_events())
+                            })
                             .await
                             .map_err(|_| {
                                 webex::error::Error::Other("Agent routing failed".into())
                             })?;
-                        publish_deliveries(&events, &queued);
+                        events.publish_agent_events(agent_events);
                         for invalidation in live::ui_invalidations(&result) {
                             events.publish_ui(invalidation.name, invalidation.data);
                         }
@@ -371,19 +373,6 @@ async fn watch_connection(
     }
 }
 
-fn publish_deliveries(events: &EventBus, deliveries: &[Delivery]) {
-    for delivery in deliveries {
-        events.publish_agent_route(
-            &delivery.route_id,
-            "inbox.new",
-            serde_json::json!({
-                "deliveryId": delivery.id,
-                "revision": delivery.revision,
-            }),
-        );
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod bootstrap_tests {
@@ -539,11 +528,14 @@ async fn run_sync(
             result = sync::synchronize_once(&mirror, &rest, &config, dev_room.as_deref()) => {
                 match result {
                     Ok(summary) => {
-                        let queued = mirror
-                            .with(|db| db.queue_new_deliveries(&config))
+                        let (queued, agent_events) = mirror
+                            .with(|db| {
+                                let queued = db.queue_new_deliveries(&config)?;
+                                Ok((queued, db.take_agent_events()))
+                            })
                             .await
                             .context("Agent routing failed after synchronization")?;
-                        publish_deliveries(&events, &queued);
+                        events.publish_agent_events(agent_events);
                         for room_id in &summary.departed_rooms {
                             events.publish_ui(
                                 "membership.changed",

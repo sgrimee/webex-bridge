@@ -395,8 +395,18 @@ async fn approve_draft(
     match sent {
         Ok(message) if message.id.as_deref().is_some_and(|id| !id.is_empty()) => {
             let id = message.id.as_deref().expect("checked nonempty");
-            match state.mirror().with(|db| db.mark_sent(&draft_id, id)).await {
-                Ok(()) => Json(serde_json::json!({ "state": "sent" })).into_response(),
+            match state
+                .mirror()
+                .with(|db| {
+                    db.mark_sent(&draft_id, id)?;
+                    Ok(db.take_agent_events())
+                })
+                .await
+            {
+                Ok(agent_events) => {
+                    state.events().publish_agent_events(agent_events);
+                    Json(serde_json::json!({ "state": "sent" })).into_response()
+                }
                 Err(_) => json_error(
                     StatusCode::ACCEPTED,
                     "delivery_unknown",
@@ -405,14 +415,29 @@ async fn approve_draft(
             }
         }
         Err(error) if error.to_string().contains("returned HTTP") => {
-            let _ = state.mirror().with(|db| db.mark_failed(&draft_id)).await;
+            if let Ok(agent_events) = state
+                .mirror()
+                .with(|db| {
+                    db.mark_failed(&draft_id)?;
+                    Ok(db.take_agent_events())
+                })
+                .await
+            {
+                state.events().publish_agent_events(agent_events);
+            }
             Json(serde_json::json!({ "state": "failed" })).into_response()
         }
         _ => {
-            let _ = state
+            if let Ok(agent_events) = state
                 .mirror()
-                .with(|db| db.mark_delivery_unknown(&draft_id))
-                .await;
+                .with(|db| {
+                    db.mark_delivery_unknown(&draft_id)?;
+                    Ok(db.take_agent_events())
+                })
+                .await
+            {
+                state.events().publish_agent_events(agent_events);
+            }
             Json(serde_json::json!({ "state": "delivery-unknown" })).into_response()
         }
     }

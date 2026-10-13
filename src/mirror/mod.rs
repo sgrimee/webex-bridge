@@ -227,6 +227,8 @@ pub struct Mirror {
     // this connection; the fields remain unavailable outside this crate.
     pub(crate) conn: Connection,
     pub(crate) crypto: MirrorCrypto,
+    /// Metadata-only agent notifications awaiting publication by the daemon.
+    pub(crate) agent_events: crate::routing::PendingAgentEvents,
 }
 
 /// Internal mirror-key seam. The production implementation uses Keychain;
@@ -306,7 +308,11 @@ impl Mirror {
                 bail!("Mirror encryption key check failed");
             }
         }
-        Ok(Self { conn, crypto })
+        Ok(Self {
+            conn,
+            crypto,
+            agent_events: crate::routing::PendingAgentEvents::default(),
+        })
     }
 
     /// Create an encrypted in-memory mirror for tests; never touches Keychain.
@@ -1257,6 +1263,17 @@ impl Mirror {
         tx.execute("INSERT INTO messages(room_id,message_id,revision,parent_id,sender_id,created_at,updated_at,status)
                     VALUES (?1,?2,?3,?4,?5,?6,?7,'deleted')",
             params![room_id,message_id,new_revision,parent,sender,created,Utc::now().to_rfc3339()])?;
+        let removed = {
+            let mut statement = tx.prepare(
+                "SELECT route_id,revision FROM deliveries WHERE message_id=?1 AND state<>'deleted'",
+            )?;
+            let rows = statement
+                .query_map([message_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
         tx.execute(
             "UPDATE deliveries SET state='deleted' WHERE message_id=?1",
             [message_id],
@@ -1266,6 +1283,11 @@ impl Mirror {
             [message_id],
         )?;
         tx.commit()?;
+        for (route_id, revision) in removed {
+            self.agent_events.push(crate::routing::AgentEvent::removed(
+                route_id, message_id, revision, "deleted",
+            ));
+        }
         Ok(true)
     }
 

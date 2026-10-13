@@ -70,6 +70,97 @@ pub struct DeliveryPreview {
     pub markdown: String,
 }
 
+/// Upper bound on unpublished agent notifications held by one mirror. A
+/// longer backlog is replaced by a single "resync required" signal.
+const MAX_PENDING_AGENT_EVENTS: usize = 1024;
+
+/// A metadata-only agent notification produced by a mirror change. The daemon
+/// publishes each one to the SSE subscribers of exactly its route.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum AgentEvent {
+    /// A newly pending delivery. `supersedes` lists earlier deliveries of the
+    /// same message on this route that the new revision replaced; a non-empty
+    /// list makes this an `inbox.revised` event, otherwise `inbox.new`.
+    Queued {
+        delivery: Delivery,
+        supersedes: Vec<String>,
+    },
+    /// A delivery left the inbox (`inbox.deleted`): its message was deleted
+    /// (`deleted`), or it was recognised as this bridge's own send (`own_send`).
+    Removed {
+        route_id: String,
+        delivery_id: String,
+        revision: i64,
+        reason: &'static str,
+    },
+    /// An outbound draft changed state (`outbox.status`): `sent`, `failed`
+    /// or `delivery-unknown`.
+    Outbox {
+        route_id: String,
+        draft_id: String,
+        state: &'static str,
+    },
+}
+
+impl AgentEvent {
+    pub(crate) fn removed(
+        route_id: String,
+        message_id: &str,
+        revision: i64,
+        reason: &'static str,
+    ) -> Self {
+        let delivery_id = DeliveryKey {
+            route_id: route_id.clone(),
+            message_id: message_id.into(),
+            revision,
+        }
+        .encode();
+        Self::Removed {
+            route_id,
+            delivery_id,
+            revision,
+            reason,
+        }
+    }
+}
+
+/// Agent notifications drained from the mirror for publication.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct AgentEventBatch {
+    /// Events in production order.
+    pub events: Vec<AgentEvent>,
+    /// The bounded backlog overflowed: agents must reload their inbox.
+    pub lagged: bool,
+}
+
+/// Bounded, in-memory pending notifications (never persisted, no content).
+#[derive(Debug, Default)]
+pub struct PendingAgentEvents {
+    events: Vec<AgentEvent>,
+    lagged: bool,
+}
+
+impl PendingAgentEvents {
+    pub(crate) fn push(&mut self, event: AgentEvent) {
+        if self.lagged {
+            return;
+        }
+        if self.events.len() >= MAX_PENDING_AGENT_EVENTS {
+            self.events.clear();
+            self.lagged = true;
+            return;
+        }
+        self.events.push(event);
+    }
+
+    fn take(&mut self) -> AgentEventBatch {
+        AgentEventBatch {
+            events: std::mem::take(&mut self.events),
+            lagged: std::mem::take(&mut self.lagged),
+        }
+    }
+}
+
 /// Content released only after an explicit local acceptance.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -292,6 +383,19 @@ impl Mirror {
             }
             // An edit invalidates older decisions before its new revision is
             // evaluated, even when its new body no longer matches the route.
+            let superseded = {
+                let mut statement = self.conn.prepare(
+                    "SELECT revision FROM deliveries
+                     WHERE route_id=?1 AND message_id=?2 AND revision<?3
+                       AND state IN ('pending','accepted','rejected')",
+                )?;
+                let revisions = statement
+                    .query_map(params![route_id, message_id, revision], |row| {
+                        row.get::<_, i64>(0)
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                revisions
+            };
             self.conn.execute(
                 "UPDATE deliveries SET state='superseded',decided_at=?4
                  WHERE route_id=?1 AND message_id=?2 AND revision<?3 AND state IN ('pending','accepted','rejected')",
@@ -362,7 +466,7 @@ impl Mirror {
                  VALUES (?1,?2,?3,'pending',NULL)",
                 params![route_id, message_id, revision],
             )?;
-            queued.push(Delivery {
+            let delivery = Delivery {
                 id: key.encode(),
                 route_id,
                 sender_id: Some(sender_id),
@@ -371,9 +475,30 @@ impl Mirror {
                 state: "pending".into(),
                 sender_name: None,
                 room_title: None,
+            };
+            let supersedes = superseded
+                .into_iter()
+                .map(|old| {
+                    DeliveryKey {
+                        route_id: delivery.route_id.clone(),
+                        message_id: message_id.clone(),
+                        revision: old,
+                    }
+                    .encode()
+                })
+                .collect();
+            self.agent_events.push(AgentEvent::Queued {
+                delivery: delivery.clone(),
+                supersedes,
             });
+            queued.push(delivery);
         }
         Ok(queued)
+    }
+
+    /// Drain the pending metadata-only agent notifications for publication.
+    pub fn take_agent_events(&mut self) -> AgentEventBatch {
+        self.agent_events.take()
     }
 
     /// List metadata only for claimed route deliveries. No body leaves the
@@ -1653,5 +1778,100 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    #[test]
+    fn mirror_changes_produce_route_scoped_agent_events() {
+        let config = echo_config();
+        let mut mirror = Mirror::in_memory([25; 32]).unwrap();
+        mirror.sync_routes(&config.routes).unwrap();
+        mirror.upsert_message(&echo("m", "first")).unwrap();
+        mirror.queue_deliveries(&config).unwrap();
+        let batch = mirror.take_agent_events();
+        assert!(!batch.lagged);
+        let [AgentEvent::Queued {
+            delivery: first,
+            supersedes,
+        }] = batch.events.as_slice()
+        else {
+            panic!("one queued event")
+        };
+        assert!(supersedes.is_empty(), "inbox.new");
+        // An edit re-queues and supersedes: inbox.revised naming the old ID.
+        let mut edited = echo("m", "second");
+        edited.updated = Some("2099-01-01T00:05:00Z".into());
+        mirror.upsert_message(&edited).unwrap();
+        mirror.queue_deliveries(&config).unwrap();
+        let batch = mirror.take_agent_events();
+        let [AgentEvent::Queued {
+            delivery: revised,
+            supersedes,
+        }] = batch.events.as_slice()
+        else {
+            panic!("one revised event")
+        };
+        assert_eq!(supersedes, &vec![first.id.clone()]);
+        // Deleting the message removes its deliveries: inbox.deleted.
+        assert!(mirror.mark_deleted("room", "m").unwrap());
+        let removed = mirror.take_agent_events().events;
+        assert!(removed.contains(&AgentEvent::Removed {
+            route_id: "r".into(),
+            delivery_id: revised.id.clone(),
+            revision: revised.revision,
+            reason: "deleted",
+        }));
+        // An echo already routed, then mark_sent: own_send removal + outbox.status.
+        mirror.upsert_message(&echo("sent", "rewritten")).unwrap();
+        mirror.queue_deliveries(&config).unwrap();
+        let echo_delivery = mirror.deliveries(&["r".into()], Some("pending")).unwrap()[0].clone();
+        let draft_id = approved_draft(&mut mirror, &config);
+        mirror.take_agent_events();
+        mirror.mark_sent(&draft_id, "sent").unwrap();
+        assert_eq!(
+            mirror.take_agent_events().events,
+            vec![
+                AgentEvent::Removed {
+                    route_id: "r".into(),
+                    delivery_id: echo_delivery.id,
+                    revision: echo_delivery.revision,
+                    reason: "own_send",
+                },
+                AgentEvent::Outbox {
+                    route_id: "r".into(),
+                    draft_id,
+                    state: "sent",
+                },
+            ]
+        );
+        let failed = approved_draft(&mut mirror, &config);
+        mirror.mark_failed(&failed).unwrap();
+        let unknown = approved_draft(&mut mirror, &config);
+        mirror.mark_delivery_unknown(&unknown).unwrap();
+        let states: Vec<_> = mirror
+            .take_agent_events()
+            .events
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Outbox { state, .. } => Some(state),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(states, ["failed", "delivery-unknown"]);
+    }
+
+    #[test]
+    fn an_undrained_agent_event_backlog_is_bounded_and_signals_lag() {
+        let mut pending = PendingAgentEvents::default();
+        for index in 0..(MAX_PENDING_AGENT_EVENTS + 5) {
+            pending.push(AgentEvent::Outbox {
+                route_id: "r".into(),
+                draft_id: index.to_string(),
+                state: "sent",
+            });
+        }
+        let batch = pending.take();
+        assert!(batch.lagged);
+        assert!(batch.events.is_empty());
+        assert_eq!(pending.take(), AgentEventBatch::default());
     }
 }

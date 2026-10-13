@@ -863,10 +863,14 @@ async fn delete_message(
     }
     match state
         .mirror()
-        .with(|db| db.mark_deleted(&existing.room_id, &message_id))
+        .with(|db| {
+            let deleted = db.mark_deleted(&existing.room_id, &message_id)?;
+            Ok((deleted, db.take_agent_events()))
+        })
         .await
     {
-        Ok(true) => {
+        Ok((true, agent_events)) => {
+            state.events().publish_agent_events(agent_events);
             state.events().publish_ui(
                 "message.deleted",
                 serde_json::json!({ "roomId": existing.room_id, "messageId": message_id }),

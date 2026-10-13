@@ -767,9 +767,13 @@ fn sanitize_terminal_text(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
     // Whether the previous kept character can take one variation selector.
     let mut selector_allowed = false;
-    for ch in input.chars() {
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
         let ch = match ch {
             '\u{2028}' | '\u{2029}' => '\n',
+            // A lone CR would return a terminal cursor to column 0 and let
+            // later text overwrite the line; CRLF stays as written.
+            '\r' if chars.peek() != Some(&'\n') => '\n',
             other => other,
         };
         if matches!(
@@ -1440,5 +1444,14 @@ mod tests {
         let kept = "a\u{200c}b\u{200d}c\u{200e}d\u{200f}e";
         assert_eq!(sanitize_terminal_text(kept), kept);
         assert_eq!(sanitize_display_line(kept), "abcde");
+    }
+
+    #[test]
+    fn lone_carriage_returns_become_newlines() {
+        assert_eq!(
+            sanitize_terminal_text("safe\rFORGED\r\nnext\r\r\nend\r"),
+            "safe\nFORGED\r\nnext\n\r\nend\n"
+        );
+        assert_eq!(sanitize_display_line("Pat\rEvil"), "Pat Evil");
     }
 }

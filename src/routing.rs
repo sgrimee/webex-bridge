@@ -717,21 +717,32 @@ impl Mirror {
         } else {
             None
         };
-        let target = if accept { "accepted" } else { "rejected" };
-        let changed = self.conn.execute(
+        let (target, action) = if accept {
+            ("accepted", "inbox_accept")
+        } else {
+            ("rejected", "inbox_reject")
+        };
+        // The decision and its metadata-only audit row commit together; a
+        // refused (no longer pending) decision writes neither.
+        let now = Utc::now().to_rfc3339();
+        let tx = self.conn.transaction()?;
+        let changed = tx.execute(
             "UPDATE deliveries SET state=?4,decided_at=?5
              WHERE route_id=?1 AND message_id=?2 AND revision=?3 AND state='pending'",
-            params![
-                key.route_id,
-                key.message_id,
-                key.revision,
-                target,
-                Utc::now().to_rfc3339()
-            ],
+            params![key.route_id, key.message_id, key.revision, target, now],
         )?;
         if changed == 0 {
             return Ok(None);
         }
+        tx.execute(
+            "INSERT INTO audit(ts,scope,action,ref,detail_redacted) VALUES (?1,'agent',?2,?3,NULL)",
+            params![
+                now,
+                action,
+                format!("{}:{}:{}", key.route_id, key.message_id, key.revision)
+            ],
+        )?;
+        tx.commit()?;
         let Some(ReleasedMessage {
             sender_id,
             created_at,
@@ -1174,6 +1185,44 @@ mod tests {
             .preview_delivery(&routes, &pending[1].id)
             .unwrap()
             .is_none());
+        // Each decision is audited once, metadata-only; a repeated decision
+        // on a no-longer-pending delivery changes nothing and is not audited.
+        assert!(mirror
+            .decide_delivery(&routes, &pending[0].id, true)
+            .unwrap()
+            .is_none());
+        assert!(mirror
+            .decide_delivery(&routes, &pending[1].id, false)
+            .unwrap()
+            .is_none());
+        let decisions = mirror
+            .conn
+            .prepare(
+                "SELECT action,ref,detail_redacted FROM audit
+                 WHERE action IN ('inbox_accept','inbox_reject') ORDER BY rowid",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let reference = |encoded: &str| {
+            let key = DeliveryKey::decode(encoded).unwrap();
+            format!("{}:{}:{}", key.route_id, key.message_id, key.revision)
+        };
+        assert_eq!(
+            decisions,
+            [
+                ("inbox_accept".into(), reference(&pending[0].id), None),
+                ("inbox_reject".into(), reference(&pending[1].id), None),
+            ]
+        );
         assert!(mirror
             .preview_delivery(&["other".into()], &pending[0].id)
             .unwrap()

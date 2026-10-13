@@ -683,11 +683,15 @@ fn is_bidi_control(ch: char) -> bool {
 /// still reaching a model: TAGs U+E0000–U+E007F, invisible math operators
 /// U+2061–U+2064, Mongolian vowel separator U+180E, combining grapheme joiner
 /// U+034F, Hangul fillers U+115F/U+1160/U+3164/U+FFA0, Khmer inherent vowels
-/// U+17B4/U+17B5 and soft hyphen U+00AD.
+/// U+17B4/U+17B5, soft hyphen U+00AD, and the zero-width space U+200B, word
+/// joiner U+2060 and BOM/ZWNBSP U+FEFF (ZWSP runs can binary-encode payloads).
 fn is_invisible_smuggling(ch: char) -> bool {
     matches!(
         ch,
         '\u{e0000}'..='\u{e007f}'
+            | '\u{200b}'
+            | '\u{2060}'
+            | '\u{feff}'
             | '\u{2061}'..='\u{2064}'
             | '\u{180e}'
             | '\u{034f}'
@@ -1129,7 +1133,7 @@ mod tests {
             .map(|ch| char::from_u32(0xe0000 + u32::from(ch)).unwrap())
             .collect();
         let hidden = format!(
-            "\u{e0001}{tags}\u{e007f}\u{2061}\u{2064}\u{180e}\u{034f}\u{115f}\u{1160}\u{3164}\u{ffa0}\u{17b4}\u{17b5}\u{00ad}"
+            "\u{e0001}{tags}\u{e007f}\u{200b}\u{2060}\u{feff}\u{2061}\u{2064}\u{180e}\u{034f}\u{115f}\u{1160}\u{3164}\u{ffa0}\u{17b4}\u{17b5}\u{00ad}"
         );
         // Emoji ZWJ sequence with presentation selector, ZWNJ, RLM: all kept.
         let kept = "👩\u{200d}💻 ❤\u{fe0f} a\u{200c}b \u{200f}";

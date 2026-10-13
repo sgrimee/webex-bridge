@@ -1593,11 +1593,24 @@ fn take_revision(conn: &Connection, previous: Option<i64>) -> Result<i64> {
         .optional()?;
     let next = match stored {
         Some(next) => next,
-        None => conn.query_row(
-            "SELECT COALESCE(MAX(revision)+1, 0) FROM messages",
-            [],
-            |row| row.get(0),
-        )?,
+        None => {
+            // First allocation in this mirror: continue above every revision
+            // ever recorded, including delivery keys of already-pruned
+            // messages, then drop those orphaned deliveries.
+            let next: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(revision)+1, 0) FROM (
+                   SELECT MAX(revision) AS revision FROM messages
+                   UNION ALL SELECT MAX(revision) FROM deliveries)",
+                [],
+                |row| row.get(0),
+            )?;
+            conn.execute(
+                "DELETE FROM deliveries WHERE NOT EXISTS
+                   (SELECT 1 FROM messages m WHERE m.message_id=deliveries.message_id)",
+                [],
+            )?;
+            next
+        }
     };
     let floor = previous.map_or(Ok(0), |revision| {
         revision.checked_add(1).context("Message revision overflow")
@@ -2232,6 +2245,48 @@ mod tests {
         let mut edit = message("a", "v3", None);
         edit.updated = Some("2026-10-08T12:03:00Z".into());
         assert_eq!(mirror.upsert_message(&edit).unwrap(), Upsert::Edited(4));
+    }
+
+    #[test]
+    fn counter_initialisation_covers_orphan_delivery_revisions_and_drops_them() {
+        let mut mirror = Mirror::in_memory([16_u8; 32]).unwrap();
+        mirror
+            .sync_routes(&[crate::config::Route {
+                id: "r".into(),
+                room_id: "room-1".into(),
+                agent_name: "sam/coder".into(),
+                allowed_senders: Vec::new(),
+                receive: crate::config::Receive::Addressed,
+                workspace: "/workspace".into(),
+            }])
+            .unwrap();
+        mirror.upsert_message(&message("a", "v0", None)).unwrap();
+        // Pre-counter mirror with an orphan delivery of a pruned message (rev 7).
+        mirror
+            .conn
+            .execute(
+                "INSERT INTO deliveries(route_id,message_id,revision,state,decided_at)
+                 VALUES ('r','pruned',7,'rejected',NULL)",
+                [],
+            )
+            .unwrap();
+        mirror
+            .conn
+            .execute("DELETE FROM mirror_meta WHERE key='revision_seq'", [])
+            .unwrap();
+        assert_eq!(
+            mirror.upsert_message(&message("b", "new", None)).unwrap(),
+            Upsert::Created(8)
+        );
+        let orphans: i64 = mirror
+            .conn
+            .query_row(
+                "SELECT count(*) FROM deliveries WHERE message_id='pruned'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0);
     }
 
     #[test]

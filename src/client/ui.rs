@@ -75,10 +75,10 @@ impl BridgeClient {
         let response = self
             .request(Method::POST, "/v1/ui/sessions", None, Some(body))
             .await?;
-        let session: SessionResponse = Self::json(response).await?;
+        let session: SessionResponse = Self::secret_json(response).await?;
         Ok(UiClient {
             bridge: self.clone(),
-            token: session.token,
+            token: super::secret::SecretToken::new(session.token),
             lease_ttl: session.lease_ttl,
         })
     }
@@ -91,7 +91,8 @@ impl BridgeClient {
 #[derive(Clone)]
 pub struct UiClient {
     bridge: BridgeClient,
-    token: String,
+    /// Shared by every clone and wiped when the last clone is dropped.
+    token: super::secret::SecretToken,
     lease_ttl: u64,
 }
 
@@ -109,7 +110,7 @@ impl UiClient {
     pub async fn me(&self) -> Result<Person> {
         let response = self
             .bridge
-            .request(Method::GET, "/v1/me", Some(&self.token), None)
+            .request(Method::GET, "/v1/me", Some(self.token.as_str()), None)
             .await?;
         BridgeClient::json(response).await
     }
@@ -120,7 +121,12 @@ impl UiClient {
     pub async fn continuity(&self) -> Result<Continuity> {
         let response = self
             .bridge
-            .request(Method::GET, "/v1/ui/continuity", Some(&self.token), None)
+            .request(
+                Method::GET,
+                "/v1/ui/continuity",
+                Some(self.token.as_str()),
+                None,
+            )
             .await?;
         BridgeClient::json(response).await
     }
@@ -129,7 +135,7 @@ impl UiClient {
     pub async fn rooms(&self) -> Result<Vec<Room>> {
         let response = self
             .bridge
-            .request(Method::GET, "/v1/rooms", Some(&self.token), None)
+            .request(Method::GET, "/v1/rooms", Some(self.token.as_str()), None)
             .await?;
         Ok(BridgeClient::json::<RoomsResponse>(response).await?.rooms)
     }
@@ -141,7 +147,7 @@ impl UiClient {
             .request(
                 Method::GET,
                 &format!("/v1/rooms/{}", path_segment(room_id)),
-                Some(&self.token),
+                Some(self.token.as_str()),
                 None,
             )
             .await?;
@@ -158,7 +164,7 @@ impl UiClient {
             .request(
                 Method::GET,
                 &format!("/v1/teams/{}", path_segment(team_id)),
-                Some(&self.token),
+                Some(self.token.as_str()),
                 None,
             )
             .await?;
@@ -173,7 +179,7 @@ impl UiClient {
             .request(
                 Method::DELETE,
                 &format!("/v1/rooms/{}/membership", path_segment(room_id)),
-                Some(&self.token),
+                Some(self.token.as_str()),
                 None,
             )
             .await?;
@@ -202,7 +208,7 @@ impl UiClient {
         }
         let response = self
             .bridge
-            .request(Method::GET, &path, Some(&self.token), None)
+            .request(Method::GET, &path, Some(self.token.as_str()), None)
             .await?;
         BridgeClient::json(response).await
     }
@@ -231,7 +237,7 @@ impl UiClient {
             .request(
                 Method::GET,
                 &format!("/v1/messages/{}/thread", path_segment(message_id)),
-                Some(&self.token),
+                Some(self.token.as_str()),
                 None,
             )
             .await?;
@@ -261,7 +267,7 @@ impl UiClient {
         }
         let response = self
             .bridge
-            .request(Method::GET, &path, Some(&self.token), None)
+            .request(Method::GET, &path, Some(self.token.as_str()), None)
             .await?;
         BridgeClient::json(response).await
     }
@@ -275,7 +281,7 @@ impl UiClient {
             .request(
                 Method::GET,
                 &format!("/v1/messages/{}/read", path_segment(message_id)),
-                Some(&self.token),
+                Some(self.token.as_str()),
                 None,
             )
             .await?;
@@ -289,7 +295,7 @@ impl UiClient {
             .request(
                 Method::GET,
                 &format!("/v1/messages/{}", path_segment(message_id)),
-                Some(&self.token),
+                Some(self.token.as_str()),
                 None,
             )
             .await?;
@@ -305,7 +311,7 @@ impl UiClient {
             .request(
                 Method::GET,
                 &format!("/v1/people/{}/read", path_segment(person_id)),
-                Some(&self.token),
+                Some(self.token.as_str()),
                 None,
             )
             .await?;
@@ -319,7 +325,7 @@ impl UiClient {
             .request(
                 Method::GET,
                 &format!("/v1/people/{}", path_segment(person_id)),
-                Some(&self.token),
+                Some(self.token.as_str()),
                 None,
             )
             .await?;
@@ -341,7 +347,12 @@ impl UiClient {
         })?;
         let response = self
             .bridge
-            .request(Method::POST, "/v1/messages", Some(&self.token), Some(body))
+            .request(
+                Method::POST,
+                "/v1/messages",
+                Some(self.token.as_str()),
+                Some(body),
+            )
             .await?;
         BridgeClient::json(response).await
     }
@@ -363,7 +374,12 @@ impl UiClient {
         })?;
         let response = self
             .bridge
-            .request(Method::POST, "/v1/messages", Some(&self.token), Some(body))
+            .request(
+                Method::POST,
+                "/v1/messages",
+                Some(self.token.as_str()),
+                Some(body),
+            )
             .await?;
         BridgeClient::json(response).await
     }
@@ -385,7 +401,7 @@ impl UiClient {
             .request(
                 Method::PUT,
                 &format!("/v1/messages/{}", path_segment(message_id)),
-                Some(&self.token),
+                Some(self.token.as_str()),
                 Some(body),
             )
             .await?;
@@ -409,7 +425,7 @@ impl UiClient {
             .request(
                 Method::PUT,
                 &format!("/v1/messages/{}", path_segment(message_id)),
-                Some(&self.token),
+                Some(self.token.as_str()),
                 Some(body),
             )
             .await?;
@@ -423,7 +439,7 @@ impl UiClient {
             .request(
                 Method::DELETE,
                 &format!("/v1/messages/{}", path_segment(message_id)),
-                Some(&self.token),
+                Some(self.token.as_str()),
                 None,
             )
             .await?;
@@ -432,7 +448,7 @@ impl UiClient {
 
     /// Open the metadata-only, UI-filtered bridge event stream.
     pub async fn events(&self) -> Result<EventStream> {
-        EventStream::connect(self.bridge.clone(), &self.token).await
+        EventStream::connect(self.bridge.clone(), self.token.as_str()).await
     }
 }
 

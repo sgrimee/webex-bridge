@@ -4,13 +4,14 @@
 //! module only after pairing and can only reach the local daemon socket.
 
 pub mod events;
+mod secret;
 pub mod ui;
 
 use anyhow::Context;
 use http_body_util::{BodyExt, Full};
 use hyper::{
     body::{Bytes, Incoming},
-    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
+    header::{HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE},
     Method, Request, Response, StatusCode,
 };
 use hyper_util::client::legacy::Client;
@@ -153,12 +154,21 @@ impl BridgeClient {
             .uri(Uri::new(&self.socket, path))
             .header(ACCEPT, "application/json");
         if let Some(token) = token {
-            builder = builder.header(AUTHORIZATION, format!("Bearer {token}"));
+            // Build the header in a wiped buffer shared with hyper (no copy).
+            let mut header = Vec::with_capacity(7 + token.len());
+            header.extend_from_slice(b"Bearer ");
+            header.extend_from_slice(token.as_bytes());
+            let mut value =
+                HeaderValue::from_maybe_shared(Bytes::from_owner(secret::Wiped::new(header)))
+                    .map_err(|error| ClientError::InvalidResponse(error.into()))?;
+            value.set_sensitive(true);
+            builder = builder.header(AUTHORIZATION, value);
         }
         let request = if let Some(body) = body {
+            // Request bodies (including the UI secret) are wiped when released.
             builder
                 .header(CONTENT_TYPE, "application/json")
-                .body(Full::new(Bytes::from(body)))
+                .body(Full::new(Bytes::from_owner(secret::Wiped::new(body))))
         } else {
             builder.body(Full::new(Bytes::new()))
         }
@@ -219,6 +229,22 @@ impl BridgeClient {
             .map_err(|error| ClientError::Transport(error.into()))?
             .to_bytes();
         Self::decode_json(status, &body)
+    }
+
+    /// As [`Self::json`], for a response carrying a credential: the collected
+    /// body is held in a wiped buffer while it is parsed.
+    pub(crate) async fn secret_json<T: DeserializeOwned>(
+        response: Response<Incoming>,
+    ) -> Result<T> {
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|error| ClientError::Transport(error.into()))?
+            .to_bytes();
+        let body = secret::Wiped::new(Vec::from(body));
+        Self::decode_json(status, body.as_ref())
     }
 
     pub(crate) async fn empty(response: Response<Incoming>) -> Result<()> {

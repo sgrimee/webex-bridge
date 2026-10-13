@@ -134,6 +134,22 @@ impl UiClient {
             .lease_ttl)
     }
 
+    /// Log out: the daemon revokes this session's token (and closes its event
+    /// streams). Every clone of this client stops working. The pairing stays.
+    /// A repeated logout returns `auth_required`.
+    pub async fn logout(&self) -> Result<()> {
+        let response = self
+            .bridge
+            .request(
+                Method::DELETE,
+                "/v1/ui/sessions",
+                Some(self.token.as_str()),
+                None,
+            )
+            .await?;
+        BridgeClient::empty(response).await
+    }
+
     /// Read the daemon account from the encrypted mirror, refreshing it from
     /// Webex when available. A first-run offline daemon reports
     /// `identity_not_ready` instead of guessing an account from person rows.
@@ -1729,6 +1745,112 @@ mod server_tests {
             .await
             .expect("revoked stream should close")
             .is_none());
+        env.server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn logout_revokes_only_the_presenting_session_and_closes_its_stream() {
+        let env = renewable_server().await;
+        let ui = env.bridge.create_ui_session(RENEW_SECRET).await.unwrap();
+        let other = env.bridge.create_ui_session(RENEW_SECRET).await.unwrap();
+        let mut stream = ui.events().await.unwrap();
+        let _ready = stream.next().await.unwrap().unwrap();
+        let clone = ui.clone();
+
+        ui.logout().await.unwrap();
+        // Its quiet stream ends at once with the terminal event.
+        let expired = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("logout should close the stream at once")
+            .unwrap()
+            .unwrap();
+        assert!(expired.is_session_expired());
+        // Every clone is logged out; a second logout is auth_required.
+        let error = clone.rooms().await.unwrap_err();
+        assert_eq!(api_code(&error), Some((401, "auth_required")));
+        let error = ui.logout().await.unwrap_err();
+        assert_eq!(api_code(&error), Some((401, "auth_required")));
+        // Another session of the same pairing is unaffected.
+        assert_eq!(other.rooms().await.unwrap(), Vec::<Room>::new());
+
+        // Another process cannot log a session out.
+        let me = this_process();
+        let foreign = env.sessions.issue_ui(
+            crate::api::auth::PeerIdentity {
+                uid: me.uid,
+                pid: me.pid.map(|pid| pid + 1),
+            },
+            env.hash.clone(),
+            Duration::from_secs(60),
+            Duration::from_secs(3600),
+        );
+        let response = env
+            .bridge
+            .request(Method::DELETE, "/v1/ui/sessions", Some(&foreign), None)
+            .await
+            .unwrap();
+        let error = BridgeClient::empty(response).await.unwrap_err();
+        assert_eq!(api_code(&error), Some((403, "forbidden_peer")));
+        assert!(env
+            .sessions
+            .authorize(
+                Some(&foreign),
+                crate::api::auth::Scope::Ui,
+                crate::api::auth::PeerIdentity {
+                    uid: me.uid,
+                    pid: me.pid.map(|pid| pid + 1),
+                },
+            )
+            .is_ok());
+        env.server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_pairing_dialog_outcome_is_audited_without_the_secret() {
+        let env = renewable_server().await;
+        let hash = URL_SAFE_NO_PAD.encode(Sha256::digest(b"another-local-ui-secret-long-enough"));
+        for (answer, expected) in [
+            (crate::dialog::PairingAnswer::GaveUp, "pair_gave_up"),
+            (crate::dialog::PairingAnswer::Denied, "pair_denied"),
+            (crate::dialog::PairingAnswer::Allowed, "pair_approved"),
+        ] {
+            *crate::dialog::TEST_ANSWER.lock().unwrap() = Some(answer);
+            let result = env.bridge.pair_ui(&hash).await;
+            if answer == crate::dialog::PairingAnswer::Allowed {
+                result.unwrap();
+            } else {
+                assert_eq!(
+                    api_code(&result.unwrap_err()),
+                    Some((403, "pairing_denied")),
+                    "{expected}"
+                );
+            }
+            let (count, reference): (i64, Option<String>) = env
+                .mirror
+                .with(move |db| {
+                    Ok(db.conn.query_row(
+                        "SELECT COUNT(*),MAX(ref) FROM audit WHERE scope='ui' AND action=?1",
+                        [expected],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?)
+                })
+                .await
+                .unwrap();
+            assert_eq!(count, 1, "{expected}");
+            let reference = reference.unwrap();
+            assert!(
+                reference.starts_with('/'),
+                "the executable path: {reference}"
+            );
+            assert!(!reference.contains(&hash));
+        }
+        *crate::dialog::TEST_ANSWER.lock().unwrap() = None;
+        let pairings = env.mirror.with(|db| db.ui_pairings()).await.unwrap();
+        assert_eq!(
+            pairings.len(),
+            2,
+            "the fixture pairing plus the approved one"
+        );
         env.server.shutdown().await.unwrap();
     }
 }

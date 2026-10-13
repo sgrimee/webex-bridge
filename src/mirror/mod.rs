@@ -1671,6 +1671,15 @@ impl Mirror {
         )?)
     }
 
+    /// Record one metadata-only UI-scope audit row (no secrets or content).
+    pub fn audit_ui(&mut self, action: &str, reference: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO audit(ts,scope,action,ref,detail_redacted) VALUES (?1,'ui',?2,?3,NULL)",
+            params![Utc::now().to_rfc3339(), action, reference],
+        )?;
+        Ok(())
+    }
+
     /// Paired UI clients, without their secret hashes.
     pub fn ui_pairings(&self) -> Result<Vec<UiPairing>> {
         let mut statement = self.conn.prepare(

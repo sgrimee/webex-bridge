@@ -529,6 +529,7 @@ mod tests {
             ("POST", "/v1/ui/pair", Some(r#"{"secretHash":""}"#)),
             ("POST", "/v1/ui/sessions", Some(r#"{"secret":""}"#)),
             ("POST", "/v1/ui/sessions/renew", None),
+            ("DELETE", "/v1/ui/sessions", None),
             ("GET", "/v1/ui/pairings", None),
             ("POST", "/v1/ui/pairings/remove", Some(r#"{"all":true}"#)),
             ("GET", "/v1/me", None),

@@ -1419,10 +1419,22 @@ async fn pair(
             )
         }
     };
-    if !dialog::confirm_ui_pairing(&executable)
-        .await
-        .unwrap_or(false)
-    {
+    let answer = dialog::confirm_ui_pairing(&executable).await;
+    let action = match &answer {
+        Ok(dialog::PairingAnswer::Allowed) => "pair_approved",
+        Ok(dialog::PairingAnswer::Denied) => "pair_denied",
+        Ok(dialog::PairingAnswer::GaveUp) => "pair_gave_up",
+        Err(_) => "pair_dialog_failed",
+    };
+    // Metadata-only audit of every completed dialog: the local executable
+    // path and the outcome, never the secret hash. A cancelled request (the
+    // client gave up) kills its dialog and records nothing.
+    let executable_ref = executable.display().to_string();
+    let _ = state
+        .mirror()
+        .with(move |db| db.audit_ui(action, Some(&executable_ref)))
+        .await;
+    if !matches!(answer, Ok(dialog::PairingAnswer::Allowed)) {
         return json_error(
             StatusCode::FORBIDDEN,
             "pairing_denied",
@@ -1488,6 +1500,22 @@ async fn create_session(
         lease_ttl: UI_LEASE_TTL.as_secs(),
     })
     .into_response()
+}
+
+/// Log out: revoke exactly the presented UI token (same process only) and
+/// close its event streams. Other sessions, and the pairing, are unaffected.
+async fn delete_session(
+    State(state): State<ApiState>,
+    Extension(peer): Extension<auth::PeerIdentity>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = ui_session(&state, peer, &headers) {
+        return *response;
+    }
+    if let Some(token) = bearer(&headers) {
+        state.sessions().revoke(token);
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// Extend the presented UI lease in place. The same token stays valid; only
@@ -1613,7 +1641,10 @@ pub fn router() -> Router<ApiState> {
         .route("/v1/ui/pair", post(pair))
         .route("/v1/ui/pairings", get(pairings))
         .route("/v1/ui/pairings/remove", post(unpair))
-        .route("/v1/ui/sessions", post(create_session))
+        .route(
+            "/v1/ui/sessions",
+            post(create_session).delete(delete_session),
+        )
         .route("/v1/ui/sessions/renew", post(renew_session))
         .route("/v1/me", get(me))
         .route("/v1/ui/continuity", get(continuity))

@@ -53,17 +53,37 @@ fn pairing_script(executable: &Path) -> String {
     )
 }
 
-/// Only an explicit "Allow" approves. Deny (cancel button, non-zero exit),
-/// give-up (empty button), missing GUI and any other output deny.
-fn approved(success: bool, stdout: &[u8]) -> bool {
-    success && stdout == b"Allow\n"
+/// Test-only scripted answer, so API tests never open a real dialog.
+#[cfg(test)]
+pub(crate) static TEST_ANSWER: std::sync::Mutex<Option<PairingAnswer>> =
+    std::sync::Mutex::new(None);
+
+/// The user's answer to one pairing dialog. Only `Allowed` approves.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PairingAnswer {
+    /// The user clicked "Allow".
+    Allowed,
+    /// "Deny" (the cancel button), no graphical session, or any other result.
+    Denied,
+    /// Nobody answered within [`PAIRING_DIALOG_SECS`].
+    GaveUp,
+}
+
+/// Only an explicit "Allow" approves; a give-up returns an empty button; a
+/// cancel button, missing GUI and any other output deny.
+fn classify(success: bool, stdout: &[u8]) -> PairingAnswer {
+    match (success, stdout) {
+        (true, b"Allow\n") => PairingAnswer::Allowed,
+        (true, b"\n") => PairingAnswer::GaveUp,
+        _ => PairingAnswer::Denied,
+    }
 }
 
 /// Run `program -e script` and classify its result. The child is killed when
 /// this future is dropped, so a cancelled pairing request (for example a
 /// client that gave up) removes its dialog instead of leaving it on screen
 /// to collect a click that nobody receives.
-async fn confirm_with(program: &Path, script: String) -> Result<bool> {
+async fn confirm_with(program: &Path, script: String) -> Result<PairingAnswer> {
     let output = tokio::process::Command::new(program)
         .arg("-e")
         .arg(script)
@@ -72,13 +92,17 @@ async fn confirm_with(program: &Path, script: String) -> Result<bool> {
         .output()
         .await
         .context("Cannot display macOS pairing dialog")?;
-    Ok(approved(output.status.success(), &output.stdout))
+    Ok(classify(output.status.success(), &output.stdout))
 }
 
 /// Ask the logged-in macOS user whether this exact executable may receive full
 /// mirror access. A missing GUI, deny, give-up after
 /// [`PAIRING_DIALOG_SECS`], or a platform without a native dialog is a denial.
-pub async fn confirm_ui_pairing(executable: &Path) -> Result<bool> {
+pub async fn confirm_ui_pairing(executable: &Path) -> Result<PairingAnswer> {
+    #[cfg(test)]
+    if let Some(answer) = *TEST_ANSWER.lock().expect("test dialog mutex") {
+        return Ok(answer);
+    }
     #[cfg(target_os = "macos")]
     {
         confirm_with(Path::new("/usr/bin/osascript"), pairing_script(executable)).await
@@ -86,7 +110,7 @@ pub async fn confirm_ui_pairing(executable: &Path) -> Result<bool> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (executable, confirm_with, pairing_script(executable));
-        Ok(false)
+        Ok(PairingAnswer::Denied)
     }
 }
 
@@ -116,28 +140,38 @@ mod tests {
 
     #[test]
     fn only_an_explicit_allow_approves() {
-        assert!(approved(true, b"Allow\n"));
+        assert_eq!(classify(true, b"Allow\n"), PairingAnswer::Allowed);
+        assert_eq!(classify(true, b"\n"), PairingAnswer::GaveUp);
         for (success, stdout) in [
-            (true, &b"\n"[..]), // gave up: empty button
-            (true, b"Deny\n"),
-            (false, b""), // cancel button / no GUI
+            (true, &b"Deny\n"[..]),
+            (false, b""),
             (false, b"Allow\n"),
+            (false, b"\n"),
             (true, b"Allow"),
             (true, b"Allow\nAllow\n"),
         ] {
-            assert!(!approved(success, stdout), "{success} {stdout:?}");
+            assert_eq!(
+                classify(success, stdout),
+                PairingAnswer::Denied,
+                "{success} {stdout:?}"
+            );
         }
     }
 
     #[tokio::test]
     async fn runner_results_are_classified() {
         let dir = tempfile::tempdir().unwrap();
-        let allow = fake_dialog(dir.path(), "echo Allow");
-        assert!(confirm_with(&allow, "ignored".into()).await.unwrap());
-        let gave_up = fake_dialog(dir.path(), "echo");
-        assert!(!confirm_with(&gave_up, "ignored".into()).await.unwrap());
-        let cancelled = fake_dialog(dir.path(), "exit 1");
-        assert!(!confirm_with(&cancelled, "ignored".into()).await.unwrap());
+        for (body, answer) in [
+            ("echo Allow", PairingAnswer::Allowed),
+            ("echo", PairingAnswer::GaveUp),
+            ("exit 1", PairingAnswer::Denied),
+        ] {
+            let dialog = fake_dialog(dir.path(), body);
+            assert_eq!(
+                confirm_with(&dialog, "ignored".into()).await.unwrap(),
+                answer
+            );
+        }
         assert!(confirm_with(&dir.path().join("missing"), "x".into())
             .await
             .is_err());

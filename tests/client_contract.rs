@@ -21,6 +21,8 @@ async fn typed_bootstrap_contract(
     let _: Status = bridge.status().await?;
     bridge.pair_ui(secret_hash).await?;
     let client = bridge.create_ui_session(secret).await?;
+    // Logout on quit (typed; not called here).
+    let _ = UiClient::logout;
     // Lease renewal keeps the same token; its refusals are typed.
     if let Err(error) = client.renew().await {
         let _: bool = error.is_pairing_removed() || error.is_session_cap_reached();

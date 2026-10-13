@@ -1,6 +1,8 @@
 //! Atomic SQLite schema migrations.
 
-use super::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7};
+use super::schema::{
+    SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
+};
 use anyhow::{bail, Result};
 use rusqlite::Connection;
 
@@ -70,55 +72,51 @@ fn migrate_v7(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_v8(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction()?;
+    if !has_column(&tx, "room_sweep", "attempts")? {
+        tx.execute_batch(
+            "ALTER TABLE room_sweep ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE room_sweep ADD COLUMN queued_at TEXT;",
+        )?;
+    }
+    tx.execute_batch(SCHEMA_V8)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// One migration that brings the schema to the paired version.
+type Step = fn(&mut Connection) -> Result<()>;
+
+/// Newest schema version this code writes.
+pub const LATEST_VERSION: i32 = 8;
+
 /// Apply migrations or reject a database written by newer code.
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    match version {
-        0 => {
-            let tx = conn.transaction()?;
-            tx.execute_batch(SCHEMA_V1)?;
-            tx.commit()?;
-            migrate_v2(conn)?;
-            migrate_v3(conn)?;
-            migrate_v4(conn)?;
-            migrate_v5(conn)?;
-            migrate_v6(conn)?;
-            migrate_v7(conn)
-        }
-        1 => {
-            migrate_v2(conn)?;
-            migrate_v3(conn)?;
-            migrate_v4(conn)?;
-            migrate_v5(conn)?;
-            migrate_v6(conn)?;
-            migrate_v7(conn)
-        }
-        2 => {
-            migrate_v3(conn)?;
-            migrate_v4(conn)?;
-            migrate_v5(conn)?;
-            migrate_v6(conn)?;
-            migrate_v7(conn)
-        }
-        3 => {
-            migrate_v4(conn)?;
-            migrate_v5(conn)?;
-            migrate_v6(conn)?;
-            migrate_v7(conn)
-        }
-        4 => {
-            migrate_v5(conn)?;
-            migrate_v6(conn)?;
-            migrate_v7(conn)
-        }
-        5 => {
-            migrate_v6(conn)?;
-            migrate_v7(conn)
-        }
-        6 => migrate_v7(conn),
-        7 => Ok(()),
-        _ => bail!("Mirror database schema version {version} is unsupported"),
+    if !(0..=LATEST_VERSION).contains(&version) {
+        bail!("Mirror database schema version {version} is unsupported");
     }
+    if version == 0 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V1)?;
+        tx.commit()?;
+    }
+    let steps: [(i32, Step); 7] = [
+        (2, migrate_v2),
+        (3, migrate_v3),
+        (4, migrate_v4),
+        (5, migrate_v5),
+        (6, migrate_v6),
+        (7, migrate_v7),
+        (8, migrate_v8),
+    ];
+    for (target, step) in steps {
+        if version < target {
+            step(conn)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -136,10 +134,12 @@ mod tests {
         assert!(has_column(&conn, "ui_lookup", "checked_at").unwrap());
         assert!(has_column(&conn, "messages", "body_kind").unwrap());
         assert!(has_column(&conn, "room_sweep", "cursor_message_id").unwrap());
+        assert!(has_column(&conn, "room_sweep", "attempts").unwrap());
+        assert!(has_column(&conn, "room_sweep", "queued_at").unwrap());
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                 .unwrap(),
-            7
+            LATEST_VERSION
         );
         conn.execute_batch("PRAGMA user_version=99").unwrap();
         assert!(migrate(&mut conn).is_err());
@@ -174,7 +174,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                 .unwrap(),
-            7
+            LATEST_VERSION
         );
     }
 
@@ -211,7 +211,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                 .unwrap(),
-            7
+            LATEST_VERSION
         );
     }
 
@@ -225,7 +225,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                 .unwrap(),
-            7
+            LATEST_VERSION
         );
     }
 }

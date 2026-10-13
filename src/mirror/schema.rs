@@ -148,3 +148,9 @@ CREATE TABLE IF NOT EXISTS room_sweep (
 );
 PRAGMA user_version=7;
 "#;
+
+// Sweep fairness: `attempts` counts consecutive failed steps of one request
+// generation (a failing room is dropped after a bound, and a re-request or
+// progress resets it); `queued_at` rotates a failed room behind the others.
+// The columns are added by `migrate_v8`; this only bumps the version.
+pub(crate) const SCHEMA_V8: &str = "PRAGMA user_version=8;";

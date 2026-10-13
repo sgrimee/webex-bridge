@@ -3,7 +3,7 @@
 
 use crate::{
     diagnostics,
-    mirror::{SharedMirror, Upsert},
+    mirror::{RoomSweep, SharedMirror, Upsert},
     sync::history::WebexRest,
 };
 use anyhow::{bail, Context, Result};
@@ -132,6 +132,9 @@ pub const RECONCILE_RECENT_MESSAGES: usize = 100;
 
 /// Messages checked per background sweep step.
 pub const SWEEP_BATCH: usize = 20;
+
+/// Consecutive failed steps after which one room's sweep is dropped.
+pub const SWEEP_MAX_ATTEMPTS: u32 = 5;
 
 /// Pause between the REST checks of a background sweep: at most one GET per
 /// second on top of live traffic.
@@ -284,6 +287,13 @@ pub struct SweepStep {
 /// pausing `pause` between REST checks. Progress is persisted after every
 /// message, so a restart resumes where it stopped. Returns `None` when no
 /// sweep is pending. Run it off the live handler.
+///
+/// A failed step re-queues its room behind the other pending sweeps, so one
+/// room with a recurring error (room mismatch, authorization, a long
+/// Retry-After, a malformed body) cannot stall the queue. After
+/// [`SWEEP_MAX_ATTEMPTS`] consecutive failures that room's sweep is dropped;
+/// a later reconcile may request it again. Authentication failures are global,
+/// not the room's fault, and are not counted.
 pub async fn sweep_step(
     mirror: &SharedMirror,
     rest: &WebexRest,
@@ -293,6 +303,31 @@ pub async fn sweep_step(
     let Some(sweep) = mirror.with(|db| db.next_room_sweep()).await? else {
         return Ok(None);
     };
+    match sweep_room(mirror, rest, &sweep, batch, pause).await {
+        Ok(step) => Ok(Some(step)),
+        Err(error) => {
+            if !error.to_string().contains("auth_required") {
+                let failed = sweep.clone();
+                let dropped = mirror
+                    .with(move |db| db.fail_room_sweep(&failed, SWEEP_MAX_ATTEMPTS))
+                    .await?;
+                if dropped {
+                    diagnostics::debug("sync.sweep_dropped after repeated failures");
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn sweep_room(
+    mirror: &SharedMirror,
+    rest: &WebexRest,
+    sweep: &RoomSweep,
+    batch: usize,
+    pause: Duration,
+) -> Result<SweepStep> {
+    let sweep = sweep.clone();
     let mut step = SweepStep {
         room_id: sweep.room_id.clone(),
         checked: 0,
@@ -307,7 +342,7 @@ pub async fn sweep_step(
             .with(move |db| db.advance_room_sweep(&done, None))
             .await?;
         step.finished = true;
-        return Ok(Some(step));
+        return Ok(step);
     }
     let lookup = sweep.clone();
     let messages = mirror
@@ -319,7 +354,7 @@ pub async fn sweep_step(
             .with(move |db| db.advance_room_sweep(&done, None))
             .await?;
         step.finished = true;
-        return Ok(Some(step));
+        return Ok(step);
     }
     for (index, (id, created_at)) in messages.iter().enumerate() {
         if index > 0 {
@@ -336,7 +371,7 @@ pub async fn sweep_step(
                     .with(move |db| db.advance_room_sweep(&done, None))
                     .await?;
                 step.finished = true;
-                return Ok(Some(step));
+                return Ok(step);
             }
         }
         step.checked += 1;
@@ -356,7 +391,7 @@ pub async fn sweep_step(
         "sync.sweep checked={} edited={} deleted={} finished={}",
         step.checked, step.edited, step.deleted, step.finished
     ));
-    Ok(Some(step))
+    Ok(step)
 }
 
 /// Hydrate one Mercury event, encrypt changes, and return metadata-only outcome.
@@ -1053,6 +1088,70 @@ mod tests {
         assert_eq!((step.checked, step.deleted, step.finished), (0, 0, true));
         assert!(bodies_kept(&mirror, &ids).await);
         // The sweep is over, not retried against an unavailable room.
+        assert_eq!(
+            sweep_step(&mirror, &rest, 20, Duration::ZERO)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recurring_sweep_error_rotates_its_room_and_drops_it_after_the_bound() {
+        let server = MockServer::start().await;
+        let synthetic = |kind: &str, n: u32| {
+            STANDARD_NO_PAD.encode(format!(
+                "ciscospark://us/{kind}/00000000-0000-4000-8000-{:012}",
+                800 + n
+            ))
+        };
+        let (failing, healthy) = (synthetic("ROOM", 1), synthetic("ROOM", 2));
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/rooms/{failing}")))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/rooms/{healthy}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(room(&healthy)))
+            .mount(&server)
+            .await;
+        let rest =
+            WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
+        let mut mirror = Mirror::in_memory([63_u8; 32]).unwrap();
+        for room_id in [&failing, &healthy] {
+            mirror.upsert_room(&room(room_id), true).unwrap();
+            mirror
+                .request_room_sweep(room_id, "2026-10-08T12:00:09Z", "newest")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let mirror = SharedMirror::new(mirror);
+        // The failing room is first in line, fails, and moves behind.
+        assert!(sweep_step(&mirror, &rest, 20, Duration::ZERO)
+            .await
+            .is_err());
+        let next = mirror
+            .with(|db| db.next_room_sweep())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.room_id, healthy);
+        // The healthy room is not starved: it finishes (nothing to check).
+        let step = sweep_step(&mirror, &rest, 20, Duration::ZERO)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (step.room_id.as_str(), step.finished),
+            (healthy.as_str(), true)
+        );
+        // The failing room is dropped after the bound instead of retrying forever.
+        for _ in 1..SWEEP_MAX_ATTEMPTS {
+            assert!(sweep_step(&mirror, &rest, 20, Duration::ZERO)
+                .await
+                .is_err());
+        }
         assert_eq!(
             sweep_step(&mirror, &rest, 20, Duration::ZERO)
                 .await

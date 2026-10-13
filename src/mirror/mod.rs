@@ -1766,7 +1766,8 @@ impl Mirror {
             "INSERT INTO room_sweep(room_id,cursor_created_at,cursor_message_id,requested_at)
              VALUES (?1,?2,?3,?4)
              ON CONFLICT(room_id) DO UPDATE SET cursor_created_at=excluded.cursor_created_at,
-               cursor_message_id=excluded.cursor_message_id,requested_at=excluded.requested_at",
+               cursor_message_id=excluded.cursor_message_id,requested_at=excluded.requested_at,
+               attempts=0,queued_at=NULL",
             params![
                 room_id,
                 created_at,
@@ -1777,13 +1778,14 @@ impl Mirror {
         Ok(())
     }
 
-    /// The longest-waiting room sweep, if any.
+    /// The longest-waiting room sweep, if any. A failed step re-queues its
+    /// room behind the others (see [`Self::fail_room_sweep`]).
     pub fn next_room_sweep(&self) -> Result<Option<RoomSweep>> {
         Ok(self
             .conn
             .query_row(
                 "SELECT room_id,cursor_created_at,cursor_message_id,requested_at FROM room_sweep
-                 ORDER BY requested_at,room_id LIMIT 1",
+                 ORDER BY COALESCE(queued_at,requested_at),room_id LIMIT 1",
                 [],
                 |row| {
                     Ok(RoomSweep {
@@ -1838,7 +1840,7 @@ impl Mirror {
     ) -> Result<()> {
         match next {
             Some((created_at, message_id)) => self.conn.execute(
-                "UPDATE room_sweep SET cursor_created_at=?3,cursor_message_id=?4
+                "UPDATE room_sweep SET cursor_created_at=?3,cursor_message_id=?4,attempts=0
                  WHERE room_id=?1 AND requested_at=?2",
                 params![sweep.room_id, sweep.generation, created_at, message_id],
             )?,
@@ -1848,6 +1850,27 @@ impl Mirror {
             )?,
         };
         Ok(())
+    }
+
+    /// Record a failed sweep step of this generation: the room moves behind
+    /// every other pending sweep, and after `max_attempts` consecutive
+    /// failures its sweep is dropped (a later reconcile can request it again).
+    /// Returns whether it was dropped. A stale generation changes nothing.
+    pub fn fail_room_sweep(&mut self, sweep: &RoomSweep, max_attempts: u32) -> Result<bool> {
+        self.conn.execute(
+            "UPDATE room_sweep SET attempts=attempts+1,queued_at=?3
+             WHERE room_id=?1 AND requested_at=?2",
+            params![
+                sweep.room_id,
+                sweep.generation,
+                Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+            ],
+        )?;
+        let dropped = self.conn.execute(
+            "DELETE FROM room_sweep WHERE room_id=?1 AND requested_at=?2 AND attempts>=?3",
+            params![sweep.room_id, sweep.generation, max_attempts],
+        )?;
+        Ok(dropped > 0)
     }
 
     /// Canonical IDs whose latest revision is active in a room. Reconcile only on events/outage.
@@ -2033,6 +2056,43 @@ mod tests {
         assert_eq!(restarted.cursor_message_id, "d");
         mirror.advance_room_sweep(&restarted, None).unwrap();
         assert_eq!(mirror.next_room_sweep().unwrap(), None);
+    }
+
+    #[test]
+    fn a_failing_room_sweep_rotates_behind_others_and_is_dropped_after_its_bound() {
+        let mut mirror = Mirror::in_memory([40_u8; 32]).unwrap();
+        mirror
+            .request_room_sweep("room-a", "2026-10-08T12:00:03Z", "d")
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        mirror
+            .request_room_sweep("room-b", "2026-10-08T12:00:03Z", "d")
+            .unwrap();
+        let first = mirror.next_room_sweep().unwrap().unwrap();
+        assert_eq!(first.room_id, "room-a");
+        // A failure rotates room-a behind room-b.
+        assert!(!mirror.fail_room_sweep(&first, 3).unwrap());
+        assert_eq!(mirror.next_room_sweep().unwrap().unwrap().room_id, "room-b");
+        // Progress resets the count; consecutive failures drop it at the bound.
+        mirror
+            .advance_room_sweep(&first, Some(("2026-10-08T12:00:02Z", "c")))
+            .unwrap();
+        assert!(!mirror.fail_room_sweep(&first, 3).unwrap());
+        assert!(!mirror.fail_room_sweep(&first, 3).unwrap());
+        assert!(mirror.fail_room_sweep(&first, 3).unwrap());
+        assert_eq!(mirror.next_room_sweep().unwrap().unwrap().room_id, "room-b");
+        let b = mirror.next_room_sweep().unwrap().unwrap();
+        mirror.advance_room_sweep(&b, None).unwrap();
+        assert_eq!(mirror.next_room_sweep().unwrap(), None);
+        // A re-request starts over with a clean count.
+        mirror
+            .request_room_sweep("room-a", "2026-10-08T12:00:03Z", "d")
+            .unwrap();
+        let again = mirror.next_room_sweep().unwrap().unwrap();
+        assert!(!mirror.fail_room_sweep(&again, 2).unwrap());
+        // A failure from a stale generation changes nothing.
+        assert!(!mirror.fail_room_sweep(&first, 1).unwrap());
+        assert_eq!(mirror.next_room_sweep().unwrap().unwrap(), again);
     }
 
     #[test]

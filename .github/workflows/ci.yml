@@ -5,33 +5,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          path: workspace/webex-bridge
-      - name: Checkout sibling webex-rust (local path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: sgrimee/webex-rust
-          # Temporary until the refactoring baseline and Step 1.1 are on master.
-          ref: step-1-transport-feasibility
-          path: workspace/webex-rust
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.88"
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: workspace/webex-bridge
       - run: cargo fmt --check
-        working-directory: workspace/webex-bridge
       - run: cargo clippy --all-targets -- -D warnings
-        working-directory: workspace/webex-bridge
       - run: cargo test
-        working-directory: workspace/webex-bridge
       # The typed client's server-backed tests need both features.
       - run: cargo clippy --all-targets --features client -- -D warnings
-        working-directory: workspace/webex-bridge
       - run: cargo test --features client
-        working-directory: workspace/webex-bridge
       - name: Check client-only TUI contract and dependency graph
         run: ./scripts/check-client-only
-        working-directory: workspace/webex-bridge

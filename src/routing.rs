@@ -390,6 +390,14 @@ impl Mirror {
             if self.delivery_exists(&key)? {
                 continue;
             }
+            // A config-dependent filter decision is final for this exact
+            // revision: widening the route later (e.g. receive = "all", a new
+            // allowed sender, a larger size limit) applies only to new
+            // messages and real edits, never retroactively to old ones.
+            // Rate-limit and queue-full decisions stay re-evaluable.
+            if self.filtered_sticky(&key)? {
+                continue;
+            }
             // An edit invalidates older decisions before its new revision is
             // evaluated, even when its new body no longer matches the route.
             let superseded = {
@@ -876,6 +884,23 @@ impl Mirror {
             .is_some())
     }
 
+    /// Whether this exact key was already filtered for a reason that depends
+    /// only on configuration or content (not on transient load).
+    fn filtered_sticky(&self, key: &DeliveryKey) -> Result<bool> {
+        let reference = format!("{}:{}:{}", key.route_id, key.message_id, key.revision);
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM audit WHERE scope='agent' AND action='route_filtered'
+                   AND ref=?1 AND detail_redacted IN
+                   ('not_addressed','sender_not_allowed','empty_body','inbound_too_large','missing_sender')",
+                [reference],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some())
+    }
+
     /// Record a filtered key once per reason (at most one row per distinct
     /// reason), so a sticky reason such as `own_outbound` is always recorded.
     fn audit_filtered_once(&self, key: &DeliveryKey, reason: &str) -> Result<()> {
@@ -1063,6 +1088,68 @@ mod tests {
             created: Some("2099-01-01T00:00:00Z".into()),
             ..Message::default()
         }
+    }
+
+    #[test]
+    fn widening_a_route_never_admits_already_filtered_revisions() {
+        let mut config = config();
+        let mut mirror = Mirror::in_memory([33; 32]).unwrap();
+        mirror.sync_routes(&config.routes).unwrap();
+        let mut unaddressed = message("just chatting");
+        unaddressed.id = Some("unaddressed".into());
+        let mut stranger = message("sam/coder: from someone else");
+        stranger.id = Some("stranger".into());
+        stranger.person_id = Some("stranger-person".into());
+        let mut large = message(&format!("sam/coder: {}", "x".repeat(64)));
+        large.id = Some("large".into());
+        config.limits.agent_inbound_max_bytes = 32;
+        for message in [&unaddressed, &stranger, &large] {
+            mirror.upsert_message(message).unwrap();
+        }
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 0);
+        let _ = mirror.take_agent_events();
+
+        // Widen every config-dependent filter at once.
+        config.routes[0].receive = Receive::All;
+        config.routes[0]
+            .allowed_senders
+            .push("stranger-person".into());
+        config.limits.agent_inbound_max_bytes = 1024;
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 0);
+        assert!(mirror.take_agent_events().events.is_empty());
+
+        // New messages and real edits are judged by the widened route.
+        let mut fresh = message("a new unaddressed post");
+        fresh.id = Some("fresh".into());
+        fresh.created = Some("2099-01-01T00:01:00Z".into());
+        mirror.upsert_message(&fresh).unwrap();
+        let mut edited = unaddressed.clone();
+        edited.text = Some("just chatting, edited".into());
+        edited.updated = Some("2099-01-01T00:02:00Z".into());
+        mirror.upsert_message(&edited).unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 2);
+    }
+
+    #[test]
+    fn transient_filters_are_reevaluated_later() {
+        let mut config = config();
+        config.limits.route_queue_cap = 1;
+        let mut mirror = Mirror::in_memory([34; 32]).unwrap();
+        mirror.sync_routes(&config.routes).unwrap();
+        let mut first = message("sam/coder: first");
+        first.id = Some("first".into());
+        let mut second = message("sam/coder: second");
+        second.id = Some("second".into());
+        second.created = Some("2099-01-01T00:00:01Z".into());
+        mirror.upsert_message(&first).unwrap();
+        mirror.upsert_message(&second).unwrap();
+        // The queue is full for the second one: route_queue_full, not sticky.
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
+        let pending = mirror.deliveries(&["r".into()], Some("pending")).unwrap();
+        mirror
+            .decide_delivery(&["r".into()], &pending[0].id, false)
+            .unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
     }
 
     #[test]

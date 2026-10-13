@@ -438,7 +438,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(result, Upsert::Created(0));
+        assert!(matches!(result, Upsert::Created(_)));
         assert!(task.await.unwrap().unwrap().boundary_reached);
     }
 

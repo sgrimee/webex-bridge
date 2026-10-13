@@ -79,7 +79,10 @@ Probe output contains only IDs, timestamps, lengths and sanitized event types,
 not message bodies. `webex-bridged --dev-room <allowlisted ID>` is a restricted
 Step 2 validation mode; without it, the daemon follows D7 and mirrors all
 rooms. Optional `[webex] retention_max_age = "365d"` prunes old encrypted
-message revisions; leaving it unset keeps all history. All write paths must
+message revisions (and their agent delivery metadata); leaving it unset keeps
+all history. Message `revision` values come from one mirror-wide counter: they
+are opaque, strictly increasing per message and never reused, even when a pruned
+message is later re-hydrated, but they are not contiguous and not an edit count. All write paths must
 enforce `[dev] write_allowlist` in later steps. See [the local implementation plan](../docs/webex-agent-channel-plan.md)
 and [`docs/events.md`](docs/events.md) for observations.
 

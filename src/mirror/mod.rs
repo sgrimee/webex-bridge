@@ -79,7 +79,7 @@ struct StoredAttachmentMeta {
 /// Result of a canonical message upsert.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Upsert {
-    /// New message, revision zero.
+    /// First stored revision of a message (new, or re-hydrated after retention).
     Created(i64),
     /// Existing canonical message changed, new revision.
     Edited(i64),
@@ -877,9 +877,10 @@ impl Mirror {
                 }
             }
         }
-        let revision = previous.as_ref().map_or(Ok(0), |(rev, ..)| {
-            rev.checked_add(1).context("Message revision overflow")
-        })?;
+        let created = previous.is_none();
+        // The revision counter bump and the row INSERT share one transaction.
+        let tx = self.conn.transaction()?;
+        let revision = take_revision(&tx, previous.as_ref().map(|(rev, ..)| *rev))?;
         let encrypted_body = body
             .map(|text| {
                 self.crypto
@@ -895,7 +896,6 @@ impl Mirror {
                     .seal_prefixed(data, &message_aad("files", id, revision))
             })
             .transpose()?;
-        let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT OR IGNORE INTO rooms(room_id,type,is_member,updated_at) VALUES (?1,'unknown',1,?2)",
             params![room_id, Utc::now().to_rfc3339()],
@@ -916,8 +916,8 @@ impl Mirror {
             [id],
         )?;
         tx.commit()?;
-        Ok(if revision == 0 {
-            Upsert::Created(0)
+        Ok(if created {
+            Upsert::Created(revision)
         } else {
             Upsert::Edited(revision)
         })
@@ -1240,10 +1240,8 @@ impl Mirror {
         if status == "deleted" {
             return Ok(false);
         }
-        let new_revision = revision
-            .checked_add(1)
-            .context("Message revision overflow")?;
         let tx = self.conn.transaction()?;
+        let new_revision = take_revision(&tx, Some(revision))?;
         tx.execute(
             "UPDATE messages SET body_ct=NULL, body_nonce=NULL, files_meta_ct=NULL,body_kind=NULL WHERE message_id=?1",
             [message_id],
@@ -1420,6 +1418,14 @@ impl Mirror {
         parse_timestamp(cutoff)?;
         let tx = self.conn.transaction()?;
         let removed = tx.execute("DELETE FROM messages WHERE created_at < ?1", [cutoff])?;
+        // Retention also removes delivery metadata of pruned messages. The
+        // revision counter is never lowered, so a later re-hydrate cannot reuse
+        // a pruned revision or collide with a former delivery key.
+        tx.execute(
+            "DELETE FROM deliveries WHERE NOT EXISTS
+               (SELECT 1 FROM messages m WHERE m.message_id=deliveries.message_id)",
+            [],
+        )?;
         tx.execute("INSERT INTO audit(ts,scope,action,ref,detail_redacted) VALUES (?1,'system','retention',NULL,?2)",
             params![Utc::now().to_rfc3339(), format!("removed={removed}")])?;
         tx.commit()?;
@@ -1556,6 +1562,48 @@ fn parse_gap(value: &str) -> Option<(String, String)> {
 
 fn parse_timestamp(value: &str) -> Result<chrono::DateTime<chrono::FixedOffset>> {
     chrono::DateTime::parse_from_rfc3339(value).context("Invalid Webex message timestamp")
+}
+
+/// Largest revision handed out: JSON clients (pi) parse numbers as IEEE-754
+/// doubles, so every revision must stay an exactly representable integer.
+const MAX_REVISION: i64 = (1 << 53) - 1;
+
+/// Allocate the next message revision from the mirror-wide counter.
+///
+/// Revisions are opaque: strictly increasing per message and never reused
+/// within a mirror, but neither contiguous nor an edit count. This keeps them
+/// monotonic when retention prunes every revision of a message and a later
+/// hydrate stores it again. An existing mirror without a counter continues
+/// above its current maximum. Callers bump within their INSERT transaction.
+fn take_revision(conn: &Connection, previous: Option<i64>) -> Result<i64> {
+    let stored: Option<i64> = conn
+        .query_row(
+            "SELECT value FROM mirror_meta WHERE key='revision_seq'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let next = match stored {
+        Some(next) => next,
+        None => conn.query_row(
+            "SELECT COALESCE(MAX(revision)+1, 0) FROM messages",
+            [],
+            |row| row.get(0),
+        )?,
+    };
+    let floor = previous.map_or(Ok(0), |revision| {
+        revision.checked_add(1).context("Message revision overflow")
+    })?;
+    let revision = next.max(floor);
+    if !(0..=MAX_REVISION).contains(&revision) {
+        bail!("Message revision space exhausted");
+    }
+    conn.execute(
+        "INSERT INTO mirror_meta(key,value) VALUES ('revision_seq',?1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [revision + 1],
+    )?;
+    Ok(revision)
 }
 
 pub(crate) fn message_aad(column: &str, id: &str, revision: i64) -> Vec<u8> {
@@ -2116,6 +2164,84 @@ mod tests {
         assert_eq!(mirror.prune_before("2026-10-08T12:00:01Z").unwrap(), 1);
         assert!(!mirror.contains_message("old").unwrap());
         assert!(mirror.contains_message("new").unwrap());
+    }
+
+    #[test]
+    fn revisions_stay_monotonic_across_retention_prune_and_rehydrate() {
+        let mut mirror = Mirror::in_memory([13_u8; 32]).unwrap();
+        let Upsert::Created(first) = mirror.upsert_message(&message("old", "v1", None)).unwrap()
+        else {
+            panic!("created")
+        };
+        let mut edit = message("old", "v2", None);
+        edit.updated = Some("2026-10-08T12:05:00Z".into());
+        let Upsert::Edited(edited) = mirror.upsert_message(&edit).unwrap() else {
+            panic!("edited")
+        };
+        assert!(edited > first);
+        assert_eq!(mirror.prune_before("2026-10-08T12:00:01Z").unwrap(), 2);
+        // Lazy hydrate stores the pruned message again: still a creation, but
+        // above every revision it ever had, never reusing a pruned one.
+        let Upsert::Created(rehydrated) = mirror.upsert_message(&edit).unwrap() else {
+            panic!("re-created")
+        };
+        assert!(rehydrated > edited);
+        let mut again = message("old", "v3", None);
+        again.updated = Some("2026-10-08T12:09:00Z".into());
+        let Upsert::Edited(later) = mirror.upsert_message(&again).unwrap() else {
+            panic!("edited again")
+        };
+        assert!(later > rehydrated);
+        assert!(mirror.mark_deleted("room-1", "old").unwrap());
+        let tombstone = mirror.ui_message("old").unwrap().unwrap();
+        assert_eq!(tombstone.status, "deleted");
+        assert!(tombstone.revision > later);
+    }
+
+    #[test]
+    fn existing_mirror_without_a_counter_continues_above_its_maximum() {
+        let mut mirror = Mirror::in_memory([14_u8; 32]).unwrap();
+        mirror.upsert_message(&message("a", "v0", None)).unwrap();
+        for (minute, body) in [(1, "v1"), (2, "v2")] {
+            let mut edit = message("a", body, None);
+            edit.updated = Some(format!("2026-10-08T12:0{minute}:00Z"));
+            mirror.upsert_message(&edit).unwrap();
+        }
+        // A pre-counter mirror: per-message revisions 0..=2 and no sequence row.
+        mirror
+            .conn
+            .execute("DELETE FROM mirror_meta WHERE key='revision_seq'", [])
+            .unwrap();
+        let max: i64 = mirror
+            .conn
+            .query_row("SELECT MAX(revision) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(max, 2);
+        assert_eq!(
+            mirror.upsert_message(&message("b", "new", None)).unwrap(),
+            Upsert::Created(3)
+        );
+        let mut edit = message("a", "v3", None);
+        edit.updated = Some("2026-10-08T12:03:00Z".into());
+        assert_eq!(mirror.upsert_message(&edit).unwrap(), Upsert::Edited(4));
+    }
+
+    #[test]
+    fn revisions_stay_json_safe_integers() {
+        let mut mirror = Mirror::in_memory([15_u8; 32]).unwrap();
+        mirror
+            .conn
+            .execute(
+                "INSERT INTO mirror_meta(key,value) VALUES ('revision_seq',?1)",
+                [MAX_REVISION],
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.upsert_message(&message("a", "last", None)).unwrap(),
+            Upsert::Created(MAX_REVISION)
+        );
+        assert!(mirror.upsert_message(&message("b", "over", None)).is_err());
+        assert!(!mirror.contains_message("b").unwrap());
     }
 
     #[test]

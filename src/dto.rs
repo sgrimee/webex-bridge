@@ -107,6 +107,12 @@ pub struct PersonRead {
 pub struct Message {
     pub id: String,
     pub room_id: String,
+    /// Opaque mirror revision: a non-negative JSON-safe integer (< 2^53) that
+    /// strictly increases per message (edits and the deletion tombstone) and is
+    /// never reused within a mirror, even across retention and re-hydration.
+    /// It is not contiguous and not an edit count; compare, never subtract.
+    /// A different continuity `instanceId` may come from a rebuilt mirror, so
+    /// clients must discard cached revisions when the instance changes.
     pub revision: i64,
     pub parent_id: Option<String>,
     pub sender_id: Option<String>,

@@ -871,7 +871,8 @@ mod tests {
         assert_eq!(deliveries.len(), 2);
         assert_eq!(deliveries[0].state, "superseded");
         assert_eq!(deliveries[1].state, "pending");
-        assert_eq!(deliveries[1].revision, 1);
+        // Revisions are opaque and mirror-wide: only their order is meaningful.
+        assert!(deliveries[1].revision > deliveries[0].revision);
     }
 
     #[test]
@@ -1081,7 +1082,6 @@ mod tests {
         assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
         let pending = mirror.deliveries(&routes, Some("pending")).unwrap();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].revision, 1);
         assert!(mirror.preview_delivery(&routes, &old).unwrap().is_none());
         let accepted = mirror
             .decide_delivery(&routes, &pending[0].id, true)
@@ -1195,5 +1195,35 @@ mod tests {
             .unwrap();
         assert_eq!(accepted.markdown, expected);
         assert!(!accepted.markdown.chars().any(is_invisible_smuggling));
+    }
+
+    #[test]
+    fn retention_removes_delivery_metadata_and_rehydrate_never_reuses_a_key() {
+        let config = config();
+        let mut mirror = Mirror::in_memory([15; 32]).unwrap();
+        mirror.sync_routes(&config.routes).unwrap();
+        mirror
+            .upsert_message(&message("sam/coder: please review"))
+            .unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
+        let routes = ["r".to_string()];
+        let old = mirror.deliveries(&routes, None).unwrap()[0].clone();
+        mirror.decide_delivery(&routes, &old.id, false).unwrap();
+        assert_eq!(mirror.prune_before("2100-01-01T00:00:00Z").unwrap(), 1);
+        let orphans: i64 = mirror
+            .conn
+            .query_row("SELECT count(*) FROM deliveries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(orphans, 0, "retention removes pruned delivery metadata");
+        // Lazy hydrate of the same message after retention: new revision, new key.
+        mirror
+            .upsert_message(&message("sam/coder: please review"))
+            .unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
+        let fresh = mirror.deliveries(&routes, Some("pending")).unwrap();
+        assert_eq!(fresh.len(), 1);
+        assert!(fresh[0].revision > old.revision);
+        assert_ne!(fresh[0].id, old.id);
+        assert!(mirror.preview_delivery(&routes, &old.id).unwrap().is_none());
     }
 }

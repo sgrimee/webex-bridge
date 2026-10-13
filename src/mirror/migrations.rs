@@ -2,6 +2,7 @@
 
 use super::schema::{
     SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
+    SCHEMA_V9,
 };
 use anyhow::{bail, Result};
 use rusqlite::Connection;
@@ -85,11 +86,25 @@ fn migrate_v8(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_v9(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction()?;
+    if !has_column(&tx, "room_sweep", "rerun_requested")? {
+        tx.execute_batch(
+            "ALTER TABLE room_sweep ADD COLUMN rerun_requested INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE room_sweep ADD COLUMN rerun_created_at TEXT;
+             ALTER TABLE room_sweep ADD COLUMN rerun_message_id TEXT;",
+        )?;
+    }
+    tx.execute_batch(SCHEMA_V9)?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// One migration that brings the schema to the paired version.
 type Step = fn(&mut Connection) -> Result<()>;
 
 /// Newest schema version this code writes.
-pub const LATEST_VERSION: i32 = 8;
+pub const LATEST_VERSION: i32 = 9;
 
 /// Apply migrations or reject a database written by newer code.
 pub fn migrate(conn: &mut Connection) -> Result<()> {
@@ -102,7 +117,7 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
         tx.execute_batch(SCHEMA_V1)?;
         tx.commit()?;
     }
-    let steps: [(i32, Step); 7] = [
+    let steps: [(i32, Step); 8] = [
         (2, migrate_v2),
         (3, migrate_v3),
         (4, migrate_v4),
@@ -110,6 +125,7 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
         (6, migrate_v6),
         (7, migrate_v7),
         (8, migrate_v8),
+        (9, migrate_v9),
     ];
     for (target, step) in steps {
         if version < target {
@@ -136,6 +152,7 @@ mod tests {
         assert!(has_column(&conn, "room_sweep", "cursor_message_id").unwrap());
         assert!(has_column(&conn, "room_sweep", "attempts").unwrap());
         assert!(has_column(&conn, "room_sweep", "queued_at").unwrap());
+        assert!(has_column(&conn, "room_sweep", "rerun_requested").unwrap());
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                 .unwrap(),

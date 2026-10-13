@@ -154,3 +154,8 @@ PRAGMA user_version=7;
 // progress resets it); `queued_at` rotates a failed room behind the others.
 // The columns are added by `migrate_v8`; this only bumps the version.
 pub(crate) const SCHEMA_V8: &str = "PRAGMA user_version=8;";
+
+// Sweep coalescing: a request that arrives during a pass sets
+// `rerun_requested` and keeps the newest start point in `rerun_*`; the pass
+// finishes and then restarts once from there. Columns added by `migrate_v9`.
+pub(crate) const SCHEMA_V9: &str = "PRAGMA user_version=9;";

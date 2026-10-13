@@ -1753,9 +1753,11 @@ impl Mirror {
             .map_err(Into::into)
     }
 
-    /// Request (or restart) a paced background sweep of a room's messages
-    /// older than `(created_at, message_id)`. A new request resets the cursor
-    /// and the generation, so an in-progress pass starts over from here.
+    /// Request a paced background sweep of a room's messages older than
+    /// `(created_at, message_id)`. With no sweep pending, a new pass starts
+    /// there. A request that arrives while a pass is running does not reset it
+    /// (a busy room would otherwise never finish): the newest start point is
+    /// kept and the room is swept once more after the current pass finishes.
     pub fn request_room_sweep(
         &mut self,
         room_id: &str,
@@ -1765,9 +1767,9 @@ impl Mirror {
         self.conn.execute(
             "INSERT INTO room_sweep(room_id,cursor_created_at,cursor_message_id,requested_at)
              VALUES (?1,?2,?3,?4)
-             ON CONFLICT(room_id) DO UPDATE SET cursor_created_at=excluded.cursor_created_at,
-               cursor_message_id=excluded.cursor_message_id,requested_at=excluded.requested_at,
-               attempts=0,queued_at=NULL",
+             ON CONFLICT(room_id) DO UPDATE SET rerun_requested=1,
+               rerun_created_at=excluded.cursor_created_at,
+               rerun_message_id=excluded.cursor_message_id",
             params![
                 room_id,
                 created_at,
@@ -1844,12 +1846,32 @@ impl Mirror {
                  WHERE room_id=?1 AND requested_at=?2",
                 params![sweep.room_id, sweep.generation, created_at, message_id],
             )?,
-            None => self.conn.execute(
-                "DELETE FROM room_sweep WHERE room_id=?1 AND requested_at=?2",
-                params![sweep.room_id, sweep.generation],
-            )?,
+            None => self.finish_room_sweep(sweep)?,
         };
         Ok(())
+    }
+
+    /// End this generation's pass: restart once from the newest requested
+    /// start point if a request arrived meanwhile, else remove the sweep.
+    fn finish_room_sweep(&mut self, sweep: &RoomSweep) -> Result<usize> {
+        let restarted = self.conn.execute(
+            "UPDATE room_sweep SET cursor_created_at=rerun_created_at,
+               cursor_message_id=rerun_message_id,requested_at=?3,attempts=0,queued_at=NULL,
+               rerun_requested=0,rerun_created_at=NULL,rerun_message_id=NULL
+             WHERE room_id=?1 AND requested_at=?2 AND rerun_requested=1",
+            params![
+                sweep.room_id,
+                sweep.generation,
+                Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+            ],
+        )?;
+        if restarted > 0 {
+            return Ok(restarted);
+        }
+        Ok(self.conn.execute(
+            "DELETE FROM room_sweep WHERE room_id=?1 AND requested_at=?2",
+            params![sweep.room_id, sweep.generation],
+        )?)
     }
 
     /// Record a failed sweep step of this generation: the room moves behind
@@ -1866,11 +1888,17 @@ impl Mirror {
                 Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
             ],
         )?;
-        let dropped = self.conn.execute(
-            "DELETE FROM room_sweep WHERE room_id=?1 AND requested_at=?2 AND attempts>=?3",
+        let exhausted: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM room_sweep WHERE room_id=?1 AND requested_at=?2
+               AND attempts>=?3)",
             params![sweep.room_id, sweep.generation, max_attempts],
+            |row| row.get(0),
         )?;
-        Ok(dropped > 0)
+        if exhausted {
+            // Like a finished pass: a request made meanwhile still runs once.
+            self.finish_room_sweep(sweep)?;
+        }
+        Ok(exhausted)
     }
 
     /// Canonical IDs whose latest revision is active in a room. Reconcile only on events/outage.
@@ -2010,7 +2038,7 @@ mod tests {
     }
 
     #[test]
-    fn room_sweep_requests_restart_and_ignore_stale_progress() {
+    fn room_sweep_rerequests_coalesce_into_one_rerun_and_ignore_stale_progress() {
         let mut mirror = Mirror::in_memory([39_u8; 32]).unwrap();
         for (id, created) in [
             ("a", "2026-10-08T12:00:01Z"),
@@ -2041,19 +2069,35 @@ mod tests {
             mirror.room_sweep_batch(&resumed, 10).unwrap(),
             vec![("a".to_string(), "2026-10-08T12:00:01Z".to_string())]
         );
-        // A re-request mid-sweep restarts the pass; stale progress and a
-        // stale finish from the old generation are ignored.
+        // Re-requests mid-sweep do not reset the running pass (a busy room
+        // would never finish); they coalesce into one rerun from the newest
+        // start point once the pass finishes.
         std::thread::sleep(std::time::Duration::from_millis(2));
+        mirror
+            .request_room_sweep("room-1", "2026-10-08T12:00:02Z", "c")
+            .unwrap();
         mirror
             .request_room_sweep("room-1", "2026-10-08T12:00:03Z", "d")
             .unwrap();
+        assert_eq!(mirror.next_room_sweep().unwrap().unwrap(), resumed);
         mirror
             .advance_room_sweep(&resumed, Some(("2026-10-08T12:00:01Z", "a")))
             .unwrap();
+        assert_eq!(
+            mirror.next_room_sweep().unwrap().unwrap().cursor_message_id,
+            "a"
+        );
         mirror.advance_room_sweep(&resumed, None).unwrap();
         let restarted = mirror.next_room_sweep().unwrap().unwrap();
         assert_ne!(restarted.generation, resumed.generation);
         assert_eq!(restarted.cursor_message_id, "d");
+        // Progress and a finish from the old generation are ignored.
+        mirror
+            .advance_room_sweep(&resumed, Some(("2026-10-08T12:00:01Z", "a")))
+            .unwrap();
+        mirror.advance_room_sweep(&resumed, None).unwrap();
+        assert_eq!(mirror.next_room_sweep().unwrap().unwrap(), restarted);
+        // The rerun happens once.
         mirror.advance_room_sweep(&restarted, None).unwrap();
         assert_eq!(mirror.next_room_sweep().unwrap(), None);
     }

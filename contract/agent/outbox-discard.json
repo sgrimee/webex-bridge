@@ -1,0 +1,12 @@
+{
+  "kind": "http",
+  "request": {
+    "route": "DELETE /v1/agent/outbox/{draftId}"
+  },
+  "response": {
+    "body": {
+      "state": "discarded"
+    },
+    "status": 200
+  }
+}

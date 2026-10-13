@@ -755,6 +755,73 @@ async fn agent_contract_fixtures_match_the_real_daemon_output() {
         );
     }
 
+    // Discard: a cancelled approval dialog withdraws a pending draft.
+    let (_, draft, _) = call(
+        &bridge,
+        Method::POST,
+        "/v1/agent/outbox",
+        Some(&token),
+        Some(json!({"routeId": ROUTE, "markdown": "Synthetic cancelled reply\n— 🤖 sam/coder"})),
+    )
+    .await;
+    let draft = draft.unwrap();
+    let discard_path = format!("/v1/agent/outbox/{}", draft["draftId"].as_str().unwrap());
+    let (status, body, sent) =
+        call(&bridge, Method::DELETE, &discard_path, Some(&token), None).await;
+    assert_eq!(status, 200);
+    rec.http(
+        "outbox-discard",
+        "DELETE /v1/agent/outbox/{draftId}",
+        status,
+        body,
+        sent,
+    );
+    rec.events(
+        "event-outbox-status-discarded",
+        &frames(&events, &mut stream).await,
+    );
+    let (status, body, sent) = call(&bridge, Method::GET, &discard_path, Some(&token), None).await;
+    rec.http(
+        "outbox-status-discarded",
+        "GET /v1/agent/outbox/{draftId}",
+        status,
+        body,
+        sent,
+    );
+    let (status, body, sent) =
+        call(&bridge, Method::DELETE, &discard_path, Some(&token), None).await;
+    rec.http(
+        "error-draft-not-pending",
+        "DELETE /v1/agent/outbox/{draftId}",
+        status,
+        body,
+        sent,
+    );
+    let (status, _, _) = call(
+        &bridge,
+        Method::POST,
+        &format!("{discard_path}/approve"),
+        Some(&token),
+        Some(json!({"sha256": draft["sha256"], "approvalToken": draft["approvalToken"]})),
+    )
+    .await;
+    assert_eq!(status, 409, "a discarded draft can never be approved");
+    let (status, body, sent) = call(
+        &bridge,
+        Method::DELETE,
+        "/v1/agent/outbox/synthetic-unknown-draft",
+        Some(&token),
+        None,
+    )
+    .await;
+    rec.http(
+        "error-discard-not-found",
+        "DELETE /v1/agent/outbox/{draftId}",
+        status,
+        body,
+        sent,
+    );
+
     // --- Daemon-wide events ------------------------------------------------
     events.publish_both(
         "connection.status",
@@ -897,4 +964,111 @@ async fn agent_contract_fixtures_match_the_real_daemon_output() {
             "agent contract fixture {name} drifted; review, then rerun with {UPDATE_ENV}=1"
         );
     }
+}
+
+/// Discard is scoped to the session's claimed routes, audited once, purges
+/// the encrypted body, and needs a valid agent bearer.
+#[tokio::test]
+async fn discard_is_route_scoped_audited_and_purges_the_body() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = Paths::under(temp.path().join("bridge"));
+    let mut config = config();
+    config.routes.push(Route {
+        id: "other-route".into(),
+        room_id: room(),
+        agent_name: "sam/other".into(),
+        allowed_senders: vec![sender()],
+        receive: Receive::Addressed,
+        workspace: "/synthetic/elsewhere".into(),
+    });
+    let mirror = SharedMirror::new(Mirror::in_memory([78_u8; 32]).unwrap());
+    let config = Arc::new(config);
+    let other_draft = {
+        let config = Arc::clone(&config);
+        mirror
+            .with(move |db| {
+                db.sync_routes(&config.routes)?;
+                db.create_draft(
+                    &config,
+                    "other-route",
+                    None,
+                    "Synthetic other reply\n— 🤖 sam/other",
+                )
+            })
+            .await
+            .unwrap()
+    };
+    let (_connection_tx, connection_rx) = watch::channel(ConnectionStatus::Connected);
+    let server = start(
+        &paths,
+        ApiState::with_config(mirror.clone(), connection_rx, Arc::clone(&config)),
+    )
+    .await
+    .unwrap();
+    let bridge = BridgeClient::new(paths.socket.clone());
+    let (_, claimed, _) = call(
+        &bridge,
+        Method::POST,
+        "/v1/agent/sessions",
+        None,
+        Some(json!({"host":"pi","sessionId":SESSION,"cwd":WORKSPACE,"agentName":AGENT})),
+    )
+    .await;
+    let token = claimed.unwrap()["token"].as_str().unwrap().to_owned();
+    let other_path = format!("/v1/agent/outbox/{}", other_draft.draft_id);
+    let (status, body, _) = call(&bridge, Method::DELETE, &other_path, Some(&token), None).await;
+    assert_eq!(status, 403);
+    assert_eq!(body.unwrap()["code"], "not_routed");
+    let (status, _, _) = call(&bridge, Method::DELETE, &other_path, None, None).await;
+    assert_eq!(status, 401);
+
+    let (_, own, _) = call(
+        &bridge,
+        Method::POST,
+        "/v1/agent/outbox",
+        Some(&token),
+        Some(json!({"routeId": ROUTE, "markdown": "Synthetic own reply\n— 🤖 sam/coder"})),
+    )
+    .await;
+    let own_id = own.unwrap()["draftId"].as_str().unwrap().to_owned();
+    let (status, _, _) = call(
+        &bridge,
+        Method::DELETE,
+        &format!("/v1/agent/outbox/{own_id}"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let other_id = other_draft.draft_id.clone();
+    let (own_state, other_state, body_len, audits) = mirror
+        .with(move |db| {
+            let state = |id: &str| -> anyhow::Result<String> {
+                Ok(db.conn.query_row(
+                    "SELECT state FROM outbox WHERE draft_id=?1",
+                    [id],
+                    |row| row.get(0),
+                )?)
+            };
+            let own_state = state(&own_id)?;
+            let other_state = state(&other_id)?;
+            let body_len: i64 = db.conn.query_row(
+                "SELECT length(body_ct)+length(body_nonce) FROM outbox WHERE draft_id=?1",
+                [&own_id],
+                |row| row.get(0),
+            )?;
+            let audits: i64 = db.conn.query_row(
+                "SELECT COUNT(*) FROM audit WHERE action='outbox_discard' AND ref=?1",
+                [&own_id],
+                |row| row.get(0),
+            )?;
+            Ok((own_state, other_state, body_len, audits))
+        })
+        .await
+        .unwrap();
+    assert_eq!(own_state, "discarded");
+    assert_eq!(other_state, "pending", "another route's draft is untouched");
+    assert_eq!(body_len, 0, "the discarded body is purged");
+    assert_eq!(audits, 1);
+    server.shutdown().await.unwrap();
 }

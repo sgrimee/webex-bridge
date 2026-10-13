@@ -359,6 +359,43 @@ impl Mirror {
         self.push_outbox_event(draft_id, "delivery-unknown")
     }
 
+    /// Discard one pending draft of a claimed route: it can never be approved
+    /// afterwards, and its encrypted body is purged. Returns `None` for an
+    /// unknown draft, `Some(false)` when it is no longer pending (nothing
+    /// changes), and errors for a draft of an unclaimed route.
+    pub fn discard_draft(&mut self, route_ids: &[String], draft_id: &str) -> Result<Option<bool>> {
+        let route_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT route_id FROM outbox WHERE draft_id=?1",
+                [draft_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(route_id) = route_id else {
+            return Ok(None);
+        };
+        if !route_ids.iter().any(|claimed| claimed == &route_id) {
+            bail!("Draft is not available to this agent session");
+        }
+        let tx = self.conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE outbox SET state='discarded',body_ct=X'',body_nonce=X''
+             WHERE draft_id=?1 AND state='pending'",
+            [draft_id],
+        )?;
+        if changed == 0 {
+            return Ok(Some(false));
+        }
+        tx.execute(
+            "INSERT INTO audit(ts,scope,action,ref,detail_redacted) VALUES (?1,'agent','outbox_discard',?2,NULL)",
+            params![Utc::now().to_rfc3339(), draft_id],
+        )?;
+        tx.commit()?;
+        self.push_outbox_event(draft_id, "discarded")?;
+        Ok(Some(true))
+    }
+
     /// Return status only for drafts belonging to routes claimed by this host.
     pub fn draft_status(
         &self,

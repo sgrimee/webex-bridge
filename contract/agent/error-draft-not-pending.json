@@ -1,0 +1,13 @@
+{
+  "kind": "http",
+  "request": {
+    "route": "DELETE /v1/agent/outbox/{draftId}"
+  },
+  "response": {
+    "body": {
+      "code": "draft_not_pending",
+      "message": "Only a pending draft can be discarded"
+    },
+    "status": 409
+  }
+}

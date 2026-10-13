@@ -468,6 +468,47 @@ async fn outbox_status(
     }
 }
 
+/// Discard a pending draft of a claimed route (for example when the local
+/// user cancels its approval dialog). Only `pending` can be discarded.
+async fn discard_draft(
+    State(state): State<ApiState>,
+    Extension(peer): Extension<auth::PeerIdentity>,
+    Path(draft_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let route_ids = match claimed_routes(&state, peer, &headers) {
+        Ok(routes) => routes,
+        Err(error) => return session_error(error),
+    };
+    match state
+        .mirror()
+        .with(|db| {
+            let outcome = db.discard_draft(&route_ids, &draft_id)?;
+            Ok((outcome, db.take_agent_events()))
+        })
+        .await
+    {
+        Ok((outcome, agent_events)) => {
+            // Publish whatever the mirror drained, never drop other queued events.
+            state.events().publish_agent_events(agent_events);
+            match outcome {
+                Some(true) => Json(serde_json::json!({ "state": "discarded" })).into_response(),
+                Some(false) => json_error(
+                    StatusCode::CONFLICT,
+                    "draft_not_pending",
+                    "Only a pending draft can be discarded",
+                ),
+                None => json_error(StatusCode::NOT_FOUND, "not_routed", "Draft was not found"),
+            }
+        }
+        Err(_) => json_error(
+            StatusCode::FORBIDDEN,
+            "not_routed",
+            "Draft is not route-scoped",
+        ),
+    }
+}
+
 /// One fixed 404 body for every unavailable preview, so cases are
 /// indistinguishable to the caller.
 fn preview_not_found() -> Response {
@@ -538,7 +579,10 @@ pub fn router() -> Router<ApiState> {
         .route("/v1/agent/inbox/{delivery_id}/accept", post(accept_inbox))
         .route("/v1/agent/inbox/{delivery_id}/reject", post(reject_inbox))
         .route("/v1/agent/outbox", post(create_draft))
-        .route("/v1/agent/outbox/{draft_id}", get(outbox_status))
+        .route(
+            "/v1/agent/outbox/{draft_id}",
+            get(outbox_status).delete(discard_draft),
+        )
         .route("/v1/agent/outbox/{draft_id}/approve", post(approve_draft))
 }
 

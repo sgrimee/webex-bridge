@@ -49,6 +49,9 @@ pub struct Delivery {
 pub struct DeliveryPreview {
     /// Stable opaque delivery ID.
     pub id: String,
+    /// Canonical Webex message ID of this delivery, for host-side threading
+    /// and handles. Hosts must not show it to the model.
+    pub message_id: String,
     /// Configured route, not a room ID.
     pub route_id: String,
     /// Revision being previewed.
@@ -167,6 +170,9 @@ impl PendingAgentEvents {
 pub struct AcceptedDelivery {
     /// Stable opaque delivery ID.
     pub id: String,
+    /// Canonical Webex message ID of this delivery, for host-side threading
+    /// and handles. Hosts must not show it to the model.
+    pub message_id: String,
     /// Configured route, not a room ID.
     pub route_id: String,
     /// Canonical sender Webex person ID.
@@ -630,6 +636,7 @@ impl Mirror {
         self.audit_preview(&key)?;
         Ok(Some(DeliveryPreview {
             id: key.encode(),
+            message_id: key.message_id.clone(),
             route_id: key.route_id,
             revision: key.revision,
             created_at: released.created_at,
@@ -755,6 +762,7 @@ impl Mirror {
         else {
             return Ok(Some(AcceptedDelivery {
                 id: key.encode(),
+                message_id: key.message_id.clone(),
                 route_id: key.route_id,
                 sender_id: None,
                 created_at: String::new(),
@@ -766,6 +774,7 @@ impl Mirror {
         };
         Ok(Some(AcceptedDelivery {
             id: key.encode(),
+            message_id: key.message_id.clone(),
             route_id: key.route_id,
             sender_id,
             created_at,
@@ -1216,6 +1225,8 @@ mod tests {
         assert_eq!(accepted.markdown, preview.markdown);
         assert_eq!(accepted.parent_id.as_deref(), Some("parent-message"));
         assert_eq!(accepted.state, "accepted");
+        assert_eq!(accepted.message_id, "message");
+        assert_eq!(preview.message_id, "message");
 
         // Accepted, rejected, other-route, unknown and malformed: all `None`.
         assert!(mirror

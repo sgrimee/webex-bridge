@@ -42,6 +42,11 @@ struct CreateSessionResponse {
     token: String,
     lease_ttl: u64,
     routes: Vec<RouteClaim>,
+    /// The daemon account's opaque Webex person ID, so the agent host can
+    /// recognise its own account as a sender (e.g. refuse to auto-trust it).
+    /// Omitted until the daemon has cached it; no name, email or room data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    self_person_id: Option<String>,
 }
 
 fn json_error(status: StatusCode, code: &'static str, message: &'static str) -> Response {
@@ -158,10 +163,18 @@ async fn create_session(
                 )
             }
         };
+    // Best-effort: an unreadable cached identity is simply omitted.
+    let self_person_id = state
+        .mirror()
+        .with(|db| db.account_person_id())
+        .await
+        .ok()
+        .flatten();
     Json(CreateSessionResponse {
         token,
         lease_ttl: LEASE_TTL.as_secs(),
         routes: route_ids.into_iter().map(|id| RouteClaim { id }).collect(),
+        self_person_id,
     })
     .into_response()
 }

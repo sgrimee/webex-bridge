@@ -411,6 +411,8 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"));
         assert!(response.contains("\"routes\":[{\"id\":\"agents-social\"}]"));
         assert!(!response.contains("room-id-is-not-returned"));
+        // No cached daemon account yet: the optional field is omitted.
+        assert!(!response.contains("selfPersonId"));
         let token =
             serde_json::from_str::<serde_json::Value>(response.split("\r\n\r\n").nth(1).unwrap())
                 .unwrap()["token"]
@@ -996,6 +998,55 @@ mod tests {
             .await
             .unwrap();
         assert!(pending.iter().any(|delivery| delivery.id == held));
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_claim_reports_only_the_cached_account_person_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(temp.path().join("bridge"));
+        let mut config = Config::default();
+        config.routes.push(Route {
+            id: "agents-social".into(),
+            room_id: "room-id-is-not-returned".into(),
+            agent_name: "sam/coder".into(),
+            allowed_senders: Vec::new(),
+            receive: Receive::Addressed,
+            workspace: "/workspace".into(),
+        });
+        let mirror = SharedMirror::new(Mirror::in_memory([87_u8; 32]).unwrap());
+        mirror
+            .with(|db| {
+                db.cache_account_identity(&webex::Person {
+                    id: "account-person".into(),
+                    display_name: "Private Account Name".into(),
+                    emails: vec!["private@example.test".into()],
+                    ..webex::Person::default()
+                })
+            })
+            .await
+            .unwrap();
+        let (_connection_tx, connection_rx) = watch::channel(ConnectionStatus::Connected);
+        let server = start(
+            &paths,
+            ApiState::with_config(mirror, connection_rx, Arc::new(config)),
+        )
+        .await
+        .unwrap();
+        let body = r#"{"host":"pi","sessionId":"test-session","cwd":"/workspace","agentName":"sam/coder"}"#;
+        let session = request(
+            &paths.socket,
+            format!("POST /v1/agent/sessions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()),
+        )
+        .await;
+        assert_eq!(response_status(&session), Some(200));
+        let json = json_body(&session);
+        assert_eq!(json["selfPersonId"], "account-person");
+        let keys: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(keys.len(), 4, "{keys:?}");
+        assert!(!session.contains("Private Account Name"));
+        assert!(!session.contains("private@example.test"));
+        assert!(!session.contains("room-id-is-not-returned"));
         server.shutdown().await.unwrap();
     }
 

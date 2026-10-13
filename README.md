@@ -12,7 +12,8 @@ daemon exposes a same-user, 0600 HTTP-over-UDS API at `run/bridge.sock`.
 `GET /v1/status` is metadata-only; a paired `ui` session can read the encrypted
 mirror, lazily hydrate one older message page, and directly send, edit, delete
 or leave an allowlisted group room. Agent hosts can create an exclusive,
-process-bound 60-second route lease and use the scoped inbox API: listing is
+process-bound 60-second route lease (the claim response carries only route IDs
+plus, once cached, the daemon account's opaque `selfPersonId`) and use the scoped inbox API: listing is
 metadata-only (plus optional decrypted `senderName`/`roomTitle` display names),
 and remote text enters model context only through an explicit local accept.
 `GET /v1/agent/inbox/{id}/preview` returns the identical sanitized text of a

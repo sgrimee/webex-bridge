@@ -431,6 +431,15 @@ impl Mirror {
                 || self.is_own_outbound(&room_id, &sender_id, &body, account_id.as_deref())?
             {
                 self.audit_filtered_once(&key, "own_outbound")?;
+                // An echo of an ambiguous send proves it reached Webex.
+                self.reconcile_delivery_unknown(
+                    &room_id,
+                    &sender_id,
+                    &body,
+                    account_id.as_deref(),
+                    &message_id,
+                    &created_at,
+                )?;
                 continue;
             }
             if body.len() > config.limits.agent_inbound_max_bytes {
@@ -1873,5 +1882,128 @@ mod tests {
         assert!(batch.lagged);
         assert!(batch.events.is_empty());
         assert_eq!(pending.take(), AgentEventBatch::default());
+    }
+
+    fn outbox_row(mirror: &Mirror, draft_id: &str) -> (String, Option<String>) {
+        mirror
+            .conn
+            .query_row(
+                "SELECT state,webex_message_id FROM outbox WHERE draft_id=?1",
+                [draft_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn an_echo_promotes_a_delivery_unknown_draft_to_sent() {
+        let config = echo_config();
+        let mut mirror = Mirror::in_memory([26; 32]).unwrap();
+        mirror.sync_routes(&config.routes).unwrap();
+        let first = approved_draft(&mut mirror, &config);
+        mirror.mark_delivery_unknown(&first).unwrap();
+        let second = approved_draft(&mut mirror, &config);
+        mirror.mark_delivery_unknown(&second).unwrap();
+        mirror
+            .conn
+            .execute(
+                "UPDATE outbox SET created_at='2026-01-01T00:00:00+00:00' WHERE draft_id=?1",
+                [&first],
+            )
+            .unwrap();
+        mirror.take_agent_events();
+        // One echo of the identical text: the oldest ambiguous attempt is sent.
+        mirror.upsert_message(&echo("echo-1", DRAFT)).unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 0);
+        assert_eq!(
+            outbox_row(&mirror, &first),
+            ("sent".into(), Some("echo-1".into()))
+        );
+        assert_eq!(
+            outbox_row(&mirror, &second),
+            ("delivery-unknown".into(), None)
+        );
+        assert_eq!(
+            mirror.take_agent_events().events,
+            vec![AgentEvent::Outbox {
+                route_id: "r".into(),
+                draft_id: first.clone(),
+                state: "sent",
+            }]
+        );
+        let status = mirror.draft_status(&["r".into()], &first).unwrap().unwrap();
+        assert_eq!(status.state, "sent");
+        // Re-evaluation never promotes twice; a second echo takes the next draft.
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 0);
+        assert_eq!(
+            outbox_row(&mirror, &second),
+            ("delivery-unknown".into(), None)
+        );
+        mirror.upsert_message(&echo("echo-2", DRAFT)).unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 0);
+        assert_eq!(
+            outbox_row(&mirror, &second),
+            ("sent".into(), Some("echo-2".into()))
+        );
+    }
+
+    #[test]
+    fn an_older_or_foreign_message_never_promotes_a_draft() {
+        let config = echo_config();
+        let mut mirror = Mirror::in_memory([27; 32]).unwrap();
+        mirror.sync_routes(&config.routes).unwrap();
+        let draft = approved_draft(&mut mirror, &config);
+        mirror.mark_delivery_unknown(&draft).unwrap();
+        // Created before the draft existed: it cannot be this attempt's echo.
+        let mut older = echo("older", DRAFT);
+        older.created = Some("2000-01-01T00:00:00Z".into());
+        assert!(!mirror
+            .reconcile_delivery_unknown(
+                "room",
+                "person",
+                DRAFT,
+                None,
+                "older",
+                "2000-01-01T00:00:00Z"
+            )
+            .unwrap());
+        mirror.upsert_message(&older).unwrap();
+        // With a known account, another sender's copy never promotes it.
+        mirror
+            .cache_account_identity(&webex::Person {
+                id: "account".into(),
+                display_name: "Me".into(),
+                ..webex::Person::default()
+            })
+            .unwrap();
+        assert!(!mirror
+            .reconcile_delivery_unknown(
+                "room",
+                "person",
+                DRAFT,
+                Some("account"),
+                "x",
+                "2099-01-01T00:00:00Z"
+            )
+            .unwrap());
+        assert_eq!(
+            outbox_row(&mirror, &draft),
+            ("delivery-unknown".into(), None)
+        );
+        // The account's own echo does.
+        assert!(mirror
+            .reconcile_delivery_unknown(
+                "room",
+                "account",
+                DRAFT,
+                Some("account"),
+                "own",
+                "2099-01-01T00:00:00Z"
+            )
+            .unwrap());
+        assert_eq!(
+            outbox_row(&mirror, &draft),
+            ("sent".into(), Some("own".into()))
+        );
     }
 }

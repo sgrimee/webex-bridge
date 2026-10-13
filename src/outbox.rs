@@ -396,6 +396,83 @@ impl Mirror {
         }))
     }
 
+    /// Promote one `delivery-unknown` draft to `sent` when its own echo is
+    /// mirrored: the ambiguous attempt demonstrably reached Webex. The match is
+    /// the same fingerprint used for echo exclusion (exact body hash, or the
+    /// CRLF/trailing-whitespace-normalised decrypted draft), in the same room,
+    /// from the daemon account when known, with an agent trailer, and never
+    /// for a message created before the draft. Identical drafts are matched
+    /// oldest first, one per echo. Returns whether a draft was promoted.
+    pub(crate) fn reconcile_delivery_unknown(
+        &mut self,
+        room_id: &str,
+        sender_id: &str,
+        body: &str,
+        account_id: Option<&str>,
+        message_id: &str,
+        message_created_at: &str,
+    ) -> Result<bool> {
+        if account_id.is_some_and(|account| account != sender_id)
+            || !body
+                .trim_end()
+                .lines()
+                .last()
+                .is_some_and(|line| line.starts_with(AGENT_TRAILER_PREFIX))
+        {
+            return Ok(false);
+        }
+        let Ok(message_created) = DateTime::parse_from_rfc3339(message_created_at) else {
+            return Ok(false);
+        };
+        let candidates = {
+            let mut statement = self.conn.prepare(
+                "SELECT draft_id,sha256,body_ct,body_nonce,created_at FROM outbox
+                 WHERE room_id=?1 AND state='delivery-unknown' AND webex_message_id IS NULL
+                 ORDER BY created_at,draft_id",
+            )?;
+            let rows = statement
+                .query_map([room_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let exact = digest(body.as_bytes());
+        let normalized = normalize_echo(body);
+        for (draft_id, sha256, body_ct, body_nonce, created_at) in candidates {
+            let drafted_before = DateTime::parse_from_rfc3339(&created_at)
+                .is_ok_and(|drafted| drafted <= message_created);
+            if !drafted_before {
+                continue;
+            }
+            let matches = sha256 == exact || {
+                let draft =
+                    self.crypto
+                        .open(&body_ct, &body_nonce, &aad("outbox", "body", &draft_id))?;
+                std::str::from_utf8(&draft).is_ok_and(|draft| normalize_echo(draft) == normalized)
+            };
+            if !matches {
+                continue;
+            }
+            let promoted = self.conn.execute(
+                "UPDATE outbox SET state='sent',webex_message_id=?2
+                 WHERE draft_id=?1 AND state='delivery-unknown' AND webex_message_id IS NULL",
+                params![draft_id, message_id],
+            )?;
+            if promoted == 1 {
+                self.push_outbox_event(&draft_id, "sent")?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn push_outbox_event(&mut self, draft_id: &str, state: &'static str) -> Result<()> {
         let route_id: String = self.conn.query_row(
             "SELECT route_id FROM outbox WHERE draft_id=?1",

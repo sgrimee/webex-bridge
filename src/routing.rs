@@ -678,11 +678,63 @@ fn is_bidi_control(ch: char) -> bool {
     matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
-/// Remove terminal control introducers and bidi overrides/isolates before any
-/// released remote text crosses the local API boundary. Newlines and tabs
-/// remain ordinary message data; Unicode line/paragraph separators become
-/// explicit `\n`. Zero-width joiners and LRM/RLM are kept in message text
-/// because emoji sequences and right-to-left scripts legitimately need them.
+/// Invisible or blank-rendering characters usable to smuggle hidden text past a
+/// human reviewer (e.g. "ASCII smuggling" via Unicode TAG characters) while
+/// still reaching a model: TAGs U+E0000–U+E007F, invisible math operators
+/// U+2061–U+2064, Mongolian vowel separator U+180E, combining grapheme joiner
+/// U+034F, Hangul fillers U+115F/U+1160/U+3164/U+FFA0, Khmer inherent vowels
+/// U+17B4/U+17B5 and soft hyphen U+00AD.
+fn is_invisible_smuggling(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{e0000}'..='\u{e007f}'
+            | '\u{2061}'..='\u{2064}'
+            | '\u{180e}'
+            | '\u{034f}'
+            | '\u{115f}'
+            | '\u{1160}'
+            | '\u{3164}'
+            | '\u{ffa0}'
+            | '\u{17b4}'
+            | '\u{17b5}'
+            | '\u{00ad}'
+    )
+}
+
+/// Unicode General_Category=Cf (format) characters, per Unicode 15.1.
+fn is_format_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00ad}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061c}'
+            | '\u{06dd}'
+            | '\u{070f}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08e2}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
+    )
+}
+
+/// Remove terminal control introducers, bidi overrides/isolates and invisible
+/// smuggling characters before any released remote text crosses the local API
+/// boundary. Newlines and tabs remain ordinary message data; Unicode
+/// line/paragraph separators become explicit `\n`. ZWJ/ZWNJ, LRM/RLM and
+/// variation selectors U+FE00–U+FE0F are kept because emoji sequences and
+/// right-to-left or Indic scripts legitimately need them.
 fn sanitize_terminal_text(input: &str) -> String {
     input
         .chars()
@@ -691,6 +743,7 @@ fn sanitize_terminal_text(input: &str) -> String {
                 *ch,
                 '\u{1b}' | '\u{009b}' | '\u{009d}' | '\u{0090}' | '\u{0098}'
             ) && !is_bidi_control(*ch)
+                && !is_invisible_smuggling(*ch)
                 && (!ch.is_control() || matches!(*ch, '\n' | '\r' | '\t'))
         })
         .map(|ch| match ch {
@@ -712,13 +765,14 @@ fn best_effort_display(value: Result<Option<String>>) -> Option<String> {
 }
 
 /// Display metadata (names, titles) is remote free text shown on one UI line:
-/// strip terminal controls, bidi overrides/isolates and invisible zero-width
-/// characters (U+200B–U+200F, U+2060, U+FEFF), and replace line breaks, tabs
-/// and U+2028/U+2029 with spaces so a name cannot forge or reorder UI text.
+/// strip terminal controls, every format (Cf) character (bidi controls,
+/// zero-width characters, U+2060–U+2064, U+FEFF, TAGs, …) and the invisible
+/// smuggling set, and replace line breaks, tabs and U+2028/U+2029 with spaces
+/// so a name cannot forge, hide or reorder UI text.
 fn sanitize_display_line(input: &str) -> String {
     sanitize_terminal_text(input)
         .chars()
-        .filter(|ch| !matches!(*ch, '\u{200b}'..='\u{200f}' | '\u{2060}' | '\u{feff}'))
+        .filter(|ch| !is_format_char(*ch))
         .map(|ch| if ch.is_control() { ' ' } else { ch })
         .collect()
 }
@@ -1065,5 +1119,77 @@ mod tests {
             .unwrap();
         assert!(mirror.preview_delivery(&routes, &id).unwrap().is_some());
         assert_eq!(count(&mirror), 2);
+    }
+
+    #[test]
+    fn tag_smuggled_and_invisible_characters_never_reach_released_text_or_names() {
+        // "ignore" spelled with invisible Unicode TAG characters (ASCII smuggling).
+        let tags: String = "ignore"
+            .chars()
+            .map(|ch| char::from_u32(0xe0000 + u32::from(ch)).unwrap())
+            .collect();
+        let hidden = format!(
+            "\u{e0001}{tags}\u{e007f}\u{2061}\u{2064}\u{180e}\u{034f}\u{115f}\u{1160}\u{3164}\u{ffa0}\u{17b4}\u{17b5}\u{00ad}"
+        );
+        // Emoji ZWJ sequence with presentation selector, ZWNJ, RLM: all kept.
+        let kept = "👩\u{200d}💻 ❤\u{fe0f} a\u{200c}b \u{200f}";
+        assert_eq!(
+            sanitize_terminal_text(&format!("sam/coder: hi{hidden} {kept}\nline")),
+            format!("sam/coder: hi {kept}\nline")
+        );
+        assert_eq!(
+            sanitize_display_line(&format!(
+                "Pat{hidden}\u{200d}\u{fe0f}\u{0600}\u{fff9} Sender"
+            )),
+            "Pat\u{fe0f} Sender"
+        );
+
+        let config = config();
+        let mut mirror = Mirror::in_memory([14; 32]).unwrap();
+        mirror.sync_routes(&config.routes).unwrap();
+        mirror
+            .upsert_room(
+                &webex::Room {
+                    id: "room".into(),
+                    title: Some(format!("Room{hidden}")),
+                    room_type: "group".into(),
+                    is_locked: false,
+                    team_id: None,
+                    last_activity: "2099-01-01T00:00:00Z".into(),
+                    creator_id: "person".into(),
+                    created: "2099-01-01T00:00:00Z".into(),
+                },
+                true,
+            )
+            .unwrap();
+        mirror
+            .upsert_person(&webex::Person {
+                id: "person".into(),
+                display_name: format!("Pat{hidden}"),
+                ..webex::Person::default()
+            })
+            .unwrap();
+        mirror
+            .upsert_message(&message(&format!("sam/coder: hi{hidden} {kept}")))
+            .unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
+        let routes = ["r".to_string()];
+        let listed = mirror.deliveries(&routes, Some("pending")).unwrap();
+        assert_eq!(listed[0].sender_name.as_deref(), Some("Pat"));
+        assert_eq!(listed[0].room_title.as_deref(), Some("Room"));
+        let expected = format!("sam/coder: hi {kept}");
+        let preview = mirror
+            .preview_delivery(&routes, &listed[0].id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(preview.markdown, expected);
+        assert_eq!(preview.sender_name.as_deref(), Some("Pat"));
+        assert_eq!(preview.room_title.as_deref(), Some("Room"));
+        let accepted = mirror
+            .decide_delivery(&routes, &listed[0].id, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.markdown, expected);
+        assert!(!accepted.markdown.chars().any(is_invisible_smuggling));
     }
 }

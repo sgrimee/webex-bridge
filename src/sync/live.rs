@@ -170,14 +170,27 @@ async fn reconcile_recent(
     outcome
 }
 
+/// Outcome of re-reading one known message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Checked {
+    Present {
+        edited: bool,
+    },
+    Deleted,
+    /// Two 404s, but the room itself is now unavailable (e.g. membership lost
+    /// mid-pass): the absence says nothing about the message. Nothing purged.
+    RoomGone,
+}
+
 /// Re-read one known message: an edit is upserted, a confirmed absence (two
-/// 404s) is tombstoned. Returns `(edited, deleted)`.
+/// 404s) is tombstoned only after the room is re-confirmed available, so a
+/// membership loss during a long pass never purges bodies.
 async fn check_message(
     mirror: &SharedMirror,
     rest: &WebexRest,
     room_id: &str,
     id: &str,
-) -> Result<(bool, bool)> {
+) -> Result<Checked> {
     let current = match rest.message(id).await? {
         Some(message) => Some(message),
         None => {
@@ -193,10 +206,19 @@ async fn check_message(
             mirror.with(|db| db.upsert_message(&message)).await?,
             Upsert::Edited(_)
         );
-        Ok((edited, false))
+        Ok(Checked::Present { edited })
     } else {
+        // Irreversible next: re-confirm the room first. A transport error
+        // propagates, which also purges nothing.
+        if rest.room(room_id).await?.is_none() {
+            return Ok(Checked::RoomGone);
+        }
         let deleted = mirror.with(|db| db.mark_deleted(room_id, id)).await?;
-        Ok((false, deleted))
+        Ok(if deleted {
+            Checked::Deleted
+        } else {
+            Checked::Present { edited: false }
+        })
     }
 }
 
@@ -220,9 +242,11 @@ async fn reconcile_room_inner(
         deleted: 0,
     };
     for (id, _) in &recent {
-        let (edited, deleted) = check_message(mirror, rest, room_id, id).await?;
-        result.edited += usize::from(edited);
-        result.deleted += usize::from(deleted);
+        match check_message(mirror, rest, room_id, id).await? {
+            Checked::Present { edited } => result.edited += usize::from(edited),
+            Checked::Deleted => result.deleted += 1,
+            Checked::RoomGone => bail!("Room became unavailable; cannot infer message deletions"),
+        }
         result.checked += 1;
     }
     // A full window may hide older messages: queue a paced sweep below it.
@@ -301,9 +325,20 @@ pub async fn sweep_step(
         if index > 0 {
             sleep(pause).await;
         }
-        let (edited, deleted) = check_message(mirror, rest, &sweep.room_id, id).await?;
-        step.edited += usize::from(edited);
-        step.deleted += usize::from(deleted);
+        match check_message(mirror, rest, &sweep.room_id, id).await? {
+            Checked::Present { edited } => step.edited += usize::from(edited),
+            Checked::Deleted => step.deleted += 1,
+            // Like a room unavailable at the start of a step: end the sweep
+            // without inferring anything; a later reconcile can request it.
+            Checked::RoomGone => {
+                let done = sweep.clone();
+                mirror
+                    .with(move |db| db.advance_room_sweep(&done, None))
+                    .await?;
+                step.finished = true;
+                return Ok(Some(step));
+            }
+        }
         step.checked += 1;
         let (progress, created, id) = (sweep.clone(), created_at.clone(), id.clone());
         mirror
@@ -923,6 +958,106 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("revised body")
+        );
+    }
+
+    /// A room that answers its first `rooms` GET and then 404s (membership
+    /// lost mid-pass), plus `count` synthetic messages that all 404.
+    async fn room_lost_after_first_check(
+        seed: u8,
+        count: usize,
+    ) -> (MockServer, WebexRest, SharedMirror, String, Vec<String>) {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let server = MockServer::start().await;
+        let room_id =
+            STANDARD_NO_PAD.encode("ciscospark://us/ROOM/00000000-0000-4000-8000-000000000077");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let answer = room_id.clone();
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/rooms/{room_id}")))
+            .respond_with(move |_: &wiremock::Request| {
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(200).set_body_json(room(&answer))
+                } else {
+                    ResponseTemplate::new(404)
+                }
+            })
+            .mount(&server)
+            .await;
+        let ids = (1..=count)
+            .map(|n| {
+                STANDARD_NO_PAD.encode(format!(
+                    "ciscospark://us/MESSAGE/00000000-0000-4000-8000-{:012}",
+                    700 + n
+                ))
+            })
+            .collect::<Vec<_>>();
+        for id in &ids {
+            Mock::given(method("GET"))
+                .and(path(format!("/v1/messages/{id}")))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+        }
+        let rest =
+            WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
+        let mut mirror = Mirror::in_memory([seed; 32]).unwrap();
+        mirror.upsert_room(&room(&room_id), true).unwrap();
+        for (index, id) in ids.iter().enumerate() {
+            let mut message = msg(id, &room_id, "keep me", None);
+            message.created = Some(format!("2026-10-08T12:00:0{index}Z"));
+            mirror.upsert_message(&message).unwrap();
+        }
+        (server, rest, SharedMirror::new(mirror), room_id, ids)
+    }
+
+    async fn bodies_kept(mirror: &SharedMirror, ids: &[String]) -> bool {
+        for id in ids {
+            let id = id.clone();
+            if mirror
+                .with(move |db| db.message_body(&id))
+                .await
+                .unwrap()
+                .is_none()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[tokio::test]
+    async fn reconcile_purges_nothing_when_the_room_disappears_mid_pass() {
+        let (_server, rest, mirror, room_id, ids) = room_lost_after_first_check(61, 3).await;
+        let error = reconcile_room(&mirror, &rest, &room_id).await.unwrap_err();
+        assert!(error.to_string().contains("cannot infer message deletions"));
+        assert!(bodies_kept(&mirror, &ids).await);
+    }
+
+    #[tokio::test]
+    async fn a_sweep_purges_nothing_and_ends_when_the_room_disappears_mid_step() {
+        let (_server, rest, mirror, room_id, ids) = room_lost_after_first_check(62, 3).await;
+        let (room, created, id) = (room_id.clone(), "2026-10-08T12:00:09Z", "newest");
+        mirror
+            .with(move |db| db.request_room_sweep(&room, created, id))
+            .await
+            .unwrap();
+        let step = sweep_step(&mirror, &rest, 20, Duration::ZERO)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((step.checked, step.deleted, step.finished), (0, 0, true));
+        assert!(bodies_kept(&mirror, &ids).await);
+        // The sweep is over, not retried against an unavailable room.
+        assert_eq!(
+            sweep_step(&mirror, &rest, 20, Duration::ZERO)
+                .await
+                .unwrap(),
+            None
         );
     }
 }

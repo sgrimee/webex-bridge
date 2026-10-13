@@ -143,6 +143,19 @@ pub struct UiTeam {
     pub name: Option<String>,
 }
 
+/// A pending background sweep of one room's older messages.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RoomSweep {
+    /// Room being swept.
+    pub room_id: String,
+    /// Creation time of the oldest message already checked.
+    pub cursor_created_at: String,
+    /// ID of the oldest message already checked (tie-breaker).
+    pub cursor_message_id: String,
+    /// Request generation; progress applies only to the same generation.
+    pub generation: String,
+}
+
 /// One paired UI executable. The secret hash is deliberately omitted.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1706,18 +1719,125 @@ impl Mirror {
         Ok(hashes)
     }
 
-    /// The newest `limit` canonical IDs (by creation time) whose latest
-    /// revision is active in a room: the bounded room-reconcile window.
-    pub fn recent_active_message_ids(&self, room_id: &str, limit: usize) -> Result<Vec<String>> {
+    /// The newest `limit` messages (by creation time) whose latest revision is
+    /// active in a room, as `(message_id, created_at)`: the bounded
+    /// room-reconcile window.
+    pub fn recent_active_messages(
+        &self,
+        room_id: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
         let mut statement = self.conn.prepare(
-            "SELECT m.message_id FROM messages m WHERE m.room_id=?1 AND m.status='active'
+            "SELECT m.message_id,m.created_at FROM messages m WHERE m.room_id=?1 AND m.status='active'
              AND m.revision=(SELECT MAX(revision) FROM messages WHERE message_id=m.message_id)
              ORDER BY m.created_at DESC, m.message_id DESC LIMIT ?2",
         )?;
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows = statement.query_map(params![room_id, limit], |row| row.get(0))?;
+        let rows = statement.query_map(params![room_id, limit], |row| {
+            Ok((
+                row.get(0)?,
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            ))
+        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    /// Request (or restart) a paced background sweep of a room's messages
+    /// older than `(created_at, message_id)`. A new request resets the cursor
+    /// and the generation, so an in-progress pass starts over from here.
+    pub fn request_room_sweep(
+        &mut self,
+        room_id: &str,
+        created_at: &str,
+        message_id: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO room_sweep(room_id,cursor_created_at,cursor_message_id,requested_at)
+             VALUES (?1,?2,?3,?4)
+             ON CONFLICT(room_id) DO UPDATE SET cursor_created_at=excluded.cursor_created_at,
+               cursor_message_id=excluded.cursor_message_id,requested_at=excluded.requested_at",
+            params![
+                room_id,
+                created_at,
+                message_id,
+                Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The longest-waiting room sweep, if any.
+    pub fn next_room_sweep(&self) -> Result<Option<RoomSweep>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT room_id,cursor_created_at,cursor_message_id,requested_at FROM room_sweep
+                 ORDER BY requested_at,room_id LIMIT 1",
+                [],
+                |row| {
+                    Ok(RoomSweep {
+                        room_id: row.get(0)?,
+                        cursor_created_at: row.get(1)?,
+                        cursor_message_id: row.get(2)?,
+                        generation: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// The next `limit` active messages strictly older than the sweep cursor,
+    /// newest first, as `(message_id, created_at)`.
+    pub fn room_sweep_batch(
+        &self,
+        sweep: &RoomSweep,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT m.message_id,m.created_at FROM messages m WHERE m.room_id=?1 AND m.status='active'
+             AND m.revision=(SELECT MAX(revision) FROM messages WHERE message_id=m.message_id)
+             AND (m.created_at<?2 OR (m.created_at=?2 AND m.message_id<?3))
+             ORDER BY m.created_at DESC, m.message_id DESC LIMIT ?4",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement.query_map(
+            params![
+                sweep.room_id,
+                sweep.cursor_created_at,
+                sweep.cursor_message_id,
+                limit
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                ))
+            },
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Record progress, or finish the sweep when `next` is `None`. Both apply
+    /// only to the same request generation: a re-request made meanwhile wins.
+    pub fn advance_room_sweep(
+        &mut self,
+        sweep: &RoomSweep,
+        next: Option<(&str, &str)>,
+    ) -> Result<()> {
+        match next {
+            Some((created_at, message_id)) => self.conn.execute(
+                "UPDATE room_sweep SET cursor_created_at=?3,cursor_message_id=?4
+                 WHERE room_id=?1 AND requested_at=?2",
+                params![sweep.room_id, sweep.generation, created_at, message_id],
+            )?,
+            None => self.conn.execute(
+                "DELETE FROM room_sweep WHERE room_id=?1 AND requested_at=?2",
+                params![sweep.room_id, sweep.generation],
+            )?,
+        };
+        Ok(())
     }
 
     /// Canonical IDs whose latest revision is active in a room. Reconcile only on events/outage.
@@ -1854,6 +1974,55 @@ mod tests {
             updated: updated.map(str::to_owned),
             ..Message::default()
         }
+    }
+
+    #[test]
+    fn room_sweep_requests_restart_and_ignore_stale_progress() {
+        let mut mirror = Mirror::in_memory([39_u8; 32]).unwrap();
+        for (id, created) in [
+            ("a", "2026-10-08T12:00:01Z"),
+            ("b", "2026-10-08T12:00:02Z"),
+            ("c", "2026-10-08T12:00:02Z"),
+            ("d", "2026-10-08T12:00:03Z"),
+        ] {
+            let mut message = message(id, "body", None);
+            message.created = Some(created.into());
+            mirror.upsert_message(&message).unwrap();
+        }
+        assert_eq!(mirror.next_room_sweep().unwrap(), None);
+        mirror
+            .request_room_sweep("room-1", "2026-10-08T12:00:03Z", "d")
+            .unwrap();
+        let sweep = mirror.next_room_sweep().unwrap().unwrap();
+        // Older than the cursor, newest first, with a stable tie-breaker.
+        let batch = mirror.room_sweep_batch(&sweep, 10).unwrap();
+        assert_eq!(
+            batch.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            ["c", "b", "a"]
+        );
+        mirror
+            .advance_room_sweep(&sweep, Some(("2026-10-08T12:00:02Z", "b")))
+            .unwrap();
+        let resumed = mirror.next_room_sweep().unwrap().unwrap();
+        assert_eq!(
+            mirror.room_sweep_batch(&resumed, 10).unwrap(),
+            vec![("a".to_string(), "2026-10-08T12:00:01Z".to_string())]
+        );
+        // A re-request mid-sweep restarts the pass; stale progress and a
+        // stale finish from the old generation are ignored.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        mirror
+            .request_room_sweep("room-1", "2026-10-08T12:00:03Z", "d")
+            .unwrap();
+        mirror
+            .advance_room_sweep(&resumed, Some(("2026-10-08T12:00:01Z", "a")))
+            .unwrap();
+        mirror.advance_room_sweep(&resumed, None).unwrap();
+        let restarted = mirror.next_room_sweep().unwrap().unwrap();
+        assert_ne!(restarted.generation, resumed.generation);
+        assert_eq!(restarted.cursor_message_id, "d");
+        mirror.advance_room_sweep(&restarted, None).unwrap();
+        assert_eq!(mirror.next_room_sweep().unwrap(), None);
     }
 
     #[test]

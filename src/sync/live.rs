@@ -123,13 +123,19 @@ fn event_room_id(event: &Event, from_delete_target: bool) -> Result<String> {
     Ok(room.id().to_owned())
 }
 
-/// How many of a room's newest active messages a reconcile re-checks. A
-/// Mercury delete names only its room, so every check is one REST GET; a full
-/// pass over a large room blocked its caller for minutes. Deletions are
-/// overwhelmingly of recent messages, mirroring catch-up's newest-first page
-/// semantics. Trade-off: deleting a message older than this window is not
-/// detected; it stays in the mirror until a future full or windowed pass.
+/// How many of a room's newest active messages a reconcile re-checks at once.
+/// A Mercury delete names only its room, so every check is one REST GET; a full
+/// pass over a large room blocked its caller for minutes. When the room has
+/// older messages, the reconcile requests a paced background sweep of them
+/// (see [`sweep_step`]), so an old deletion is still found, just later.
 pub const RECONCILE_RECENT_MESSAGES: usize = 100;
+
+/// Messages checked per background sweep step.
+pub const SWEEP_BATCH: usize = 20;
+
+/// Pause between the REST checks of a background sweep: at most one GET per
+/// second on top of live traffic.
+pub const SWEEP_PAUSE: Duration = Duration::from_secs(1);
 
 /// Recheck a room's newest active messages after a delete signal or reconnect.
 /// A room REST check prevents misclassifying loss of membership as mass deletion.
@@ -164,6 +170,36 @@ async fn reconcile_recent(
     outcome
 }
 
+/// Re-read one known message: an edit is upserted, a confirmed absence (two
+/// 404s) is tombstoned. Returns `(edited, deleted)`.
+async fn check_message(
+    mirror: &SharedMirror,
+    rest: &WebexRest,
+    room_id: &str,
+    id: &str,
+) -> Result<(bool, bool)> {
+    let current = match rest.message(id).await? {
+        Some(message) => Some(message),
+        None => {
+            sleep(Duration::from_millis(200)).await;
+            rest.message(id).await?
+        }
+    };
+    if let Some(message) = current {
+        if message.room_id.as_deref() != Some(room_id) {
+            bail!("REST message room mismatch during reconciliation");
+        }
+        let edited = matches!(
+            mirror.with(|db| db.upsert_message(&message)).await?,
+            Upsert::Edited(_)
+        );
+        Ok((edited, false))
+    } else {
+        let deleted = mirror.with(|db| db.mark_deleted(room_id, id)).await?;
+        Ok((false, deleted))
+    }
+}
+
 async fn reconcile_room_inner(
     mirror: &SharedMirror,
     rest: &WebexRest,
@@ -175,38 +211,117 @@ async fn reconcile_room_inner(
         .await?
         .context("Room unavailable; cannot infer message deletions")?;
     mirror.with(|db| db.upsert_room(&room, true)).await?;
-    let ids = mirror
-        .with(|db| db.recent_active_message_ids(room_id, limit))
+    let recent = mirror
+        .with(|db| db.recent_active_messages(room_id, limit))
         .await?;
     let mut result = ReconcileResult {
         checked: 0,
         edited: 0,
         deleted: 0,
     };
-    for id in ids {
-        let current = match rest.message(&id).await? {
-            Some(message) => Some(message),
-            None => {
-                sleep(Duration::from_millis(200)).await;
-                rest.message(&id).await?
-            }
-        };
-        if let Some(message) = current {
-            if message.room_id.as_deref() != Some(room_id) {
-                bail!("REST message room mismatch during reconciliation");
-            }
-            if matches!(
-                mirror.with(|db| db.upsert_message(&message)).await?,
-                Upsert::Edited(_)
-            ) {
-                result.edited += 1;
-            }
-        } else if mirror.with(|db| db.mark_deleted(room_id, &id)).await? {
-            result.deleted += 1;
-        }
+    for (id, _) in &recent {
+        let (edited, deleted) = check_message(mirror, rest, room_id, id).await?;
+        result.edited += usize::from(edited);
+        result.deleted += usize::from(deleted);
         result.checked += 1;
     }
+    // A full window may hide older messages: queue a paced sweep below it.
+    if recent.len() >= limit {
+        if let Some((oldest_id, oldest_created)) = recent.last() {
+            let (room_id, created, id) = (
+                room_id.to_owned(),
+                oldest_created.clone(),
+                oldest_id.clone(),
+            );
+            mirror
+                .with(move |db| db.request_room_sweep(&room_id, &created, &id))
+                .await?;
+        }
+    }
     Ok(result)
+}
+
+/// Outcome of one background sweep step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SweepStep {
+    /// Room that was swept.
+    pub room_id: String,
+    /// Messages re-read in this step.
+    pub checked: usize,
+    /// Messages found edited.
+    pub edited: usize,
+    /// Messages confirmed deleted and purged.
+    pub deleted: usize,
+    /// Whether the room's sweep is complete.
+    pub finished: bool,
+}
+
+/// Advance the longest-waiting room sweep by at most `batch` messages,
+/// pausing `pause` between REST checks. Progress is persisted after every
+/// message, so a restart resumes where it stopped. Returns `None` when no
+/// sweep is pending. Run it off the live handler.
+pub async fn sweep_step(
+    mirror: &SharedMirror,
+    rest: &WebexRest,
+    batch: usize,
+    pause: Duration,
+) -> Result<Option<SweepStep>> {
+    let Some(sweep) = mirror.with(|db| db.next_room_sweep()).await? else {
+        return Ok(None);
+    };
+    let mut step = SweepStep {
+        room_id: sweep.room_id.clone(),
+        checked: 0,
+        edited: 0,
+        deleted: 0,
+        finished: false,
+    };
+    // Never infer deletions for a room that is no longer available.
+    if rest.room(&sweep.room_id).await?.is_none() {
+        let done = sweep.clone();
+        mirror
+            .with(move |db| db.advance_room_sweep(&done, None))
+            .await?;
+        step.finished = true;
+        return Ok(Some(step));
+    }
+    let lookup = sweep.clone();
+    let messages = mirror
+        .with(move |db| db.room_sweep_batch(&lookup, batch))
+        .await?;
+    if messages.is_empty() {
+        let done = sweep.clone();
+        mirror
+            .with(move |db| db.advance_room_sweep(&done, None))
+            .await?;
+        step.finished = true;
+        return Ok(Some(step));
+    }
+    for (index, (id, created_at)) in messages.iter().enumerate() {
+        if index > 0 {
+            sleep(pause).await;
+        }
+        let (edited, deleted) = check_message(mirror, rest, &sweep.room_id, id).await?;
+        step.edited += usize::from(edited);
+        step.deleted += usize::from(deleted);
+        step.checked += 1;
+        let (progress, created, id) = (sweep.clone(), created_at.clone(), id.clone());
+        mirror
+            .with(move |db| db.advance_room_sweep(&progress, Some((&created, &id))))
+            .await?;
+    }
+    if messages.len() < batch {
+        let done = sweep.clone();
+        mirror
+            .with(move |db| db.advance_room_sweep(&done, None))
+            .await?;
+        step.finished = true;
+    }
+    diagnostics::debug(format_args!(
+        "sync.sweep checked={} edited={} deleted={} finished={}",
+        step.checked, step.edited, step.deleted, step.finished
+    ));
+    Ok(Some(step))
 }
 
 /// Hydrate one Mercury event, encrypt changes, and return metadata-only outcome.
@@ -656,6 +771,95 @@ mod tests {
             .unwrap()
             .is_some());
         assert_eq!(RECONCILE_RECENT_MESSAGES, 100);
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn a_paced_sweep_eventually_covers_older_history_and_resumes() {
+        let server = MockServer::start().await;
+        let room_id =
+            "Y2lzY29zcGFyazovL3VzL1JPT00vMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDBhMDAx";
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/rooms/{room_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(room(room_id)))
+            .mount(&server)
+            .await;
+        // Six messages, oldest first. Remotely, #0 and #3 are deleted and the
+        // others unchanged.
+        let ids = (1..=6)
+            .map(|n| {
+                STANDARD_NO_PAD.encode(format!(
+                    "ciscospark://us/MESSAGE/00000000-0000-4000-8000-{n:012}"
+                ))
+            })
+            .collect::<Vec<_>>();
+        let created = |index: usize| format!("2026-10-08T12:00:0{index}Z");
+        for (index, id) in ids.iter().enumerate() {
+            let response = if index == 0 || index == 3 {
+                ResponseTemplate::new(404)
+            } else {
+                let mut message = msg(id, room_id, "body", None);
+                message.created = Some(created(index));
+                ResponseTemplate::new(200).set_body_json(message)
+            };
+            Mock::given(method("GET"))
+                .and(path(format!("/v1/messages/{id}")))
+                .respond_with(response)
+                .mount(&server)
+                .await;
+        }
+        let rest =
+            WebexRest::for_tests(Url::parse(&format!("{}/v1/", server.uri())).unwrap()).unwrap();
+        let mut mirror = Mirror::in_memory([38_u8; 32]).unwrap();
+        mirror.upsert_room(&room(room_id), true).unwrap();
+        for (index, id) in ids.iter().enumerate() {
+            let mut message = msg(id, room_id, "body", None);
+            message.created = Some(created(index));
+            mirror.upsert_message(&message).unwrap();
+        }
+        let mirror = SharedMirror::new(mirror);
+
+        // Nothing to sweep yet.
+        assert_eq!(
+            sweep_step(&mirror, &rest, 2, Duration::ZERO).await.unwrap(),
+            None
+        );
+        // The bounded reconcile checks the newest two (#5, #4) and queues a
+        // sweep below them.
+        let result = reconcile_recent(&mirror, &rest, room_id, 2).await.unwrap();
+        assert_eq!((result.checked, result.deleted), (2, 0));
+
+        // Batches of two, resuming from the persisted cursor each step.
+        let first = sweep_step(&mirror, &rest, 2, Duration::ZERO)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (first.checked, first.deleted, first.finished),
+            (2, 1, false)
+        );
+        let second = sweep_step(&mirror, &rest, 2, Duration::ZERO)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (second.checked, second.deleted, second.finished),
+            (2, 1, false)
+        );
+        let last = sweep_step(&mirror, &rest, 2, Duration::ZERO)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((last.checked, last.finished), (0, true));
+        assert_eq!(
+            sweep_step(&mirror, &rest, 2, Duration::ZERO).await.unwrap(),
+            None
+        );
+        for (index, id) in ids.iter().enumerate() {
+            let id = id.clone();
+            let body = mirror.with(move |db| db.message_body(&id)).await.unwrap();
+            assert_eq!(body.is_none(), index == 0 || index == 3, "message {index}");
+        }
     }
 
     #[tokio::test]

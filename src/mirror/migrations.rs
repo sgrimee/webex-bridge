@@ -1,6 +1,6 @@
 //! Atomic SQLite schema migrations.
 
-use super::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6};
+use super::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7};
 use anyhow::{bail, Result};
 use rusqlite::Connection;
 
@@ -63,6 +63,13 @@ fn migrate_v6(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_v7(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute_batch(SCHEMA_V7)?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Apply migrations or reject a database written by newer code.
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -75,32 +82,41 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
             migrate_v3(conn)?;
             migrate_v4(conn)?;
             migrate_v5(conn)?;
-            migrate_v6(conn)
+            migrate_v6(conn)?;
+            migrate_v7(conn)
         }
         1 => {
             migrate_v2(conn)?;
             migrate_v3(conn)?;
             migrate_v4(conn)?;
             migrate_v5(conn)?;
-            migrate_v6(conn)
+            migrate_v6(conn)?;
+            migrate_v7(conn)
         }
         2 => {
             migrate_v3(conn)?;
             migrate_v4(conn)?;
             migrate_v5(conn)?;
-            migrate_v6(conn)
+            migrate_v6(conn)?;
+            migrate_v7(conn)
         }
         3 => {
             migrate_v4(conn)?;
             migrate_v5(conn)?;
-            migrate_v6(conn)
+            migrate_v6(conn)?;
+            migrate_v7(conn)
         }
         4 => {
             migrate_v5(conn)?;
-            migrate_v6(conn)
+            migrate_v6(conn)?;
+            migrate_v7(conn)
         }
-        5 => migrate_v6(conn),
-        6 => Ok(()),
+        5 => {
+            migrate_v6(conn)?;
+            migrate_v7(conn)
+        }
+        6 => migrate_v7(conn),
+        7 => Ok(()),
         _ => bail!("Mirror database schema version {version} is unsupported"),
     }
 }
@@ -119,10 +135,11 @@ mod tests {
         assert!(has_column(&conn, "teams", "name_ct").unwrap());
         assert!(has_column(&conn, "ui_lookup", "checked_at").unwrap());
         assert!(has_column(&conn, "messages", "body_kind").unwrap());
+        assert!(has_column(&conn, "room_sweep", "cursor_message_id").unwrap());
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                 .unwrap(),
-            6
+            7
         );
         conn.execute_batch("PRAGMA user_version=99").unwrap();
         assert!(migrate(&mut conn).is_err());
@@ -157,7 +174,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                 .unwrap(),
-            6
+            7
         );
     }
 
@@ -194,7 +211,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                 .unwrap(),
-            6
+            7
         );
     }
 
@@ -208,7 +225,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                 .unwrap(),
-            6
+            7
         );
     }
 }

@@ -81,6 +81,7 @@ async fn main() -> Result<()> {
     ));
     let background_mirror = mirror.clone();
     let live_dev_room = dev_room.clone();
+    let sweep_connected = connected_rx.clone();
     let sync_task = tokio::spawn(run_sync(
         connected_rx,
         background_mirror,
@@ -89,6 +90,12 @@ async fn main() -> Result<()> {
         events.clone(),
     ));
     diagnostics::debug("daemon.sync_task_started");
+    let sweep_task = tokio::spawn(run_sweeper(
+        sweep_connected,
+        mirror.clone(),
+        Arc::clone(&background_config),
+        events.clone(),
+    ));
     let live_mirror = mirror.clone();
     let live_config = Arc::clone(&background_config);
     let live_events = events.clone();
@@ -156,6 +163,8 @@ async fn main() -> Result<()> {
     .await;
     sync_task.abort();
     let _ = sync_task.await;
+    sweep_task.abort();
+    let _ = sweep_task.await;
     connection_task.abort();
     let _ = connection_task.await;
     api_server.shutdown().await?;
@@ -588,6 +597,63 @@ async fn run_sync(
                 // reconnect publishes a new REST client.
                 connected.changed().await.context("Mercury supervisor stopped")?;
             }
+        }
+    }
+}
+
+/// Background, paced sweep of older room history requested by bounded
+/// reconciles (see `live::sweep_step`). It never runs on the live handler,
+/// makes at most about one REST GET per second, and resumes from its
+/// persisted cursor after a restart. Idle when nothing is requested.
+async fn run_sweeper(
+    mut connected: watch::Receiver<Option<Arc<WebexRest>>>,
+    mirror: SharedMirror,
+    config: Arc<Config>,
+    events: EventBus,
+) {
+    const IDLE: Duration = Duration::from_secs(60);
+    const RETRY: Duration = Duration::from_secs(30);
+    loop {
+        let rest = connected.borrow().clone();
+        let Some(rest) = rest else {
+            if connected.changed().await.is_err() {
+                return;
+            }
+            continue;
+        };
+        let pause =
+            match live::sweep_step(&mirror, &rest, live::SWEEP_BATCH, live::SWEEP_PAUSE).await {
+                Ok(Some(step)) => {
+                    if step.edited != 0 || step.deleted != 0 {
+                        if let Ok(agent_events) = mirror
+                            .with(|db| {
+                                db.queue_new_deliveries(&config)?;
+                                Ok(db.take_agent_events())
+                            })
+                            .await
+                        {
+                            events.publish_agent_events(agent_events);
+                        }
+                        events.publish_ui(
+                            "room.resync",
+                            serde_json::json!({ "roomId": step.room_id, "reason": "reconciled" }),
+                        );
+                    }
+                    live::SWEEP_PAUSE
+                }
+                Ok(None) => IDLE,
+                Err(_) => {
+                    diagnostics::debug("sync.sweep_failed; retrying_later");
+                    RETRY
+                }
+            };
+        tokio::select! {
+            changed = connected.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            () = tokio::time::sleep(pause) => {}
         }
     }
 }

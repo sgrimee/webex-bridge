@@ -134,3 +134,17 @@ PRAGMA user_version=5;
 // `NULL` is deliberate for rows written before B6: their encrypted body is
 // retained but its original text-vs-Markdown provenance is unknowable.
 pub(crate) const SCHEMA_V6: &str = "PRAGMA user_version=6;";
+
+// One row per room whose older history still needs a paced, background
+// delete/edit sweep. The cursor (created_at, message_id) is the oldest message
+// already checked; `requested_at` is the request generation, so a re-request
+// that arrives mid-sweep restarts the pass instead of being lost.
+pub(crate) const SCHEMA_V7: &str = r#"
+CREATE TABLE IF NOT EXISTS room_sweep (
+    room_id TEXT PRIMARY KEY,
+    cursor_created_at TEXT NOT NULL,
+    cursor_message_id TEXT NOT NULL,
+    requested_at TEXT NOT NULL
+);
+PRAGMA user_version=7;
+"#;

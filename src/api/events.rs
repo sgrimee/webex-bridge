@@ -75,6 +75,34 @@ impl Audience {
     }
 }
 
+impl Audience {
+    /// Route label for agent-visible events in metadata-only debug logs:
+    /// `*` for all-agent events, `None` for UI-only events.
+    fn agent_log_route(&self) -> Option<String> {
+        match self {
+            Self::Ui => None,
+            Self::Agents | Self::Both => Some("*".into()),
+            Self::AgentRoute(route_id) => Some(log_route(route_id)),
+        }
+    }
+}
+
+/// Route IDs are local config names, not Webex IDs; still keep the log line
+/// to a bounded, inert character set.
+fn log_route(route_id: &str) -> String {
+    route_id
+        .chars()
+        .take(64)
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
 impl Subscriber {
     const fn required_scope(&self) -> auth::Scope {
         match self {
@@ -122,11 +150,22 @@ impl EventBus {
         let Ok(data) = serde_json::to_string(&data) else {
             return;
         };
-        let _ = self.sender.send(PublishedEvent {
-            audience,
-            name: name.into(),
-            data,
-        });
+        let agent_route = audience.agent_log_route();
+        let receivers = self
+            .sender
+            .send(PublishedEvent {
+                audience,
+                name: name.into(),
+                data,
+            })
+            .unwrap_or(0);
+        if let Some(route) = agent_route {
+            // Metadata only: a static event name, a sanitized route name and
+            // the bus receiver count (all scopes). Never IDs or payloads.
+            crate::diagnostics::debug(format_args!(
+                "agent.event_published name={name} route={route} receivers={receivers}"
+            ));
+        }
     }
 
     /// Notify paired UIs of a metadata-only mirror or connection change.
@@ -288,6 +327,11 @@ fn subscriber(
     }
 }
 
+/// Event names are code-defined constants; bound them anyway.
+fn log_event_name(name: &str) -> String {
+    log_route(name)
+}
+
 /// Yield a terminal session-expired SSE event once, then close on the next
 /// poll without waiting for another daemon event or keepalive interval.
 struct CloseAfterTerminal<S> {
@@ -418,13 +462,28 @@ async fn stream(
             return None;
         }
         match received {
-            Ok(event) if event.audience.permits(&subscriber) => Some(Ok::<SseEvent, Infallible>(
-                SseEvent::default().event(event.name).data(event.data),
-            )),
+            Ok(event) if event.audience.permits(&subscriber) => {
+                if !stream_is_ui {
+                    if let Some(route) = event.audience.agent_log_route() {
+                        crate::diagnostics::debug(format_args!(
+                            "agent.sse_emitted name={} route={route}",
+                            log_event_name(&event.name)
+                        ));
+                    }
+                }
+                Some(Ok::<SseEvent, Infallible>(
+                    SseEvent::default().event(event.name).data(event.data),
+                ))
+            }
             // The broadcast channel intentionally has no replay. Make loss
             // explicit for both scopes so their hosts reload their authorized
             // state rather than silently applying a partial event sequence.
             Err(BroadcastStreamRecvError::Lagged(_)) => {
+                if !stream_is_ui {
+                    crate::diagnostics::debug(format_args!(
+                        "agent.sse_emitted name={RESYNC_REQUIRED_EVENT} route=*"
+                    ));
+                }
                 let data = if stream_is_ui {
                     let continuity = events.continuity();
                     serde_json::json!({
@@ -479,6 +538,24 @@ pub fn router() -> Router<ApiState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_debug_log_labels_are_route_names_only() {
+        assert_eq!(Audience::Ui.agent_log_route(), None);
+        assert_eq!(Audience::Agents.agent_log_route().as_deref(), Some("*"));
+        assert_eq!(Audience::Both.agent_log_route().as_deref(), Some("*"));
+        assert_eq!(
+            Audience::AgentRoute("agents-social".into())
+                .agent_log_route()
+                .as_deref(),
+            Some("agents-social")
+        );
+        // Spaces, `=`, newlines and controls cannot forge extra log fields
+        // or lines, and the label is bounded.
+        assert_eq!(log_route("a b=c\nlevel=WARN\u{1b}"), "a?b?c?level?WARN?");
+        assert_eq!(log_route(&"r".repeat(200)).len(), 64);
+        assert_eq!(log_event_name("inbox.new"), "inbox.new");
+    }
 
     #[tokio::test]
     async fn routes_events_only_to_their_authorized_audience() {

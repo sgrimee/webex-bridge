@@ -128,7 +128,10 @@ and [`docs/events.md`](docs/events.md) for observations.
 room/message IDs, tokens, secrets, or decrypted mirror data. The daemon now
 emits timestamped lifecycle events at normal level (startup, mirror open,
 connect/reconnect, refresh, and sync counts/duration). For additional safe
-progress events, run it with `--debug` or set `WEBEX_BRIDGE_LOG=debug`:
+progress events, run it with `--debug` or set `WEBEX_BRIDGE_LOG=debug`. Debug
+mode also logs each agent-visible bus event (`agent.event_published`, with the
+receiver count) and each agent SSE frame (`agent.sse_emitted`), by event name
+and route name only:
 
 ```sh
 ./target/debug/webex-bridged --debug

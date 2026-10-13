@@ -697,7 +697,13 @@ fn is_bidi_control(ch: char) -> bool {
 fn is_invisible_smuggling(ch: char) -> bool {
     matches!(
         ch,
-        '\u{e0000}'..='\u{e007f}'
+        // Tags plane block: TAGs, Variation Selectors Supplement and the
+        // Default_Ignorable unassigned code points E0000, E0002–E001F,
+        // E0080–E0FFF.
+        '\u{e0000}'..='\u{e0fff}'
+            // Private use: BMP area and supplementary planes 15–16.
+            | '\u{e000}'..='\u{f8ff}'
+            | '\u{f0000}'..='\u{10ffff}'
             | '\u{200b}'
             | '\u{2060}'
             | '\u{feff}'
@@ -711,9 +717,6 @@ fn is_invisible_smuggling(ch: char) -> bool {
             | '\u{17b4}'
             | '\u{17b5}'
             | '\u{00ad}'
-            // Variation Selectors Supplement: no legitimate chat use, and a run
-            // of them can encode an arbitrary hidden byte string.
-            | '\u{e0100}'..='\u{e01ef}'
     )
 }
 
@@ -750,9 +753,10 @@ fn is_format_char(ch: char) -> bool {
     )
 }
 
-/// Remove terminal control introducers, bidi overrides/isolates and invisible
-/// smuggling characters before any released remote text crosses the local API
-/// boundary. Newlines and tabs remain ordinary message data; Unicode
+/// Remove terminal control introducers, every format (Cf) character except
+/// ZWNJ/ZWJ/LRM/RLM, the Tags-plane block, private-use code points and other
+/// invisible smuggling characters before any released remote text crosses the
+/// local API boundary. Newlines and tabs remain ordinary message data; Unicode
 /// line/paragraph separators become explicit `\n`. ZWJ/ZWNJ and LRM/RLM are
 /// kept because emoji sequences and right-to-left or Indic scripts need them.
 /// A variation selector U+FE00–U+FE0F (e.g. emoji presentation FE0F, text
@@ -773,6 +777,9 @@ fn sanitize_terminal_text(input: &str) -> String {
             '\u{1b}' | '\u{009b}' | '\u{009d}' | '\u{0090}' | '\u{0098}'
         ) || is_bidi_control(ch)
             || is_invisible_smuggling(ch)
+            // Every other format (Cf) character too; only ZWNJ/ZWJ/LRM/RLM
+            // have a legitimate script or emoji role in released text.
+            || (is_format_char(ch) && !matches!(ch, '\u{200c}'..='\u{200f}'))
             || (ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
         {
             continue;
@@ -1412,5 +1419,26 @@ mod tests {
             sanitize_display_line("Pat❤\u{fe0f}\u{fe0f}\u{e0101}"),
             "Pat❤\u{fe0f}"
         );
+    }
+
+    #[test]
+    fn released_text_drops_all_format_ignorable_and_private_use_characters() {
+        for code in [
+            0x0600, 0x061c, 0x06dd, 0x070f, 0x08e2, 0x206a, 0x206f, 0xfff9, 0xfffb, 0x110bd,
+            0x13430, 0x1bca0, 0x1d173, // remaining Cf
+            0xe0000, 0xe0002, 0xe001f, 0xe0080, 0xe0fff, // Default_Ignorable Cn
+            0xe000, 0xf8ff, 0xf0000, 0xffffd, 0x100000, 0x10fffd, // private use
+        ] {
+            let ch = char::from_u32(code).unwrap();
+            assert_eq!(
+                sanitize_terminal_text(&format!("a{ch}b")),
+                "ab",
+                "U+{code:04X}"
+            );
+        }
+        // Only ZWNJ, ZWJ, LRM and RLM remain from the format category.
+        let kept = "a\u{200c}b\u{200d}c\u{200e}d\u{200f}e";
+        assert_eq!(sanitize_terminal_text(kept), kept);
+        assert_eq!(sanitize_display_line(kept), "abcde");
     }
 }

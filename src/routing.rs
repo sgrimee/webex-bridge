@@ -10,7 +10,7 @@ use crate::{
     mirror::Mirror,
 };
 use anyhow::{bail, Context, Result};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -249,6 +249,15 @@ impl Mirror {
         let candidates = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         let account_id = self.account_person_id()?;
+        // With retention configured, a message older than the current cutoff
+        // never routes: retention may prune and a later hydrate re-insert it
+        // with a fresh revision, which must not re-queue a decided message.
+        let retention_cutoff = config
+            .webex
+            .retention_max_age
+            .as_deref()
+            .map(|age| crate::sync::catchup::max_age(age).map(|age| Utc::now() - age))
+            .transpose()?;
         let mut queued = Vec::new();
         for (
             route_id,
@@ -270,6 +279,14 @@ impl Mirror {
                 message_id: message_id.clone(),
                 revision,
             };
+            if let Some(cutoff) = retention_cutoff {
+                // Unparseable timestamps fail closed.
+                let within = DateTime::parse_from_rfc3339(&created_at)
+                    .is_ok_and(|created| created.with_timezone(&Utc) >= cutoff);
+                if !within {
+                    continue;
+                }
+            }
             if self.delivery_exists(&key)? {
                 continue;
             }
@@ -1244,33 +1261,43 @@ mod tests {
     }
 
     #[test]
-    fn retention_removes_delivery_metadata_and_rehydrate_never_reuses_a_key() {
-        let config = config();
+    fn retention_never_requeues_a_decided_message_after_prune_and_rehydrate() {
+        let mut config = config();
         let mut mirror = Mirror::in_memory([15; 32]).unwrap();
         mirror.sync_routes(&config.routes).unwrap();
+        // Keep the route creation boundary: this route predates the message.
         mirror
-            .upsert_message(&message("sam/coder: please review"))
+            .conn
+            .execute("UPDATE routes SET created_at='2000-01-01T00:00:00Z'", [])
             .unwrap();
+        let mut old = message("sam/coder: please review");
+        old.created = Some("2001-01-01T00:00:00Z".into());
+        mirror.upsert_message(&old).unwrap();
+        // Without retention it routes and is decided.
         assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
         let routes = ["r".to_string()];
-        let old = mirror.deliveries(&routes, None).unwrap()[0].clone();
-        mirror.decide_delivery(&routes, &old.id, false).unwrap();
-        assert_eq!(mirror.prune_before("2100-01-01T00:00:00Z").unwrap(), 1);
+        let decided = mirror.deliveries(&routes, None).unwrap()[0].clone();
+        mirror.decide_delivery(&routes, &decided.id, false).unwrap();
+        // Retention now applies: prune, then a lazy hydrate stores it again.
+        config.webex.retention_max_age = Some("365d".into());
+        assert_eq!(mirror.prune_before("2002-01-01T00:00:00Z").unwrap(), 1);
         let orphans: i64 = mirror
             .conn
             .query_row("SELECT count(*) FROM deliveries", [], |row| row.get(0))
             .unwrap();
         assert_eq!(orphans, 0, "retention removes pruned delivery metadata");
-        // Lazy hydrate of the same message after retention: new revision, new key.
-        mirror
-            .upsert_message(&message("sam/coder: please review"))
-            .unwrap();
+        mirror.upsert_message(&old).unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 0);
+        assert!(mirror.deliveries(&routes, None).unwrap().is_empty());
+        assert!(mirror
+            .preview_delivery(&routes, &decided.id)
+            .unwrap()
+            .is_none());
+        // A message inside the retention window still routes normally.
+        let mut recent = message("sam/coder: still current");
+        recent.id = Some("recent".into());
+        mirror.upsert_message(&recent).unwrap();
         assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
-        let fresh = mirror.deliveries(&routes, Some("pending")).unwrap();
-        assert_eq!(fresh.len(), 1);
-        assert!(fresh[0].revision > old.revision);
-        assert_ne!(fresh[0].id, old.id);
-        assert!(mirror.preview_delivery(&routes, &old.id).unwrap().is_none());
     }
 
     fn echo_config() -> Config {

@@ -1281,15 +1281,51 @@ mod server_tests {
             .create_ui_session("a-local-ui-secret-that-is-long-enough")
             .await
             .unwrap();
-        let error = ui.team(team_id).await.unwrap_err();
-        assert!(matches!(
-            error,
-            crate::client::ClientError::Api {
-                status: hyper::StatusCode::NOT_FOUND,
-                code,
-                ..
-            } if code == "not_found"
-        ));
+        // Asked twice (a UI re-asks after every snapshot): one REST call, the
+        // second answer comes from the negative cache.
+        for _ in 0..2 {
+            let error = ui.team(team_id).await.unwrap_err();
+            assert!(matches!(
+                error,
+                crate::client::ClientError::Api {
+                    status: hyper::StatusCode::NOT_FOUND,
+                    code,
+                    ..
+                } if code == "not_found"
+            ));
+        }
+        server.shutdown().await.unwrap();
+
+        // A failed lookup is remembered briefly too, with the same answer.
+        let failing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/teams/{team_id}")))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&failing)
+            .await;
+        let rest = Arc::new(
+            crate::sync::history::WebexRest::for_tests(
+                reqwest::Url::parse(&format!("{}/v1/", failing.uri())).unwrap(),
+            )
+            .unwrap(),
+        );
+        let (_temp, server, bridge) = hydrated_rest_server(rest).await;
+        let ui = bridge
+            .create_ui_session("a-local-ui-secret-that-is-long-enough")
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let error = ui.team(team_id).await.unwrap_err();
+            assert!(matches!(
+                error,
+                crate::client::ClientError::Api {
+                    status: hyper::StatusCode::BAD_GATEWAY,
+                    code,
+                    ..
+                } if code == "webex_unavailable"
+            ));
+        }
         server.shutdown().await.unwrap();
     }
 

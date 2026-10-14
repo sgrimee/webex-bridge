@@ -73,6 +73,64 @@ pub struct ApiState {
     rest: Option<watch::Receiver<Option<Arc<WebexRest>>>>,
     /// Held for the whole native pairing dialog: one dialog at a time.
     pairing_dialog: Arc<tokio::sync::Mutex<()>>,
+    /// Recent team lookups that Webex refused or failed (see [`TeamMisses`]).
+    team_misses: TeamMisses,
+}
+
+/// Why a team lookup produced no team.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TeamMiss {
+    /// Webex answered 404/403: the account cannot name this team.
+    NotFound,
+    /// The lookup failed (transport or unexpected status).
+    Unavailable,
+}
+
+/// In-memory negative cache for UI team reads. A UI asks for every team after
+/// each snapshot; without this, each inaccessible team cost one REST call
+/// (about 150-250 ms) every time. Inaccessible teams are remembered for an
+/// hour, failed lookups for a minute; a team that later reaches the mirror is
+/// served from there first. Bounded; the daemon restart clears it.
+#[derive(Clone, Default)]
+pub(crate) struct TeamMisses(
+    Arc<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, TeamMiss)>>>,
+);
+
+const TEAM_NOT_FOUND_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+const TEAM_UNAVAILABLE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+const TEAM_MISSES_MAX: usize = 4096;
+
+impl TeamMisses {
+    fn ttl(miss: TeamMiss) -> std::time::Duration {
+        match miss {
+            TeamMiss::NotFound => TEAM_NOT_FOUND_TTL,
+            TeamMiss::Unavailable => TEAM_UNAVAILABLE_TTL,
+        }
+    }
+
+    /// The remembered miss for this team, if still fresh.
+    pub(crate) fn get(&self, team_id: &str) -> Option<TeamMiss> {
+        let mut misses = self.0.lock().expect("team miss mutex poisoned");
+        match misses.get(team_id) {
+            Some((at, miss)) if at.elapsed() < Self::ttl(*miss) => Some(*miss),
+            Some(_) => {
+                misses.remove(team_id);
+                None
+            }
+            None => None,
+        }
+    }
+
+    pub(crate) fn record(&self, team_id: &str, miss: TeamMiss) {
+        let mut misses = self.0.lock().expect("team miss mutex poisoned");
+        if misses.len() >= TEAM_MISSES_MAX {
+            misses.retain(|_, (at, miss)| at.elapsed() < Self::ttl(*miss));
+            if misses.len() >= TEAM_MISSES_MAX {
+                misses.clear();
+            }
+        }
+        misses.insert(team_id.to_owned(), (std::time::Instant::now(), miss));
+    }
 }
 
 impl ApiState {
@@ -87,6 +145,7 @@ impl ApiState {
             config: Arc::new(Config::default()),
             rest: None,
             pairing_dialog: Arc::default(),
+            team_misses: TeamMisses::default(),
         }
     }
 
@@ -105,6 +164,7 @@ impl ApiState {
             config,
             rest: None,
             pairing_dialog: Arc::default(),
+            team_misses: TeamMisses::default(),
         }
     }
 
@@ -125,7 +185,12 @@ impl ApiState {
             config,
             rest: Some(rest),
             pairing_dialog: Arc::default(),
+            team_misses: TeamMisses::default(),
         }
+    }
+
+    pub(crate) fn team_misses(&self) -> &TeamMisses {
+        &self.team_misses
     }
 
     /// Claim the single pairing-dialog slot, or `None` while another pairing
@@ -1144,6 +1209,28 @@ mod tests {
         assert!(start(&paths, ApiState::new(mirror, connection_rx))
             .await
             .is_err());
+    }
+
+    #[test]
+    fn team_misses_expire_and_stay_bounded() {
+        let misses = TeamMisses::default();
+        assert_eq!(misses.get("team"), None);
+        misses.record("team", TeamMiss::NotFound);
+        assert_eq!(misses.get("team"), Some(TeamMiss::NotFound));
+        // An expired entry is dropped on read.
+        misses.0.lock().unwrap().insert(
+            "old".into(),
+            (
+                std::time::Instant::now() - TEAM_UNAVAILABLE_TTL - Duration::from_secs(1),
+                TeamMiss::Unavailable,
+            ),
+        );
+        assert_eq!(misses.get("old"), None);
+        assert!(!misses.0.lock().unwrap().contains_key("old"));
+        for n in 0..TEAM_MISSES_MAX + 10 {
+            misses.record(&format!("t{n}"), TeamMiss::NotFound);
+        }
+        assert!(misses.0.lock().unwrap().len() <= TEAM_MISSES_MAX);
     }
 
     #[tokio::test]

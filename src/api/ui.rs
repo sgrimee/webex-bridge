@@ -509,12 +509,39 @@ async fn team(
         }
     }
 
+    // A recent refusal or failure is answered again without a REST call.
+    match state.team_misses().get(&team_id) {
+        Some(super::TeamMiss::NotFound) => {
+            return json_error(StatusCode::NOT_FOUND, "not_found", "Team was not found")
+        }
+        Some(super::TeamMiss::Unavailable) => {
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                "webex_unavailable",
+                "Webex team lookup failed",
+            )
+        }
+        None => {}
+    }
+
     // A cache miss makes exactly one daemon-owned REST request. The UI never
     // receives a Webex capability or performs its own unbounded lookup.
     let Some(rest) = state.rest() else {
         return json_error(StatusCode::NOT_FOUND, "not_found", "Team was not found");
     };
-    match rest.team(&team_id).await {
+    let fetched = rest.team(&team_id).await;
+    match &fetched {
+        Ok(None) => state
+            .team_misses()
+            .record(&team_id, super::TeamMiss::NotFound),
+        // Authentication problems are global and resolved elsewhere; never
+        // remember them as this team's state.
+        Err(error) if !error.to_string().contains("auth_required") => state
+            .team_misses()
+            .record(&team_id, super::TeamMiss::Unavailable),
+        _ => {}
+    }
+    match fetched {
         Ok(Some(team)) if team.id == team_id => match state
             .mirror()
             .with(|db| {

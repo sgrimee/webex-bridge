@@ -32,8 +32,9 @@ pub struct Delivery {
     pub revision: i64,
     /// Pending, accepted or rejected; only requested states are returned.
     pub state: String,
-    /// Whether Webex reports this revision as edited (it has an `updated`
-    /// time). Hosts can refuse to act on a message changed after review.
+    /// Whether the message was ever edited: Webex reports an `updated` time
+    /// for this revision. Hosts can refuse to act on a message changed after
+    /// review.
     pub edited: bool,
     /// Decrypted sender display name from the people mirror, when known.
     /// Local display metadata only; never message text.
@@ -59,8 +60,9 @@ pub struct DeliveryPreview {
     pub route_id: String,
     /// Revision being previewed.
     pub revision: i64,
-    /// Whether Webex reports this revision as edited (it has an `updated`
-    /// time). Hosts can refuse to act on a message changed after review.
+    /// Whether the message was ever edited: Webex reports an `updated` time
+    /// for this revision. Hosts can refuse to act on a message changed after
+    /// review.
     pub edited: bool,
     /// Canonical message creation time.
     pub created_at: String,
@@ -187,8 +189,9 @@ pub struct AcceptedDelivery {
     pub created_at: String,
     /// Revision accepted by the local user.
     pub revision: i64,
-    /// Whether Webex reports this revision as edited (it has an `updated`
-    /// time). Hosts can refuse to act on a message changed after review.
+    /// Whether the message was ever edited: Webex reports an `updated` time
+    /// for this revision. Hosts can refuse to act on a message changed after
+    /// review.
     pub edited: bool,
     /// Delivery state after this decision: always `accepted` on the wire
     /// (a rejection returns no body), so hosts can assert it explicitly.

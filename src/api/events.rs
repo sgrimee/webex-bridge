@@ -163,7 +163,8 @@ impl EventBus {
             // Metadata only: a static event name, a sanitized route name and
             // the bus receiver count (all scopes). Never IDs or payloads.
             crate::diagnostics::debug(format_args!(
-                "agent.event_published name={name} route={route} receivers={receivers}"
+                "agent.event_published name={} route={route} receivers={receivers}",
+                log_event_name(name)
             ));
         }
     }
@@ -596,6 +597,11 @@ mod tests {
         assert_eq!(log_route("a b=c\nlevel=WARN\u{1b}"), "a?b?c?level?WARN?");
         assert_eq!(log_route(&"r".repeat(200)).len(), 64);
         assert_eq!(log_event_name("inbox.new"), "inbox.new");
+        // Published and emitted names share the same sanitizer.
+        assert_eq!(
+            log_event_name("inbox new\nlevel=WARN"),
+            "inbox?new?level?WARN"
+        );
     }
 
     #[tokio::test]

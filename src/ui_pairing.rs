@@ -185,15 +185,15 @@ mod tests {
             .with(|db| db.audit_refs_for_tests("ui", "unpair"))
             .await
             .unwrap();
-        // The executable is resolved from the kernel on macOS only.
-        let expected = cfg!(target_os = "macos").then(|| {
+        // Kernel-resolved on macOS (proc_pidpath) and Linux (/proc/PID/exe).
+        let expected = Some(
             std::env::current_exe()
                 .unwrap()
                 .canonicalize()
                 .unwrap()
                 .display()
-                .to_string()
-        });
+                .to_string(),
+        );
         assert_eq!(refs.len(), 3);
         assert!(refs.iter().all(|r| *r == expected), "{refs:?}");
         server.shutdown().await.unwrap();

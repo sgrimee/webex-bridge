@@ -77,6 +77,41 @@ fn stream_error_kind(error: &WebexError) -> &'static str {
     }
 }
 
+/// Time allowed for one Mercury event-stream setup (device listing, connect
+/// and authorization). Listing the account's WDM devices has been seen to take
+/// longer than 30 s, so a fixed budget failed the same way forever; each
+/// consecutive setup timeout widens the next budget, up to the last step, and
+/// a successful connection resets it.
+const STREAM_SETUP_BUDGETS: [Duration; 4] = [
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(120),
+    Duration::from_secs(240),
+];
+
+#[derive(Debug, Default)]
+struct StreamSetupBudget {
+    consecutive_timeouts: usize,
+}
+
+impl StreamSetupBudget {
+    fn current(&self) -> Duration {
+        STREAM_SETUP_BUDGETS[self
+            .consecutive_timeouts
+            .min(STREAM_SETUP_BUDGETS.len() - 1)]
+    }
+
+    /// Record a setup timeout; returns the budget for the next attempt.
+    fn timed_out(&mut self) -> Duration {
+        self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
+        self.current()
+    }
+
+    fn connected(&mut self) {
+        self.consecutive_timeouts = 0;
+    }
+}
+
 fn next_backoff(previous: Duration) -> Duration {
     (previous * 2).min(Duration::from_secs(300))
 }
@@ -195,6 +230,7 @@ where
     let mut force_once = forced_refresh_after;
     let mut term = signal(SignalKind::terminate())?;
     let mut backoff = Duration::from_secs(1);
+    let mut setup_budget = StreamSetupBudget::default();
     loop {
         diagnostics::debug(format!(
             "supervisor.connecting retry_backoff_secs={}",
@@ -237,11 +273,12 @@ where
         let stream = tokio::select! {
             _ = term.recv() => return Ok(()),
             _ = tokio::signal::ctrl_c() => return Ok(()),
-            result = timeout(Duration::from_secs(30), client.event_stream()) => result,
+            result = timeout(setup_budget.current(), client.event_stream()) => result,
         };
         match stream {
             Ok(Ok(mut stream)) => {
                 backoff = Duration::from_secs(1);
+                setup_budget.connected();
                 let rest = Arc::new(WebexRest::new(tokens.access_token.clone())?);
                 if let Some(sender) = &connected {
                     sender
@@ -334,7 +371,14 @@ where
                 let status = authentication_status(&error).unwrap_or_default();
                 bail!("auth_required: Mercury connection returned HTTP {status}; no scope change made");
             }
-            Ok(Err(_)) | Err(_) => {}
+            Ok(Err(_)) => {}
+            Err(_) => {
+                let elapsed = setup_budget.current().as_secs();
+                let next = setup_budget.timed_out().as_secs();
+                diagnostics::warn(format!(
+                    "supervisor.stream_setup_timed_out budget_secs={elapsed} next_budget_secs={next}"
+                ));
+            }
         }
         if let Some(sender) = &connected {
             let _ = sender.send(None);
@@ -359,6 +403,23 @@ fn now() -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn repeated_stream_setup_timeouts_widen_the_budget_until_a_connection() {
+        use super::{StreamSetupBudget, STREAM_SETUP_BUDGETS};
+        use std::time::Duration;
+        let mut budget = StreamSetupBudget::default();
+        assert_eq!(budget.current(), Duration::from_secs(30));
+        assert_eq!(budget.timed_out(), Duration::from_secs(60));
+        assert_eq!(budget.timed_out(), Duration::from_secs(120));
+        assert_eq!(budget.timed_out(), Duration::from_secs(240));
+        // Capped at the last step.
+        for _ in 0..10 {
+            assert_eq!(budget.timed_out(), *STREAM_SETUP_BUDGETS.last().unwrap());
+        }
+        budget.connected();
+        assert_eq!(budget.current(), Duration::from_secs(30));
+    }
+
     use super::*;
     #[test]
     fn backoff_is_bounded() {

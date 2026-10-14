@@ -14,7 +14,7 @@ use webex_bridge::{
     mirror::{Mirror, SharedMirror},
     paths::Paths,
     supervisor,
-    sync::{self, history::WebexRest, live},
+    sync::{self, history::WebexRest, live, teams},
 };
 
 #[tokio::main]
@@ -72,6 +72,7 @@ async fn main() -> Result<()> {
         connected_rx.clone(),
     );
     let events = api_state.events();
+    let team_misses = api_state.team_misses().clone();
     let api_server = api::start(&paths, api_state).await?;
     diagnostics::info("daemon.api_listening");
     let connection_task = tokio::spawn(watch_connection(
@@ -90,6 +91,11 @@ async fn main() -> Result<()> {
         events.clone(),
     ));
     diagnostics::debug("daemon.sync_task_started");
+    let team_task = tokio::spawn(run_team_hydrator(
+        sweep_connected.clone(),
+        mirror.clone(),
+        team_misses,
+    ));
     let sweep_task = tokio::spawn(run_sweeper(
         sweep_connected,
         mirror.clone(),
@@ -166,6 +172,8 @@ async fn main() -> Result<()> {
     let _ = sync_task.await;
     sweep_task.abort();
     let _ = sweep_task.await;
+    team_task.abort();
+    let _ = team_task.await;
     connection_task.abort();
     let _ = connection_task.await;
     api_server.shutdown().await?;
@@ -598,6 +606,52 @@ async fn run_sync(
                 // reconnect publishes a new REST client.
                 connected.changed().await.context("Mercury supervisor stopped")?;
             }
+        }
+    }
+}
+
+/// Background, paced team-name hydration (see `teams::hydrate_teams_step`):
+/// UI team reads become mirror hits. At most one REST GET per second while
+/// teams are missing, then idle; inaccessible teams are skipped through the
+/// API's shared negative cache.
+async fn run_team_hydrator(
+    mut connected: watch::Receiver<Option<Arc<WebexRest>>>,
+    mirror: SharedMirror,
+    misses: webex_bridge::api::TeamMisses,
+) {
+    const IDLE: Duration = Duration::from_secs(600);
+    const RETRY: Duration = Duration::from_secs(60);
+    loop {
+        let rest = connected.borrow().clone();
+        let Some(rest) = rest else {
+            if connected.changed().await.is_err() {
+                return;
+            }
+            continue;
+        };
+        let pause = match teams::hydrate_teams_step(
+            &mirror,
+            &rest,
+            &misses,
+            teams::TEAM_BATCH,
+            teams::TEAM_PAUSE,
+        )
+        .await
+        {
+            Ok(step) if step.remaining > 0 => teams::TEAM_PAUSE,
+            Ok(_) => IDLE,
+            Err(_) => {
+                diagnostics::debug("sync.teams_failed; retrying_later");
+                RETRY
+            }
+        };
+        tokio::select! {
+            changed = connected.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            () = tokio::time::sleep(pause) => {}
         }
     }
 }

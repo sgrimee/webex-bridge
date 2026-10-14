@@ -652,6 +652,20 @@ impl Mirror {
     }
 
     /// Upsert encrypted team name for UI display only.
+    /// Team IDs of member rooms whose team is not in the mirror yet (at most
+    /// `limit`), for background team-name hydration.
+    pub fn teams_missing(&self, limit: usize) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT r.team_id FROM rooms r LEFT JOIN teams t ON t.team_id=r.team_id
+             WHERE r.team_id IS NOT NULL AND r.is_member=1 AND t.team_id IS NULL
+             ORDER BY r.team_id LIMIT ?1",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement.query_map([limit], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn upsert_team(&mut self, team: &Team) -> Result<()> {
         if team.id.is_empty() {
             bail!("REST team has no ID");

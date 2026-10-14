@@ -79,7 +79,7 @@ pub struct ApiState {
 
 /// Why a team lookup produced no team.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TeamMiss {
+pub enum TeamMiss {
     /// Webex answered 404/403: the account cannot name this team.
     NotFound,
     /// The lookup failed (transport or unexpected status).
@@ -92,7 +92,7 @@ pub(crate) enum TeamMiss {
 /// hour, failed lookups for a minute; a team that later reaches the mirror is
 /// served from there first. Bounded; the daemon restart clears it.
 #[derive(Clone, Default)]
-pub(crate) struct TeamMisses(
+pub struct TeamMisses(
     Arc<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, TeamMiss)>>>,
 );
 
@@ -109,7 +109,8 @@ impl TeamMisses {
     }
 
     /// The remembered miss for this team, if still fresh.
-    pub(crate) fn get(&self, team_id: &str) -> Option<TeamMiss> {
+    #[must_use]
+    pub fn get(&self, team_id: &str) -> Option<TeamMiss> {
         let mut misses = self.0.lock().expect("team miss mutex poisoned");
         match misses.get(team_id) {
             Some((at, miss)) if at.elapsed() < Self::ttl(*miss) => Some(*miss),
@@ -121,7 +122,8 @@ impl TeamMisses {
         }
     }
 
-    pub(crate) fn record(&self, team_id: &str, miss: TeamMiss) {
+    /// Remember that this team produced no team just now.
+    pub fn record(&self, team_id: &str, miss: TeamMiss) {
         let mut misses = self.0.lock().expect("team miss mutex poisoned");
         if misses.len() >= TEAM_MISSES_MAX {
             misses.retain(|_, (at, miss)| at.elapsed() < Self::ttl(*miss));
@@ -189,7 +191,10 @@ impl ApiState {
         }
     }
 
-    pub(crate) fn team_misses(&self) -> &TeamMisses {
+    /// Shared negative cache of team lookups (also used by the background
+    /// team-name hydration, so neither repeats the other's misses).
+    #[must_use]
+    pub fn team_misses(&self) -> &TeamMisses {
         &self.team_misses
     }
 

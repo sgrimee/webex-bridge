@@ -6,6 +6,7 @@ pub mod history;
 pub mod initial;
 pub mod live;
 pub mod recovery;
+pub mod teams;
 
 use crate::{config::Config, mirror::SharedMirror};
 use anyhow::{bail, Context, Result};

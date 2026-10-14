@@ -959,6 +959,16 @@ impl Mirror {
                                 params![id, revision, body_kind, files_ct],
                             )?;
                         }
+                        // A sender that was missing at first ingest is
+                        // backfilled in place (never replaced): the same
+                        // revision can then be routed.
+                        if let Some(sender) = message.person_id.as_deref() {
+                            self.conn.execute(
+                                "UPDATE messages SET sender_id=?3
+                                 WHERE message_id=?1 AND revision=?2 AND sender_id IS NULL",
+                                params![id, revision, sender],
+                            )?;
+                        }
                         return Ok(Upsert::Unchanged);
                     }
                 }

@@ -909,7 +909,8 @@ impl Mirror {
     }
 
     /// Whether this exact key was already filtered for a reason that depends
-    /// only on configuration or content (not on transient load).
+    /// only on configuration or content (not on transient load). A missing
+    /// sender is not final: a later hydrate of the same revision can supply it.
     fn filtered_sticky(&self, key: &DeliveryKey) -> Result<bool> {
         let reference = format!("{}:{}:{}", key.route_id, key.message_id, key.revision);
         Ok(self
@@ -917,7 +918,7 @@ impl Mirror {
             .query_row(
                 "SELECT 1 FROM audit WHERE scope='agent' AND action='route_filtered'
                    AND ref=?1 AND detail_redacted IN
-                   ('not_addressed','sender_not_allowed','empty_body','inbound_too_large','missing_sender')",
+                   ('not_addressed','sender_not_allowed','empty_body','inbound_too_large')",
                 [reference],
                 |row| row.get::<_, i64>(0),
             )
@@ -1185,6 +1186,22 @@ mod tests {
         edited.updated = Some("2099-01-01T00:02:00Z".into());
         mirror.upsert_message(&edited).unwrap();
         assert_eq!(mirror.queue_deliveries(&config).unwrap(), 2);
+    }
+
+    #[test]
+    fn a_message_whose_sender_arrives_later_is_still_routed() {
+        let config = config();
+        let mut mirror = Mirror::in_memory([37; 32]).unwrap();
+        mirror.sync_routes(&config.routes).unwrap();
+        let mut anonymous = message("sam/coder: who sent this?");
+        anonymous.person_id = None;
+        mirror.upsert_message(&anonymous).unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 0);
+        // A later hydrate supplies the sender: missing_sender is not final.
+        mirror
+            .upsert_message(&message("sam/coder: who sent this?"))
+            .unwrap();
+        assert_eq!(mirror.queue_deliveries(&config).unwrap(), 1);
     }
 
     #[test]

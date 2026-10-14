@@ -1672,6 +1672,20 @@ impl Mirror {
         )?)
     }
 
+    #[cfg(test)]
+    pub(crate) fn audit_refs_for_tests(
+        &self,
+        scope: &str,
+        action: &str,
+    ) -> Result<Vec<Option<String>>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT ref FROM audit WHERE scope=?1 AND action=?2 ORDER BY rowid")?;
+        let rows = statement.query_map([scope, action], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     /// Record one metadata-only UI-scope audit row (no secrets or content).
     pub fn audit_ui(&mut self, action: &str, reference: Option<&str>) -> Result<()> {
         self.conn.execute(
@@ -1700,7 +1714,14 @@ impl Mirror {
     /// Remove the pairings of one exact executable path (`None`: every
     /// pairing) and audit the count. Returns the removed secret hashes so the
     /// caller can end their live sessions.
-    pub fn unpair_ui_clients(&mut self, executable: Option<&str>) -> Result<Vec<String>> {
+    ///
+    /// `caller` is the kernel-resolved executable of the requesting process
+    /// (any same-user process may unpair), recorded in the audit row's `ref`.
+    pub fn unpair_ui_clients(
+        &mut self,
+        executable: Option<&str>,
+        caller: Option<&str>,
+    ) -> Result<Vec<String>> {
         if executable
             .is_some_and(|path| !path.starts_with('/') || path.chars().any(char::is_control))
         {
@@ -1715,14 +1736,15 @@ impl Mirror {
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
         tx.execute(
-            "INSERT INTO audit(ts,scope,action,ref,detail_redacted) VALUES (?1,'ui','unpair',NULL,?2)",
+            "INSERT INTO audit(ts,scope,action,ref,detail_redacted) VALUES (?1,'ui','unpair',?3,?2)",
             params![
                 Utc::now().to_rfc3339(),
                 format!(
                     "{}removed={}",
                     if executable.is_none() { "all;" } else { "" },
                     hashes.len()
-                )
+                ),
+                caller
             ],
         )?;
         tx.commit()?;

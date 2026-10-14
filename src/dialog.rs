@@ -49,7 +49,7 @@ fn pairing_script(executable: &Path) -> String {
         .replace('\n', "\\n")
         .replace('\r', "\\r");
     format!(
-        "set choice to button returned of (display dialog \"Allow {escaped} full access to your Webex mirror?\" buttons {{\"Deny\", \"Allow\"}} default button \"Deny\" cancel button \"Deny\" with icon caution giving up after {PAIRING_DIALOG_SECS})\nreturn choice"
+        "set choice to button returned of (display dialog \"Allow {escaped} full access to your Webex mirror?\\n\\nAllow only if you just started this program yourself. If you did not, it is not webex-tui asking: click Deny.\" buttons {{\"Deny\", \"Allow\"}} default button \"Deny\" cancel button \"Deny\" with icon caution giving up after {PAIRING_DIALOG_SECS})\nreturn choice"
     )
 }
 
@@ -132,6 +132,10 @@ mod tests {
         assert!(script.contains("giving up after 60"));
         assert!(!script.contains("with timeout"));
         assert!(script.contains("default button \"Deny\""));
+        // A same-user process can unpair and then ask to pair itself: the
+        // text names the executable and says when not to allow it.
+        assert!(script.contains("Allow only if you just started this program yourself"));
+        assert!(script.contains("click Deny"));
         assert!(
             script.contains("Tui \\\"x\\\".app"),
             "quotes escaped: {script}"

@@ -180,6 +180,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(audited, 3);
+        // Each unpair records the calling executable (this test binary).
+        let refs = mirror
+            .with(|db| db.audit_refs_for_tests("ui", "unpair"))
+            .await
+            .unwrap();
+        let me_exe = std::env::current_exe().unwrap().canonicalize().unwrap();
+        assert!(
+            refs.iter()
+                .all(|r| r.as_deref() == Some(me_exe.to_str().unwrap())),
+            "{refs:?}"
+        );
         server.shutdown().await.unwrap();
     }
 

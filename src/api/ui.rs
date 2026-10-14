@@ -1650,9 +1650,15 @@ async fn unpair(
             )
         }
     };
+    // Any same-user process may unpair: record who did, best effort (an
+    // unidentifiable caller still may remove access, which is never a risk).
+    let caller = peer
+        .pid
+        .and_then(|pid| dialog::executable_for_pid(pid).ok())
+        .map(|path| path.display().to_string());
     let hashes = match state
         .mirror()
-        .with(move |db| db.unpair_ui_clients(executable.as_deref()))
+        .with(move |db| db.unpair_ui_clients(executable.as_deref(), caller.as_deref()))
         .await
     {
         Ok(hashes) => hashes,
@@ -1741,7 +1747,10 @@ mod tests {
 
         // The pairing check passed, then an unpair removed the pairing (and
         // revoked the sessions that existed) before this token was issued.
-        mirror.with(|db| db.unpair_ui_clients(None)).await.unwrap();
+        mirror
+            .with(|db| db.unpair_ui_clients(None, None))
+            .await
+            .unwrap();
         let orphan =
             state
                 .sessions()

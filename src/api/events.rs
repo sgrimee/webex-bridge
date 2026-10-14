@@ -339,26 +339,30 @@ struct CloseAfterTerminal<S> {
     closing: Arc<AtomicU64>,
     /// UI-only session deadline. Agent SSE behavior remains unchanged.
     expiry: Option<Pin<Box<Sleep>>>,
-    /// UI-only lease identity, re-read when the deadline fires: a renewal
-    /// extends the same token in place, so the stream re-arms rather than
-    /// closing a still-valid subscription.
-    lease: Option<UiLease>,
-    /// UI-only revocation wake-ups (logout, unpair). A quiet stream whose
-    /// token was revoked ends at once rather than at its old lease deadline.
+    /// Lease identity, re-read when the UI deadline fires (a renewal extends
+    /// the same token in place, so the stream re-arms rather than closing a
+    /// still-valid subscription) and on every revocation wake-up.
+    lease: Option<Lease>,
+    /// Revocation wake-ups (logout, unpair, agent release). A quiet stream
+    /// whose token was revoked ends at once rather than at its old lease
+    /// deadline: a UI stream with its terminal event, an agent stream (whose
+    /// contract has no such event) by closing, so its host reconnects and
+    /// learns the session is gone.
     revocations: Option<tokio_stream::wrappers::WatchStream<u64>>,
 }
 
-struct UiLease {
+struct Lease {
     sessions: auth::Sessions,
     token: String,
     peer: auth::PeerIdentity,
+    scope: auth::Scope,
 }
 
-impl UiLease {
+impl Lease {
     /// The current, still-in-the-future deadline of this verified lease.
     fn live_deadline(&self) -> Option<std::time::Instant> {
         self.sessions
-            .expires_at(&self.token, auth::Scope::Ui, self.peer)
+            .expires_at(&self.token, self.scope, self.peer)
             .ok()
             .filter(|deadline| *deadline > std::time::Instant::now())
     }
@@ -381,13 +385,15 @@ where
             loop {
                 match Pin::new(&mut *revocations).poll_next(context) {
                     Poll::Ready(Some(_)) => {
-                        if this
-                            .lease
-                            .as_ref()
-                            .and_then(UiLease::live_deadline)
-                            .is_none()
-                        {
+                        if this.lease.as_ref().and_then(Lease::live_deadline).is_none() {
                             this.closing.store(2, Ordering::SeqCst);
+                            if this
+                                .lease
+                                .as_ref()
+                                .is_some_and(|lease| lease.scope != auth::Scope::Ui)
+                            {
+                                return Poll::Ready(None);
+                            }
                             return Poll::Ready(Some(Ok(SseEvent::default()
                                 .event(SESSION_EXPIRED_EVENT)
                                 .data(r#"{"reason":"session_expired"}"#))));
@@ -405,7 +411,7 @@ where
             while expiry.as_mut().poll(context).is_ready() {
                 // Re-arm on a renewed lease; polling again registers the
                 // waker for the new deadline.
-                if let Some(deadline) = this.lease.as_ref().and_then(UiLease::live_deadline) {
+                if let Some(deadline) = this.lease.as_ref().and_then(Lease::live_deadline) {
                     expiry
                         .as_mut()
                         .reset(tokio::time::Instant::from_std(deadline));
@@ -458,12 +464,14 @@ async fn stream(
     } else {
         None
     };
-    let revocations =
-        ui_subscriber.then(|| tokio_stream::wrappers::WatchStream::from_changes(revocation_rx));
-    let lease = ui_subscriber.then(|| UiLease {
+    let revocations = Some(tokio_stream::wrappers::WatchStream::from_changes(
+        revocation_rx,
+    ));
+    let lease = Some(Lease {
         sessions: sessions.clone(),
         token: token.clone(),
         peer,
+        scope: subscriber.required_scope(),
     });
     let stream_is_ui = ui_subscriber;
     let closing = Arc::new(AtomicU64::new(0));

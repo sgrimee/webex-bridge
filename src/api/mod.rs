@@ -325,6 +325,7 @@ mod tests {
         config::{Receive, Route},
         mirror::Mirror,
     };
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn request(socket: &std::path::Path, request: String) -> String {
@@ -1131,5 +1132,58 @@ mod tests {
         assert!(start(&paths, ApiState::new(mirror, connection_rx))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_revoked_agent_session_closes_its_quiet_event_stream_at_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(temp.path().join("bridge"));
+        let mirror = SharedMirror::new(Mirror::in_memory([89_u8; 32]).unwrap());
+        let (_connection_tx, connection_rx) = watch::channel(ConnectionStatus::Connected);
+        let state = ApiState::new(mirror, connection_rx);
+        let me = auth::PeerIdentity {
+            uid: auth::daemon_uid(),
+            pid: Some(std::process::id()),
+        };
+        let sessions = state.sessions();
+        let agent = sessions.issue(auth::Scope::Agent, me, Duration::from_secs(600));
+        let other = sessions.issue(auth::Scope::Agent, me, Duration::from_secs(600));
+        let server = start(&paths, state).await.unwrap();
+        let mut client = UnixStream::connect(&paths.socket).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET /v1/events HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {agent}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut head = [0_u8; 12];
+        client.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head, b"HTTP/1.1 200");
+        // Revoking another session wakes the stream but must not close it.
+        sessions.revoke(&other);
+        let mut byte = [0_u8; 1];
+        let still_open = tokio::time::timeout(Duration::from_millis(300), async {
+            loop {
+                if client.read(&mut byte).await.unwrap() == 0 {
+                    return;
+                }
+            }
+        })
+        .await
+        .is_err();
+        assert!(still_open, "an unrelated revocation closed the stream");
+        // Its own revocation ends the quiet stream at once (no lease wait).
+        sessions.revoke(&agent);
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut rest))
+            .await
+            .expect("a revoked agent stream should close at once")
+            .unwrap();
+        // The agent contract has no session-expired event: it just closes.
+        assert!(!String::from_utf8_lossy(&rest).contains("session.expired"));
+        server.shutdown().await.unwrap();
     }
 }

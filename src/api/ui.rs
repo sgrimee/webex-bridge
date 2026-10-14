@@ -1493,13 +1493,50 @@ async fn create_session(
             "A paired UI secret is required",
         );
     }
-    Json(CreateSessionResponse {
-        token: state
+    let token =
+        state
             .sessions()
-            .issue_ui(peer, candidate, UI_LEASE_TTL, UI_SESSION_MAX_AGE),
+            .issue_ui(peer, candidate.clone(), UI_LEASE_TTL, UI_SESSION_MAX_AGE);
+    if let Err(response) = confirm_still_paired(&state, &token, candidate).await {
+        return *response;
+    }
+    Json(CreateSessionResponse {
+        token,
         lease_ttl: UI_LEASE_TTL.as_secs(),
     })
     .into_response()
+}
+
+/// Close the race with a concurrent unpair: the pairing is re-read after the
+/// token exists. An unpair that deleted the pairing before this read is seen
+/// here; one that deletes it afterwards revokes the (already issued) token
+/// itself. Either way no token outlives its pairing. On failure the token is
+/// revoked before it is returned to anyone.
+async fn confirm_still_paired(
+    state: &ApiState,
+    token: &str,
+    candidate: String,
+) -> Result<(), Box<Response>> {
+    let paired = state
+        .mirror()
+        .with(move |db| db.ui_client_paired(&candidate))
+        .await;
+    if matches!(paired, Ok(true)) {
+        return Ok(());
+    }
+    state.sessions().revoke(token);
+    Err(Box::new(match paired {
+        Ok(_) => json_error(
+            StatusCode::UNAUTHORIZED,
+            "auth_required",
+            "A paired UI secret is required",
+        ),
+        Err(_) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "bridge_unavailable",
+            "Pairing store is unavailable",
+        ),
+    }))
 }
 
 /// Log out: revoke exactly the presented UI token (same process only) and
@@ -1663,4 +1700,59 @@ pub fn router() -> Router<ApiState> {
         )
         .route("/v1/people/{person_id}/read", get(person_read))
         .route("/v1/people/{person_id}", get(person))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{api::ConnectionStatus, mirror::Mirror, mirror::SharedMirror};
+    use tokio::sync::watch;
+
+    fn me() -> auth::PeerIdentity {
+        auth::PeerIdentity {
+            uid: auth::daemon_uid(),
+            pid: Some(std::process::id()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_issued_while_its_pairing_is_removed_is_revoked_at_once() {
+        let mirror = SharedMirror::new(Mirror::in_memory([71_u8; 32]).unwrap());
+        let (_tx, rx) = watch::channel(ConnectionStatus::Connected);
+        let state = ApiState::new(mirror.clone(), rx);
+        let hash = hash_secret("a-local-ui-secret-that-is-long-enough");
+        let pairing = hash.clone();
+        mirror
+            .with(move |db| db.pair_ui_client(&pairing, "/test/webex-tui"))
+            .await
+            .unwrap();
+
+        // Still paired: the issued token is kept.
+        let kept = state
+            .sessions()
+            .issue_ui(me(), hash.clone(), UI_LEASE_TTL, UI_SESSION_MAX_AGE);
+        assert!(confirm_still_paired(&state, &kept, hash.clone())
+            .await
+            .is_ok());
+        assert!(state
+            .sessions()
+            .authorize(Some(&kept), auth::Scope::Ui, me())
+            .is_ok());
+
+        // The pairing check passed, then an unpair removed the pairing (and
+        // revoked the sessions that existed) before this token was issued.
+        mirror.with(|db| db.unpair_ui_clients(None)).await.unwrap();
+        let orphan =
+            state
+                .sessions()
+                .issue_ui(me(), hash.clone(), UI_LEASE_TTL, UI_SESSION_MAX_AGE);
+        let response = confirm_still_paired(&state, &orphan, hash)
+            .await
+            .unwrap_err();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(state
+            .sessions()
+            .authorize(Some(&orphan), auth::Scope::Ui, me())
+            .is_err());
+    }
 }

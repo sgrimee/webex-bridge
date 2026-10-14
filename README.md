@@ -137,6 +137,11 @@ CLI="$HOME/Library/Application Support/webex-bridge/bin/webex-bridge"
 # Explicit local diagnostic: emits roomId, title, isMember and result as JSON.
 # It decrypts the room title for stdout only; daemon logs remain metadata-only.
 "$CLI" sync failures
+# Webex device diagnostics (no IDs or names printed): counts, ages, list size/time.
+"$CLI" devices summary
+# Dry run listing this host's stale bridge/webex-tui devices; deletes nothing.
+# Deleting requires the exact count and fingerprint the dry run printed.
+"$CLI" devices prune
 "$CLI" probe --room <approved-room-id>
 # With [dev] write_allowlist configured, one-time refresh test:
 "$CLI" probe --room <approved-room-id> --refresh-after-secs 20

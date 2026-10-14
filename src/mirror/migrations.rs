@@ -1,8 +1,8 @@
 //! Atomic SQLite schema migrations.
 
 use super::schema::{
-    SCHEMA_V1, SCHEMA_V10, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
-    SCHEMA_V8, SCHEMA_V9,
+    SCHEMA_V1, SCHEMA_V10, SCHEMA_V11, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6,
+    SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
 };
 use anyhow::{bail, Result};
 use rusqlite::Connection;
@@ -86,6 +86,13 @@ fn migrate_v8(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_v11(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute_batch(SCHEMA_V11)?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn migrate_v10(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction()?;
     tx.execute_batch(SCHEMA_V10)?;
@@ -111,7 +118,7 @@ fn migrate_v9(conn: &mut Connection) -> Result<()> {
 type Step = fn(&mut Connection) -> Result<()>;
 
 /// Newest schema version this code writes.
-pub const LATEST_VERSION: i32 = 10;
+pub const LATEST_VERSION: i32 = 11;
 
 /// Apply migrations or reject a database written by newer code.
 pub fn migrate(conn: &mut Connection) -> Result<()> {
@@ -124,7 +131,7 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
         tx.execute_batch(SCHEMA_V1)?;
         tx.commit()?;
     }
-    let steps: [(i32, Step); 9] = [
+    let steps: [(i32, Step); 10] = [
         (2, migrate_v2),
         (3, migrate_v3),
         (4, migrate_v4),
@@ -134,6 +141,7 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
         (8, migrate_v8),
         (9, migrate_v9),
         (10, migrate_v10),
+        (11, migrate_v11),
     ];
     for (target, step) in steps {
         if version < target {
@@ -161,6 +169,7 @@ mod tests {
         assert!(has_column(&conn, "room_sweep", "attempts").unwrap());
         assert!(has_column(&conn, "room_sweep", "queued_at").unwrap());
         assert!(has_column(&conn, "room_sweep", "rerun_requested").unwrap());
+        assert!(has_column(&conn, "mercury_device", "device_ct").unwrap());
         // The routing audit lookup is served by the (scope, action, ref) index.
         let plan: String = conn
             .query_row(

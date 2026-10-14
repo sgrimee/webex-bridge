@@ -159,6 +159,7 @@ async fn main() -> Result<()> {
             }
         },
         connected_tx,
+        Some(mirror.clone()),
     )
     .await;
     sync_task.abort();

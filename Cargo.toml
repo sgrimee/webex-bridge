@@ -65,7 +65,7 @@ toml = { version = "0.8", optional = true }
 tower = { version = "0.5", features = ["util"], optional = true }
 tokio-tungstenite = { version = "0.28", optional = true }
 webbrowser = { version = "1", optional = true }
-webex = { git = "https://github.com/sgrimee/webex-rust", rev = "4d3a5e6b0c3690f00fe0856be162ea951071ae2f", optional = true }
+webex = { git = "https://github.com/sgrimee/webex-rust", rev = "97fb84e9ab7f1c9f36918087ab65fd33760242b4", optional = true }
 zeroize = { version = "1.8", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

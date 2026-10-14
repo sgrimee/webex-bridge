@@ -742,6 +742,41 @@ impl Mirror {
         Ok(())
     }
 
+    /// Remember the daemon's own Mercury device (encrypted; its URLs are
+    /// device identifiers), so the next connect can try it before listing.
+    pub fn remember_mercury_device(&mut self, device: &webex::DeviceData) -> Result<()> {
+        let device_ct = self.crypto.seal_prefixed(
+            &serde_json::to_vec(device)?,
+            &aad("mercury_device", "device", "current"),
+        )?;
+        self.conn.execute(
+            "INSERT INTO mercury_device(slot,device_ct) VALUES (1,?1)
+             ON CONFLICT(slot) DO UPDATE SET device_ct=excluded.device_ct",
+            [device_ct],
+        )?;
+        Ok(())
+    }
+
+    /// The remembered Mercury device, if any. An unreadable entry is treated
+    /// as absent (the device list is the fallback).
+    pub fn mercury_device(&self) -> Result<Option<webex::DeviceData>> {
+        let device_ct: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT device_ct FROM mercury_device WHERE slot=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(device_ct.and_then(|blob| {
+            let json = self
+                .crypto
+                .open_prefixed(&blob, &aad("mercury_device", "device", "current"))
+                .ok()?;
+            serde_json::from_slice(&json).ok()
+        }))
+    }
+
     /// Read the cached daemon account for an authorized UI session. A missing
     /// identity is normal before the first successful authoritative `/me`.
     pub fn ui_account_identity(&self) -> Result<Option<UiPerson>> {
@@ -2134,6 +2169,30 @@ mod tests {
         // The rerun happens once.
         mirror.advance_room_sweep(&restarted, None).unwrap();
         assert_eq!(mirror.next_room_sweep().unwrap(), None);
+    }
+
+    #[test]
+    fn the_mercury_device_is_remembered_encrypted() {
+        let mut mirror = Mirror::in_memory([42_u8; 32]).unwrap();
+        assert_eq!(mirror.mercury_device().unwrap(), None);
+        let device = webex::DeviceData {
+            name: Some("host-webex-bridge".into()),
+            ws_url: Some("wss://mercury.example.invalid/v1/apps/wx2/registrations/x".into()),
+            url: Some("https://wdm.example.invalid/devices/x".into()),
+            ..webex::DeviceData::default()
+        };
+        mirror.remember_mercury_device(&device).unwrap();
+        assert_eq!(mirror.mercury_device().unwrap(), Some(device.clone()));
+        // Stored only as ciphertext.
+        let blob: Vec<u8> = mirror
+            .conn
+            .query_row("SELECT device_ct FROM mercury_device", [], |row| row.get(0))
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&blob).contains("mercury.example.invalid"));
+        let mut newer = device;
+        newer.ws_url = Some("wss://mercury.example.invalid/other".into());
+        mirror.remember_mercury_device(&newer).unwrap();
+        assert_eq!(mirror.mercury_device().unwrap(), Some(newer));
     }
 
     #[test]

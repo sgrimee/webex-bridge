@@ -1,6 +1,8 @@
 //! Mercury connection owner. Refresh rebuilds client and stream; failures back off.
 
-use crate::{auth, config::Config, diagnostics, paths::Paths, sync::history::WebexRest};
+use crate::{
+    auth, config::Config, diagnostics, mirror::SharedMirror, paths::Paths, sync::history::WebexRest,
+};
 use anyhow::{bail, Context, Result};
 use rand::Rng;
 use std::{future::Future, sync::Arc, time::Duration};
@@ -112,6 +114,30 @@ impl StreamSetupBudget {
     }
 }
 
+/// Keep the device a successful connect used; persist it only when it
+/// changed. A persistence failure is metadata-logged and otherwise ignored:
+/// the next start just lists devices again.
+async fn remember_device(
+    memory: Option<&SharedMirror>,
+    known: &mut Option<webex::DeviceData>,
+    device: webex::DeviceData,
+) {
+    if known.as_ref() == Some(&device) {
+        return;
+    }
+    if let Some(mirror) = memory {
+        let remembered = device.clone();
+        if mirror
+            .with(move |db| db.remember_mercury_device(&remembered))
+            .await
+            .is_err()
+        {
+            diagnostics::warn("supervisor.device_memory_unavailable");
+        }
+    }
+    *known = Some(device);
+}
+
 fn next_backoff(previous: Duration) -> Duration {
     (previous * 2).min(Duration::from_secs(300))
 }
@@ -167,6 +193,7 @@ where
         forced_refresh_gap,
         move |event, client, _rest| on_event(event, client),
         None,
+        None,
     )
     .await
 }
@@ -182,7 +209,7 @@ where
     H: FnMut(Event, Webex, Arc<WebexRest>) -> F,
     F: Future<Output = Result<(), WebexError>>,
 {
-    run_daemon_with_refresh_after_and_gap(paths, None, None, on_event, connected).await
+    run_daemon_with_refresh_after_and_gap(paths, None, None, on_event, connected, None).await
 }
 
 /// Daemon variant used only by explicit development continuity validation.
@@ -193,6 +220,7 @@ pub async fn run_daemon_with_refresh_after_and_gap<H, F>(
     forced_refresh_gap: Option<Duration>,
     on_event: H,
     connected: watch::Sender<Option<Arc<WebexRest>>>,
+    device_memory: Option<SharedMirror>,
 ) -> Result<()>
 where
     H: FnMut(Event, Webex, Arc<WebexRest>) -> F,
@@ -204,6 +232,7 @@ where
         forced_refresh_gap,
         on_event,
         Some(connected),
+        device_memory,
     )
     .await
 }
@@ -214,6 +243,7 @@ async fn run_inner<H, F>(
     forced_refresh_gap: Option<Duration>,
     mut on_event: H,
     connected: Option<watch::Sender<Option<Arc<WebexRest>>>>,
+    device_memory: Option<SharedMirror>,
 ) -> Result<()>
 where
     H: FnMut(Event, Webex, Arc<WebexRest>) -> F,
@@ -231,6 +261,12 @@ where
     let mut term = signal(SignalKind::terminate())?;
     let mut backoff = Duration::from_secs(1);
     let mut setup_budget = StreamSetupBudget::default();
+    // The device the last successful connect used: reconnecting to it skips
+    // the multi-megabyte device list. Persisted (encrypted) by the daemon.
+    let mut known_device = match &device_memory {
+        Some(mirror) => mirror.with(|db| db.mercury_device()).await.ok().flatten(),
+        None => None,
+    };
     loop {
         diagnostics::debug(format!(
             "supervisor.connecting retry_backoff_secs={}",
@@ -273,12 +309,16 @@ where
         let stream = tokio::select! {
             _ = term.recv() => return Ok(()),
             _ = tokio::signal::ctrl_c() => return Ok(()),
-            result = timeout(setup_budget.current(), client.event_stream()) => result,
+            result = timeout(
+                setup_budget.current(),
+                client.event_stream_preferring(known_device.as_ref()),
+            ) => result,
         };
         match stream {
-            Ok(Ok(mut stream)) => {
+            Ok(Ok((mut stream, device))) => {
                 backoff = Duration::from_secs(1);
                 setup_budget.connected();
+                remember_device(device_memory.as_ref(), &mut known_device, device).await;
                 let rest = Arc::new(WebexRest::new(tokens.access_token.clone())?);
                 if let Some(sender) = &connected {
                     sender
@@ -403,6 +443,33 @@ fn now() -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn the_connected_device_is_remembered_only_when_it_changes() {
+        use crate::mirror::{Mirror, SharedMirror};
+        let mirror = SharedMirror::new(Mirror::in_memory([43_u8; 32]).unwrap());
+        let device = |ws: &str| webex::DeviceData {
+            name: Some("host-webex-bridge".into()),
+            ws_url: Some(ws.into()),
+            ..webex::DeviceData::default()
+        };
+        let mut known = None;
+        super::remember_device(Some(&mirror), &mut known, device("wss://a")).await;
+        assert_eq!(known, Some(device("wss://a")));
+        assert_eq!(
+            mirror.with(|db| db.mercury_device()).await.unwrap(),
+            Some(device("wss://a"))
+        );
+        super::remember_device(Some(&mirror), &mut known, device("wss://b")).await;
+        assert_eq!(
+            mirror.with(|db| db.mercury_device()).await.unwrap(),
+            Some(device("wss://b"))
+        );
+        // Without a store (CLI runs) it is kept in memory only.
+        let mut transient = None;
+        super::remember_device(None, &mut transient, device("wss://c")).await;
+        assert_eq!(transient, Some(device("wss://c")));
+    }
+
     #[test]
     fn repeated_stream_setup_timeouts_widen_the_budget_until_a_connection() {
         use super::{StreamSetupBudget, STREAM_SETUP_BUDGETS};

@@ -166,3 +166,13 @@ pub(crate) const SCHEMA_V10: &str = r#"
 CREATE INDEX IF NOT EXISTS audit_scope_action_ref ON audit(scope, action, ref);
 PRAGMA user_version=10;
 "#;
+
+// The daemon's own Mercury device (its URLs identify the device), encrypted,
+// so a reconnect can skip the multi-megabyte device list.
+pub(crate) const SCHEMA_V11: &str = r#"
+CREATE TABLE IF NOT EXISTS mercury_device (
+    slot INTEGER PRIMARY KEY CHECK (slot=1),
+    device_ct BLOB NOT NULL
+);
+PRAGMA user_version=11;
+"#;

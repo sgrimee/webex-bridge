@@ -71,6 +71,8 @@ pub struct ApiState {
     events: events::EventBus,
     config: Arc<Config>,
     rest: Option<watch::Receiver<Option<Arc<WebexRest>>>>,
+    /// Held for the whole native pairing dialog: one dialog at a time.
+    pairing_dialog: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ApiState {
@@ -84,6 +86,7 @@ impl ApiState {
             events: events::EventBus::default(),
             config: Arc::new(Config::default()),
             rest: None,
+            pairing_dialog: Arc::default(),
         }
     }
 
@@ -101,6 +104,7 @@ impl ApiState {
             events: events::EventBus::default(),
             config,
             rest: None,
+            pairing_dialog: Arc::default(),
         }
     }
 
@@ -120,7 +124,15 @@ impl ApiState {
             events: events::EventBus::default(),
             config,
             rest: Some(rest),
+            pairing_dialog: Arc::default(),
         }
+    }
+
+    /// Claim the single pairing-dialog slot, or `None` while another pairing
+    /// request is waiting for the user's answer. Dropping the guard (answer,
+    /// or the request cancelled) frees it.
+    pub(crate) fn try_pairing_dialog(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        Arc::clone(&self.pairing_dialog).try_lock_owned().ok()
     }
 
     /// Loaded, validated routing configuration used by scoped session setup.

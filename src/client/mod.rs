@@ -100,6 +100,20 @@ impl ClientError {
         )
     }
 
+    /// Whether a pairing request was refused because another pairing dialog
+    /// is still waiting for the user. Nothing was asked; retry after it.
+    #[must_use]
+    pub fn is_pairing_in_progress(&self) -> bool {
+        matches!(
+            self,
+            Self::Api {
+                status: StatusCode::CONFLICT,
+                code,
+                ..
+            } if code == "pairing_in_progress"
+        )
+    }
+
     /// Whether a UI renewal was refused because the session reached its
     /// absolute lifetime. The current token remains valid until its expiry;
     /// create a new session from the paired secret.
@@ -315,6 +329,17 @@ mod tests {
 
     const DELIVERY_UNKNOWN: &[u8] =
         br#"{"code":"delivery_unknown","message":"The write may have succeeded"}"#;
+
+    #[test]
+    fn a_busy_pairing_dialog_is_classified() {
+        let busy = BridgeClient::decode_empty(
+            StatusCode::CONFLICT,
+            br#"{"code":"pairing_in_progress","message":"busy"}"#,
+        )
+        .unwrap_err();
+        assert!(busy.is_pairing_in_progress());
+        assert!(!busy.is_session_cap_reached());
+    }
 
     #[test]
     fn accepted_delivery_unknown_is_an_api_error_for_json_and_empty_responses() {

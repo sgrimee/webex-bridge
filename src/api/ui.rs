@@ -1402,6 +1402,17 @@ async fn pair(
             "Pairing secret hash is invalid",
         );
     }
+    // One pairing dialog at a time: concurrent requests would stack dialogs,
+    // and a look-alike request could hide behind a genuine one. Later
+    // requests are refused while one is open; the slot is held until this
+    // request finishes (or is dropped, which also kills its dialog).
+    let Some(_dialog_slot) = state.try_pairing_dialog() else {
+        return json_error(
+            StatusCode::CONFLICT,
+            "pairing_in_progress",
+            "Another pairing request is waiting for an answer; try again after it",
+        );
+    };
     let Some(pid) = peer.pid else {
         return json_error(
             StatusCode::FORBIDDEN,
@@ -1719,6 +1730,58 @@ mod tests {
             uid: auth::daemon_uid(),
             pid: Some(std::process::id()),
         }
+    }
+
+    #[tokio::test]
+    async fn only_one_pairing_dialog_is_open_at_a_time() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let temp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::under(temp.path().join("bridge"));
+        let mirror = SharedMirror::new(Mirror::in_memory([72_u8; 32]).unwrap());
+        let (_tx, rx) = watch::channel(ConnectionStatus::Connected);
+        let state = ApiState::new(mirror.clone(), rx);
+        // Another pairing request holds the dialog slot.
+        let open_dialog = state.try_pairing_dialog().unwrap();
+        assert!(state.try_pairing_dialog().is_none());
+        let server = crate::api::start(&paths, state.clone()).await.unwrap();
+        let body = format!(r#"{{"secretHash":"{}"}}"#, "h".repeat(43));
+        let mut client = tokio::net::UnixStream::connect(&paths.socket)
+            .await
+            .unwrap();
+        client
+            .write_all(
+                format!(
+                    "POST /v1/ui/pair HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+        assert!(response.contains("pairing_in_progress"));
+        // Refused before any dialog: nothing audited, nothing paired.
+        for action in [
+            "pair_approved",
+            "pair_denied",
+            "pair_gave_up",
+            "pair_dialog_failed",
+        ] {
+            assert_eq!(
+                mirror
+                    .with(move |db| db.audit_count_for_tests("ui", action))
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+        assert!(mirror.with(|db| db.ui_pairings()).await.unwrap().is_empty());
+        // The slot frees when the open dialog's request finishes.
+        drop(open_dialog);
+        assert!(state.try_pairing_dialog().is_some());
+        server.shutdown().await.unwrap();
     }
 
     #[tokio::test]

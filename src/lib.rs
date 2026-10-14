@@ -22,6 +22,8 @@ pub mod config;
 #[cfg(feature = "dev-env-secrets")]
 pub mod dev_env_secrets;
 #[cfg(feature = "server")]
+pub mod devices;
+#[cfg(feature = "server")]
 pub mod diagnostics;
 #[cfg(feature = "server")]
 pub mod dialog;

@@ -1,8 +1,8 @@
 //! Atomic SQLite schema migrations.
 
 use super::schema::{
-    SCHEMA_V1, SCHEMA_V10, SCHEMA_V11, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6,
-    SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+    SCHEMA_V1, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5,
+    SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
 };
 use anyhow::{bail, Result};
 use rusqlite::Connection;
@@ -86,6 +86,13 @@ fn migrate_v8(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_v12(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute_batch(SCHEMA_V12)?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn migrate_v11(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction()?;
     tx.execute_batch(SCHEMA_V11)?;
@@ -118,7 +125,7 @@ fn migrate_v9(conn: &mut Connection) -> Result<()> {
 type Step = fn(&mut Connection) -> Result<()>;
 
 /// Newest schema version this code writes.
-pub const LATEST_VERSION: i32 = 11;
+pub const LATEST_VERSION: i32 = 12;
 
 /// Apply migrations or reject a database written by newer code.
 pub fn migrate(conn: &mut Connection) -> Result<()> {
@@ -131,7 +138,7 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
         tx.execute_batch(SCHEMA_V1)?;
         tx.commit()?;
     }
-    let steps: [(i32, Step); 10] = [
+    let steps: [(i32, Step); 11] = [
         (2, migrate_v2),
         (3, migrate_v3),
         (4, migrate_v4),
@@ -142,6 +149,7 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
         (9, migrate_v9),
         (10, migrate_v10),
         (11, migrate_v11),
+        (12, migrate_v12),
     ];
     for (target, step) in steps {
         if version < target {
@@ -170,6 +178,7 @@ mod tests {
         assert!(has_column(&conn, "room_sweep", "queued_at").unwrap());
         assert!(has_column(&conn, "room_sweep", "rerun_requested").unwrap());
         assert!(has_column(&conn, "mercury_device", "device_ct").unwrap());
+        assert!(has_column(&conn, "team_lookup", "expires_at").unwrap());
         // The routing audit lookup is served by the (scope, action, ref) index.
         let plan: String = conn
             .query_row(
@@ -271,5 +280,53 @@ mod tests {
                 .unwrap(),
             LATEST_VERSION
         );
+    }
+
+    #[test]
+    fn v12_adds_the_team_lookup_table_to_a_v11_mirror_without_touching_its_data() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        for step in [
+            migrate_v2,
+            migrate_v3,
+            migrate_v4,
+            migrate_v5,
+            migrate_v6,
+            migrate_v7,
+            migrate_v8,
+            migrate_v9,
+            migrate_v10,
+            migrate_v11,
+        ] {
+            step(&mut conn).unwrap();
+        }
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                .unwrap(),
+            11
+        );
+        conn.execute_batch(
+            "INSERT INTO rooms(room_id,type,team_id,is_member,updated_at)
+             VALUES ('room-v11','group','team-v11',1,'2026-10-14T00:00:00Z');
+             INSERT INTO teams(team_id,name_ct,updated_at) VALUES ('team-v11',X'01','2026-10-14T00:00:00Z');
+             INSERT INTO mercury_device(slot,device_ct) VALUES (1,X'02');",
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                .unwrap(),
+            12
+        );
+        assert!(has_column(&conn, "team_lookup", "team_id").unwrap());
+        let kept: (String, i64, i64) = conn
+            .query_row(
+                "SELECT r.team_id,(SELECT COUNT(*) FROM teams),(SELECT COUNT(*) FROM mercury_device)
+                 FROM rooms r WHERE r.room_id='room-v11'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(kept, ("team-v11".into(), 1, 1));
     }
 }

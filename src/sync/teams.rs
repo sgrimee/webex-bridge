@@ -62,16 +62,16 @@ pub async fn hydrate_teams_step(
                 step.hydrated += 1;
             }
             Ok(Some(_)) => {
-                misses.record(&team_id, TeamMiss::Unavailable);
+                misses.record(&team_id, TeamMiss::Unavailable).await;
                 step.failed += 1;
             }
             Ok(None) => {
-                misses.record(&team_id, TeamMiss::NotFound);
+                misses.record(&team_id, TeamMiss::NotFound).await;
                 step.inaccessible += 1;
             }
             Err(error) if error.to_string().contains("auth_required") => return Err(error),
             Err(_) => {
-                misses.record(&team_id, TeamMiss::Unavailable);
+                misses.record(&team_id, TeamMiss::Unavailable).await;
                 step.failed += 1;
             }
         }

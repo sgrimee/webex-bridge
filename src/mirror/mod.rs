@@ -652,6 +652,30 @@ impl Mirror {
     }
 
     /// Upsert encrypted team name for UI display only.
+    /// Remember that the account cannot read this team, until `expires_at`
+    /// (RFC 3339). Only the opaque ID is stored.
+    pub fn remember_team_not_found(&mut self, team_id: &str, expires_at: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO team_lookup(team_id,state,expires_at) VALUES (?1,'not_found',?2)
+             ON CONFLICT(team_id) DO UPDATE SET expires_at=excluded.expires_at",
+            params![team_id, expires_at],
+        )?;
+        Ok(())
+    }
+
+    /// Inaccessible teams still within their expiry, as `(team_id,
+    /// expires_at)`. Expired entries are removed.
+    pub fn teams_not_found(&mut self, now: &str) -> Result<Vec<(String, String)>> {
+        self.conn
+            .execute("DELETE FROM team_lookup WHERE expires_at<=?1", [now])?;
+        let mut statement = self
+            .conn
+            .prepare("SELECT team_id,expires_at FROM team_lookup ORDER BY team_id")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     /// Team IDs of member rooms whose team is not in the mirror yet (at most
     /// `limit`), for background team-name hydration.
     pub fn teams_missing(&self, limit: usize) -> Result<Vec<String>> {
@@ -670,6 +694,9 @@ impl Mirror {
         if team.id.is_empty() {
             bail!("REST team has no ID");
         }
+        // A readable team is no longer an inaccessible one.
+        self.conn
+            .execute("DELETE FROM team_lookup WHERE team_id=?1", [&team.id])?;
         let name_ct = team
             .name
             .as_ref()

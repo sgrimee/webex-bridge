@@ -176,3 +176,16 @@ CREATE TABLE IF NOT EXISTS mercury_device (
 );
 PRAGMA user_version=11;
 "#;
+
+// Teams the account cannot read (Webex 404/403), remembered until
+// `expires_at` so a restart does not repeat one REST call per such team.
+// Only the opaque team ID is stored, like `ui_lookup`; never a name.
+// Failed (transient) lookups are deliberately not persisted.
+pub(crate) const SCHEMA_V12: &str = r#"
+CREATE TABLE IF NOT EXISTS team_lookup (
+    team_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL CHECK (state='not_found'),
+    expires_at TEXT NOT NULL
+);
+PRAGMA user_version=12;
+"#;

@@ -531,14 +531,20 @@ async fn team(
     };
     let fetched = rest.team(&team_id).await;
     match &fetched {
-        Ok(None) => state
-            .team_misses()
-            .record(&team_id, super::TeamMiss::NotFound),
+        Ok(None) => {
+            state
+                .team_misses()
+                .record(&team_id, super::TeamMiss::NotFound)
+                .await;
+        }
         // Authentication problems are global and resolved elsewhere; never
         // remember them as this team's state.
-        Err(error) if !error.to_string().contains("auth_required") => state
-            .team_misses()
-            .record(&team_id, super::TeamMiss::Unavailable),
+        Err(error) if !error.to_string().contains("auth_required") => {
+            state
+                .team_misses()
+                .record(&team_id, super::TeamMiss::Unavailable)
+                .await;
+        }
         _ => {}
     }
     match fetched {

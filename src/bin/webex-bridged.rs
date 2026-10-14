@@ -73,6 +73,9 @@ async fn main() -> Result<()> {
     );
     let events = api_state.events();
     let team_misses = api_state.team_misses().clone();
+    // Inaccessible teams remembered by a previous run (count only).
+    let loaded = team_misses.load().await;
+    diagnostics::debug(format_args!("daemon.team_misses_loaded count={loaded}"));
     let api_server = api::start(&paths, api_state).await?;
     diagnostics::info("daemon.api_listening");
     let connection_task = tokio::spawn(watch_connection(

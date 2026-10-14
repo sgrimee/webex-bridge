@@ -31,6 +31,19 @@ async fn main() -> Result<()> {
             let tokens = auth::fresh_token(&paths).await?;
             hydrate::inspect_message(&tokens.access_token, id).await?;
         }
+        [command, action] if command == "devices" && action == "prune" => {
+            // Dry run: lists stale bridge/webex-tui devices; deletes nothing.
+            print!("{}", webex_bridge::devices::prune(&paths, None).await?);
+        }
+        [command, action, flag, count, digest]
+            if command == "devices" && action == "prune" && flag == "--confirm" =>
+        {
+            let count = count.parse().context("--confirm needs the candidate count")?;
+            print!(
+                "{}",
+                webex_bridge::devices::prune(&paths, Some((count, digest))).await?
+            );
+        }
         [command, action] if command == "devices" && action == "summary" => {
             // Counts, ages, size and time only: no device IDs, URLs or names.
             print!("{}", webex_bridge::devices::device_list_summary(&paths).await?);
@@ -259,7 +272,7 @@ async fn main() -> Result<()> {
             })
             .await?;
         }
-        _ => bail!("Usage: webex-bridge login | me | status | health | ui pairings | ui unpair (EXECUTABLE_PATH|--all) | install-service | uninstall-service | sync failures | sync recover-gap --room ROOM_ID | devices (status|summary) | messages inspect --id ID | rooms find --title TITLE | rooms verify --url SPACE_URL --title TITLE | routes init --url SPACE_URL --title TITLE --agent NAME --workspace PATH | membership (invite|cycle) --room ROOM_ID --email PERSON_EMAIL | probe [--room ROOM_ID [--refresh-after-secs 1..120 [--refresh-gap-secs 1..120]]]"),
+        _ => bail!("Usage: webex-bridge login | me | status | health | ui pairings | ui unpair (EXECUTABLE_PATH|--all) | install-service | uninstall-service | sync failures | sync recover-gap --room ROOM_ID | devices (status|summary|prune [--confirm N FINGERPRINT]) | messages inspect --id ID | rooms find --title TITLE | rooms verify --url SPACE_URL --title TITLE | routes init --url SPACE_URL --title TITLE --agent NAME --workspace PATH | membership (invite|cycle) --room ROOM_ID --email PERSON_EMAIL | probe [--room ROOM_ID [--refresh-after-secs 1..120 [--refresh-gap-secs 1..120]]]"),
     }
     Ok(())
 }

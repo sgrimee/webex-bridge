@@ -22,6 +22,7 @@ struct DeviceList {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Device {
+    url: Option<String>,
     name: Option<String>,
     system_name: Option<String>,
     device_type: Option<String>,
@@ -171,17 +172,28 @@ impl fmt::Display for DeviceSummary {
     }
 }
 
-/// Fetch the device list once (bounded at 180 s) and summarize it.
-pub async fn device_list_summary(paths: &Paths) -> Result<DeviceSummary> {
-    let tokens = auth::fresh_token(paths).await?;
-    let client = reqwest::Client::builder()
+const DEVICES_URL: &str = "https://wdm-a.wbx2.com/wdm/api/v1/devices";
+
+fn this_host() -> String {
+    device_name()
+        .strip_suffix(BRIDGE_SUFFIX)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn http_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
         .timeout(Duration::from_secs(180))
         .redirect(reqwest::redirect::Policy::none())
-        .build()?;
+        .build()?)
+}
+
+/// GET the device list: `(status, body, elapsed)`.
+async fn fetch_devices(client: &reqwest::Client, token: &str) -> Result<(u16, Vec<u8>, Duration)> {
     let started = std::time::Instant::now();
     let response = client
-        .get("https://wdm-a.wbx2.com/wdm/api/v1/devices")
-        .bearer_auth(tokens.access_token)
+        .get(DEVICES_URL)
+        .bearer_auth(token)
         .send()
         .await
         .context("WDM device list did not respond")?;
@@ -190,11 +202,14 @@ pub async fn device_list_summary(paths: &Paths) -> Result<DeviceSummary> {
         .bytes()
         .await
         .context("WDM device list body did not complete")?;
-    let elapsed = started.elapsed();
-    let this_host = device_name()
-        .strip_suffix(BRIDGE_SUFFIX)
-        .unwrap_or_default()
-        .to_owned();
+    Ok((status, body.to_vec(), started.elapsed()))
+}
+
+/// Fetch the device list once (bounded at 180 s) and summarize it.
+pub async fn device_list_summary(paths: &Paths) -> Result<DeviceSummary> {
+    let tokens = auth::fresh_token(paths).await?;
+    let (status, body, elapsed) = fetch_devices(&http_client()?, &tokens.access_token).await?;
+    let this_host = this_host();
     let mut summary = if (200..300).contains(&status) {
         summarize(&body, &this_host, Utc::now())?
     } else {
@@ -204,6 +219,151 @@ pub async fn device_list_summary(paths: &Paths) -> Result<DeviceSummary> {
     summary.elapsed = elapsed;
     summary.bytes = body.len();
     Ok(summary)
+}
+
+/// A stale device this bridge (or the old webex-tui) registered. The URL is
+/// kept only to delete it and is never printed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PruneCandidate {
+    pub class: DeviceClass,
+    pub modified: Option<DateTime<Utc>>,
+    url: String,
+}
+
+/// Devices safe to delete: this host's bridge devices except the newest one
+/// (the one the daemon reconnects to), and this host's old webex-tui devices.
+/// Never another host's devices, other programs' or the user's real clients,
+/// and only devices whose URL is a Webex WDM URL. Oldest first.
+pub fn prune_candidates(body: &[u8], this_host: &str) -> Result<Vec<PruneCandidate>> {
+    let list: DeviceList =
+        serde_json::from_slice(body).context("Invalid WDM device-list response")?;
+    let mut bridge: Vec<&Device> = Vec::new();
+    let mut candidates = Vec::new();
+    for device in &list.devices {
+        match classify(device, this_host) {
+            DeviceClass::BridgeThisHost => bridge.push(device),
+            DeviceClass::TuiThisHost => candidates.push(device),
+            _ => {}
+        }
+    }
+    // Keep the newest bridge device (unknown times sort as oldest).
+    bridge.sort_by_key(|device| std::cmp::Reverse(device.modification_time));
+    candidates.extend(bridge.into_iter().skip(1));
+    let mut candidates: Vec<PruneCandidate> = candidates
+        .into_iter()
+        .filter_map(|device| {
+            let url = device.url.clone()?;
+            wdm_url(&url).then(|| PruneCandidate {
+                class: classify(device, this_host),
+                modified: device.modification_time,
+                url,
+            })
+        })
+        .collect();
+    candidates.sort_by_key(|candidate| candidate.modified);
+    Ok(candidates)
+}
+
+/// Only an https URL on a Webex WDM host may receive the bearer token.
+fn wdm_url(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url
+                .host_str()
+                .is_some_and(|host| host.starts_with("wdm") && host.ends_with(".wbx2.com"))
+    })
+}
+
+/// Short digest of the candidate set, shown by the dry run and required by
+/// `--confirm`, so a set that changed in between is never deleted.
+pub fn fingerprint(candidates: &[PruneCandidate]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for candidate in candidates {
+        hasher.update(candidate.url.as_bytes());
+        hasher.update([0]);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Dry run (no `confirm`): list the candidates. With `confirm = (count,
+/// fingerprint)` matching the current candidates exactly, delete them and
+/// report the device list afterwards. Never prints device IDs or URLs.
+pub async fn prune(paths: &Paths, confirm: Option<(usize, &str)>) -> Result<String> {
+    use std::fmt::Write as _;
+    let tokens = auth::fresh_token(paths).await?;
+    let client = http_client()?;
+    let (status, body, _) = fetch_devices(&client, &tokens.access_token).await?;
+    if !(200..300).contains(&status) {
+        anyhow::bail!("WDM device list returned HTTP {status}");
+    }
+    let candidates = prune_candidates(&body, &this_host())?;
+    let digest = fingerprint(&candidates);
+    let mut out = String::new();
+    let Some((count, expected)) = confirm else {
+        writeln!(
+            out,
+            "{} stale device(s) would be deleted:",
+            candidates.len()
+        )?;
+        for (index, candidate) in candidates.iter().enumerate() {
+            let modified = candidate
+                .modified
+                .map_or_else(|| "unknown".to_owned(), |time| time.to_rfc3339());
+            writeln!(
+                out,
+                "  #{} {:?} modified {modified}",
+                index + 1,
+                candidate.class
+            )?;
+        }
+        writeln!(
+            out,
+            "Kept: the newest bridge device of this host and every other device."
+        )?;
+        if !candidates.is_empty() {
+            writeln!(
+                out,
+                "To delete exactly these: webex-bridge devices prune --confirm {} {digest}",
+                candidates.len()
+            )?;
+        }
+        return Ok(out);
+    };
+    if count != candidates.len() || expected != digest {
+        anyhow::bail!("The stale device set changed since the dry run; run the dry run again");
+    }
+    let mut deleted = 0;
+    for candidate in &candidates {
+        let response = client
+            .delete(&candidate.url)
+            .bearer_auth(&tokens.access_token)
+            .send()
+            .await
+            .context("WDM device delete did not respond")?;
+        if response.status().is_success() || response.status().as_u16() == 404 {
+            deleted += 1;
+        } else {
+            writeln!(out, "A delete returned HTTP {}", response.status().as_u16())?;
+        }
+    }
+    writeln!(
+        out,
+        "Deleted {deleted} of {} stale device(s).",
+        candidates.len()
+    )?;
+    let (status, body, elapsed) = fetch_devices(&client, &tokens.access_token).await?;
+    let mut summary = summarize(&body, &this_host(), Utc::now())?;
+    summary.status = status;
+    summary.elapsed = elapsed;
+    summary.bytes = body.len();
+    write!(out, "{summary}")?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -250,5 +410,52 @@ mod tests {
         for leak in ["host-a", "host-b", "laptop", "Sam", "phone", "secret"] {
             assert!(!printed.contains(leak), "{leak} in {printed}");
         }
+    }
+
+    #[test]
+    fn prune_keeps_the_newest_bridge_device_and_everything_not_ours() {
+        let body = serde_json::json!({"devices": [
+            {"url": "https://wdm-a.wbx2.com/wdm/api/v1/devices/old", "name": "host-a-webex-bridge",
+             "systemName": "rust-spark-client", "modificationTime": "2026-10-01T00:00:00Z"},
+            {"url": "https://wdm-a.wbx2.com/wdm/api/v1/devices/new", "name": "host-a-webex-bridge",
+             "systemName": "rust-spark-client", "modificationTime": "2026-10-13T00:00:00Z"},
+            {"url": "https://wdm-a.wbx2.com/wdm/api/v1/devices/mid", "name": "host-a-webex-bridge",
+             "systemName": "rust-spark-client", "modificationTime": "2026-10-05T00:00:00Z"},
+            {"url": "https://wdm-a.wbx2.com/wdm/api/v1/devices/tui", "name": "host-a",
+             "systemName": "rust-spark-client", "modificationTime": "2026-09-01T00:00:00Z"},
+            {"url": "https://wdm-a.wbx2.com/wdm/api/v1/devices/other-host",
+             "name": "host-b-webex-bridge", "systemName": "rust-spark-client"},
+            {"url": "https://wdm-a.wbx2.com/wdm/api/v1/devices/mac", "name": "host-a",
+             "systemName": "Mac OS X", "deviceType": "MAC"},
+            {"url": "https://evil.example/devices/x", "name": "host-a",
+             "systemName": "rust-spark-client", "modificationTime": "2026-08-01T00:00:00Z"}
+        ]});
+        let candidates = prune_candidates(&serde_json::to_vec(&body).unwrap(), "host-a").unwrap();
+        let urls: Vec<&str> = candidates.iter().map(|c| c.url.as_str()).collect();
+        // Oldest first; the newest bridge device, another host's, the user's
+        // Mac and any non-WDM URL are never candidates.
+        assert_eq!(
+            urls,
+            [
+                "https://wdm-a.wbx2.com/wdm/api/v1/devices/tui",
+                "https://wdm-a.wbx2.com/wdm/api/v1/devices/old",
+                "https://wdm-a.wbx2.com/wdm/api/v1/devices/mid",
+            ]
+        );
+        assert_eq!(candidates[0].class, DeviceClass::TuiThisHost);
+        // The fingerprint changes with the set and reveals no URL.
+        let digest = fingerprint(&candidates);
+        assert_eq!(digest.len(), 8);
+        assert_ne!(digest, fingerprint(&candidates[1..]));
+        assert!(!digest.contains("wdm"));
+    }
+
+    #[test]
+    fn only_webex_wdm_urls_may_receive_the_token() {
+        assert!(wdm_url("https://wdm-a.wbx2.com/wdm/api/v1/devices/x"));
+        assert!(wdm_url("https://wdm-r.wbx2.com/wdm/api/v1/devices/x"));
+        assert!(!wdm_url("http://wdm-a.wbx2.com/wdm/api/v1/devices/x"));
+        assert!(!wdm_url("https://wdm-a.wbx2.com.evil.example/x"));
+        assert!(!wdm_url("https://evil.example/wdm"));
     }
 }

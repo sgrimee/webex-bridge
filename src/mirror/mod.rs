@@ -1834,7 +1834,8 @@ impl Mirror {
     }
 
     /// The next `limit` active messages strictly older than the sweep cursor,
-    /// newest first, as `(message_id, created_at)`.
+    /// newest first, as `(message_id, created_at)`. A message without a
+    /// creation time sorts as the oldest (`""`), so it is still swept.
     pub fn room_sweep_batch(
         &self,
         sweep: &RoomSweep,
@@ -1843,8 +1844,9 @@ impl Mirror {
         let mut statement = self.conn.prepare(
             "SELECT m.message_id,m.created_at FROM messages m WHERE m.room_id=?1 AND m.status='active'
              AND m.revision=(SELECT MAX(revision) FROM messages WHERE message_id=m.message_id)
-             AND (m.created_at<?2 OR (m.created_at=?2 AND m.message_id<?3))
-             ORDER BY m.created_at DESC, m.message_id DESC LIMIT ?4",
+             AND (COALESCE(m.created_at,'')<?2
+                  OR (COALESCE(m.created_at,'')=?2 AND m.message_id<?3))
+             ORDER BY COALESCE(m.created_at,'') DESC, m.message_id DESC LIMIT ?4",
         )?;
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let rows = statement.query_map(
@@ -2132,6 +2134,43 @@ mod tests {
         // The rerun happens once.
         mirror.advance_room_sweep(&restarted, None).unwrap();
         assert_eq!(mirror.next_room_sweep().unwrap(), None);
+    }
+
+    #[test]
+    fn messages_without_a_creation_time_are_swept_last() {
+        let mut mirror = Mirror::in_memory([41_u8; 32]).unwrap();
+        let mut timed = message("timed", "body", None);
+        timed.created = Some("2026-10-08T12:00:01Z".into());
+        mirror.upsert_message(&timed).unwrap();
+        for id in ["untimed-a", "untimed-b"] {
+            mirror
+                .conn
+                .execute(
+                    "INSERT INTO messages(room_id,message_id,revision,status,body_ct,body_nonce)
+                     VALUES ('room-1',?1,1,'active',X'01',X'02')",
+                    [id],
+                )
+                .unwrap();
+        }
+        mirror
+            .request_room_sweep("room-1", "2026-10-08T12:00:09Z", "newest")
+            .unwrap();
+        let sweep = mirror.next_room_sweep().unwrap().unwrap();
+        let ids =
+            |batch: Vec<(String, String)>| batch.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(mirror.room_sweep_batch(&sweep, 2).unwrap()),
+            ["timed", "untimed-b"]
+        );
+        // The cursor of an untimed row is ("", id) and the pass continues.
+        mirror
+            .advance_room_sweep(&sweep, Some(("", "untimed-b")))
+            .unwrap();
+        let resumed = mirror.next_room_sweep().unwrap().unwrap();
+        assert_eq!(
+            ids(mirror.room_sweep_batch(&resumed, 10).unwrap()),
+            ["untimed-a"]
+        );
     }
 
     #[test]

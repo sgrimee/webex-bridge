@@ -185,12 +185,17 @@ mod tests {
             .with(|db| db.audit_refs_for_tests("ui", "unpair"))
             .await
             .unwrap();
-        let me_exe = std::env::current_exe().unwrap().canonicalize().unwrap();
-        assert!(
-            refs.iter()
-                .all(|r| r.as_deref() == Some(me_exe.to_str().unwrap())),
-            "{refs:?}"
-        );
+        // The executable is resolved from the kernel on macOS only.
+        let expected = cfg!(target_os = "macos").then(|| {
+            std::env::current_exe()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string()
+        });
+        assert_eq!(refs.len(), 3);
+        assert!(refs.iter().all(|r| *r == expected), "{refs:?}");
         server.shutdown().await.unwrap();
     }
 

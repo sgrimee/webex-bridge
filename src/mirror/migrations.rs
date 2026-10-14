@@ -1,8 +1,8 @@
 //! Atomic SQLite schema migrations.
 
 use super::schema::{
-    SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
-    SCHEMA_V9,
+    SCHEMA_V1, SCHEMA_V10, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+    SCHEMA_V8, SCHEMA_V9,
 };
 use anyhow::{bail, Result};
 use rusqlite::Connection;
@@ -86,6 +86,13 @@ fn migrate_v8(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_v10(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute_batch(SCHEMA_V10)?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn migrate_v9(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction()?;
     if !has_column(&tx, "room_sweep", "rerun_requested")? {
@@ -104,7 +111,7 @@ fn migrate_v9(conn: &mut Connection) -> Result<()> {
 type Step = fn(&mut Connection) -> Result<()>;
 
 /// Newest schema version this code writes.
-pub const LATEST_VERSION: i32 = 9;
+pub const LATEST_VERSION: i32 = 10;
 
 /// Apply migrations or reject a database written by newer code.
 pub fn migrate(conn: &mut Connection) -> Result<()> {
@@ -117,7 +124,7 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
         tx.execute_batch(SCHEMA_V1)?;
         tx.commit()?;
     }
-    let steps: [(i32, Step); 8] = [
+    let steps: [(i32, Step); 9] = [
         (2, migrate_v2),
         (3, migrate_v3),
         (4, migrate_v4),
@@ -126,6 +133,7 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
         (7, migrate_v7),
         (8, migrate_v8),
         (9, migrate_v9),
+        (10, migrate_v10),
     ];
     for (target, step) in steps {
         if version < target {
@@ -153,6 +161,16 @@ mod tests {
         assert!(has_column(&conn, "room_sweep", "attempts").unwrap());
         assert!(has_column(&conn, "room_sweep", "queued_at").unwrap());
         assert!(has_column(&conn, "room_sweep", "rerun_requested").unwrap());
+        // The routing audit lookup is served by the (scope, action, ref) index.
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT 1 FROM audit WHERE scope='agent'
+                 AND action='route_filtered' AND ref='r:m:1'",
+                [],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("audit_scope_action_ref"), "{plan}");
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
                 .unwrap(),

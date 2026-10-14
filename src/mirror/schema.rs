@@ -159,3 +159,10 @@ pub(crate) const SCHEMA_V8: &str = "PRAGMA user_version=8;";
 // `rerun_requested` and keeps the newest start point in `rerun_*`; the pass
 // finishes and then restarts once from there. Columns added by `migrate_v9`.
 pub(crate) const SCHEMA_V9: &str = "PRAGMA user_version=9;";
+
+// Routing re-reads the audit log per candidate delivery (`filtered_as`,
+// `filtered_sticky`: scope, action, ref) and tests count it by scope/action.
+pub(crate) const SCHEMA_V10: &str = r#"
+CREATE INDEX IF NOT EXISTS audit_scope_action_ref ON audit(scope, action, ref);
+PRAGMA user_version=10;
+"#;
